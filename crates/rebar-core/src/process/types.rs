@@ -80,6 +80,8 @@ pub enum SendError {
     ProcessDead(ProcessId),
     #[error("mailbox full for: {0}")]
     MailboxFull(ProcessId),
+    #[error("node unreachable: {0}")]
+    NodeUnreachable(u64),
 }
 
 #[cfg(test)]

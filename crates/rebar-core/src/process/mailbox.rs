@@ -127,6 +127,17 @@ impl MailboxTx {
 }
 
 impl MailboxRx {
+    /// Try to receive a message without blocking.
+    ///
+    /// Returns `Some(message)` if one is immediately available,
+    /// or `None` if the channel is empty or closed.
+    pub fn try_recv(&mut self) -> Option<Message> {
+        match &mut self.inner {
+            RxInner::Unbounded(rx) => rx.try_recv().ok(),
+            RxInner::Bounded(rx) => rx.try_recv().ok(),
+        }
+    }
+
     /// Receive a message from the mailbox.
     ///
     /// Returns `None` if all senders have been dropped (channel is closed).

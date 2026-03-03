@@ -401,4 +401,119 @@ mod tests {
         let received = server.await.unwrap();
         assert_eq!(received.payload, rmpv::Value::Binary(big_payload_clone));
     }
+
+    #[tokio::test]
+    async fn quic_connection_close() {
+        use crate::transport::traits::{TransportConnection, TransportListener};
+        use std::time::Duration;
+
+        let (cert, key, hash) = generate_self_signed_cert();
+        let transport = QuicTransport::new(cert, key);
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            // Server tries to receive — should error because client closes
+            conn.recv().await
+        });
+
+        let mut client = transport.connect(addr, hash).await.unwrap();
+        // Close the connection immediately
+        client.close().await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server task timed out")
+            .expect("server task panicked");
+
+        assert!(
+            result.is_err(),
+            "server recv should fail after client close"
+        );
+    }
+
+    #[tokio::test]
+    async fn quic_concurrent_streams() {
+        use crate::protocol::{Frame, MsgType};
+        use crate::transport::traits::{TransportConnection, TransportListener};
+        use std::time::Duration;
+
+        let (cert, key, hash) = generate_self_signed_cert();
+        let transport = QuicTransport::new(cert, key);
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let mut frames = Vec::new();
+            for _ in 0..10 {
+                frames.push(conn.recv().await.unwrap());
+            }
+            frames
+        });
+
+        let mut client = transport.connect(addr, hash).await.unwrap();
+        // Send 10 frames as fast as possible (each send opens a new stream)
+        for i in 0..10u64 {
+            client
+                .send(&Frame {
+                    version: 1,
+                    msg_type: MsgType::Send,
+                    request_id: i,
+                    header: rmpv::Value::Nil,
+                    payload: rmpv::Value::Nil,
+                })
+                .await
+                .unwrap();
+        }
+
+        let frames = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server task timed out")
+            .expect("server task panicked");
+
+        assert_eq!(frames.len(), 10);
+        let mut ids: Vec<u64> = frames.iter().map(|f| f.request_id).collect();
+        ids.sort();
+        assert_eq!(ids, (0..10).collect::<Vec<u64>>());
+    }
+
+    #[tokio::test]
+    async fn quic_cert_fingerprint_mismatch() {
+        use crate::transport::traits::TransportListener;
+        use std::time::Duration;
+
+        let (cert, key, _hash) = generate_self_signed_cert();
+        let transport = QuicTransport::new(cert, key);
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+
+        // Server must accept so the TLS handshake can proceed
+        let _server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        // Use a wrong cert hash
+        let wrong_hash: CertHash = [0xFF; 32];
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), transport.connect(addr, wrong_hash))
+                .await
+                .expect("connect timed out");
+
+        assert!(
+            result.is_err(),
+            "connection with wrong cert hash should fail"
+        );
+    }
 }

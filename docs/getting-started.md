@@ -11,6 +11,7 @@ This guide walks you through Rebar's core concepts with progressive, runnable ex
 5. [Supervisor Trees](#5-supervisor-trees)
 6. [Process-per-Key Pattern](#6-process-per-key-pattern)
 7. [Monitoring and Linking](#7-monitoring-and-linking)
+8. [Distributed Messaging](#8-distributed-messaging)
 
 ---
 
@@ -657,10 +658,82 @@ In OTP style, supervisors use monitors to watch children (so the supervisor can 
 
 ---
 
+## 8. Distributed Messaging
+
+Rebar supports transparent message passing across nodes. When you use a `DistributedRuntime`, `ctx.send()` automatically routes to remote nodes when the target PID belongs to a different node.
+
+### Setting Up Two Connected Nodes
+
+```rust
+use rebar::DistributedRuntime;
+use rebar_cluster::connection::manager::ConnectionManager;
+use rebar_cluster::transport::tcp::{TcpTransport, TcpTransportConnector};
+use rebar_cluster::transport::TransportListener;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() {
+    // --- Node 1 (listener) ---
+    let connector1 = TcpTransportConnector;
+    let mgr1 = ConnectionManager::new(Box::new(connector1));
+    let mut node1 = DistributedRuntime::new(1, mgr1);
+
+    // Start a TCP listener
+    let transport = TcpTransport;
+    let listener = transport.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let node1_addr = listener.local_addr();
+
+    // Spawn a receiver on node 1
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let receiver_pid = node1.runtime().spawn(move |mut ctx| async move {
+        let msg = ctx.recv().await.unwrap();
+        done_tx.send(msg.payload().as_str().unwrap().to_string()).unwrap();
+    }).await;
+
+    // --- Node 2 (connector) ---
+    let connector2 = TcpTransportConnector;
+    let mgr2 = ConnectionManager::new(Box::new(connector2));
+    let mut node2 = DistributedRuntime::new(2, mgr2);
+
+    // Connect node 2 to node 1
+    node2.connection_manager_mut().connect(1, node1_addr).await.unwrap();
+
+    // Spawn a sender on node 2 that sends to the receiver on node 1
+    let _ = node2.runtime().spawn(move |ctx| async move {
+        ctx.send(receiver_pid, rmpv::Value::String("hello from node 2".into()))
+            .await
+            .unwrap();
+    }).await;
+
+    // Process the outbound message on node 2
+    node2.process_outbound().await;
+
+    // Accept the connection on node 1 and deliver the inbound frame
+    let mut conn = listener.accept().await.unwrap();
+    use rebar_cluster::transport::TransportConnection;
+    let frame = conn.recv().await.unwrap();
+    node1.deliver_inbound(&frame).unwrap();
+
+    // Verify delivery
+    let result = done_rx.await.unwrap();
+    assert_eq!(result, "hello from node 2");
+    println!("Cross-node message delivered: {result}");
+}
+```
+
+Key points:
+- **`DistributedRuntime::new(node_id, connection_manager)`** wires a `DistributedRouter` that routes by node ID
+- **`ctx.send()`** is transparent -- same API whether local or remote
+- **`process_outbound()`** flushes the RouterCommand channel to the ConnectionManager
+- **`deliver_inbound()`** delivers received frames to local mailboxes
+
+---
+
 ## Next Steps
 
 - Read the [Architecture Guide](architecture.md) for a deeper understanding of Rebar's internals.
 - See the [Extending Rebar](extending.md) guide for building custom supervision patterns, transports, and registry backends.
 - Check the API Reference: [rebar-core](api/rebar-core.md) | [rebar-cluster](api/rebar-cluster.md) | [rebar-ffi](api/rebar-ffi.md) for complete type documentation.
 - Explore the internals: [Supervisor Engine](internals/supervisor-engine.md) | [Wire Protocol](internals/wire-protocol.md) | [SWIM Protocol](internals/swim-protocol.md) | [CRDT Registry](internals/crdt-registry.md).
+- Deep dives: [QUIC Transport](internals/quic-transport.md) | [Distribution Layer](internals/distribution-layer.md) | [Node Drain](internals/node-drain.md).
 - Run the [benchmarks](benchmarks.md) to see Rebar's performance characteristics.

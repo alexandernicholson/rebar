@@ -11,10 +11,14 @@ use std::time::Duration;
 use rebar_cluster::connection::{ConnectionEvent, ConnectionManager, TransportConnector};
 use rebar_cluster::protocol::{Frame, MsgType};
 use rebar_cluster::registry::{Registry, RegistryDelta};
+use rebar_cluster::router::{DistributedRouter, RouterCommand, deliver_inbound_frame};
 use rebar_cluster::swim::{GossipQueue, GossipUpdate, Member, MembershipList, NodeState};
 use rebar_cluster::transport::tcp::TcpTransport;
 use rebar_cluster::transport::{TransportConnection, TransportError, TransportListener};
 use rebar_core::process::ProcessId;
+use rebar_core::process::table::ProcessTable;
+use rebar_core::runtime::Runtime;
+use tokio::sync::mpsc;
 
 // ─── Mock infrastructure for ConnectionManager tests ───────────────────────
 
@@ -486,4 +490,99 @@ async fn three_node_mesh_all_connected() {
     assert!(mgr_3.is_connected(1));
     assert!(mgr_3.is_connected(2));
     assert!(!mgr_3.is_connected(3));
+}
+
+// ─── Test 8: end_to_end_cross_node_send_via_tcp ────────────────────────────
+
+/// End-to-end: two DistributedRuntimes send messages via TCP transport.
+#[tokio::test]
+async fn end_to_end_cross_node_send_via_tcp() {
+    struct TcpConnector;
+
+    #[async_trait::async_trait]
+    impl TransportConnector for TcpConnector {
+        async fn connect(
+            &self,
+            addr: std::net::SocketAddr,
+        ) -> Result<Box<dyn TransportConnection>, TransportError> {
+            let transport = TcpTransport::new();
+            let conn = transport.connect(addr).await?;
+            Ok(Box::new(conn))
+        }
+    }
+
+    // --- Node 1 setup ---
+    let table1 = Arc::new(ProcessTable::new(1));
+    let (remote_tx1, mut remote_rx1) = mpsc::channel::<RouterCommand>(64);
+    let router1 = Arc::new(DistributedRouter::new(1, Arc::clone(&table1), remote_tx1));
+    let rt1 = Runtime::with_router(1, Arc::clone(&table1), router1);
+
+    // --- Node 2 setup ---
+    let table2 = Arc::new(ProcessTable::new(2));
+    let (remote_tx2, _remote_rx2) = mpsc::channel::<RouterCommand>(64);
+    let router2 = Arc::new(DistributedRouter::new(2, Arc::clone(&table2), remote_tx2));
+    let rt2 = Runtime::with_router(2, Arc::clone(&table2), router2);
+
+    // Node 2: start TCP listener
+    let transport2 = TcpTransport::new();
+    let listener = transport2
+        .listen("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let node2_addr = listener.local_addr();
+
+    // Node 2: spawn a receiver process
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let receiver_pid = rt2
+        .spawn(move |mut ctx| async move {
+            let msg = ctx.recv().await.unwrap();
+            done_tx
+                .send((
+                    msg.from().node_id(),
+                    msg.payload().as_str().unwrap().to_string(),
+                ))
+                .unwrap();
+        })
+        .await;
+
+    // Node 2: accept connection and deliver inbound frames
+    let table2_clone = Arc::clone(&table2);
+    let server = tokio::spawn(async move {
+        let mut conn = listener.accept().await.unwrap();
+        loop {
+            match conn.recv().await {
+                Ok(frame) => {
+                    deliver_inbound_frame(&table2_clone, &frame)
+                        .expect("inbound frame delivery should succeed");
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Node 1: connect to node 2
+    let mut mgr1 = ConnectionManager::new(Box::new(TcpConnector));
+    mgr1.connect(2, node2_addr).await.unwrap();
+
+    // Node 1: send message to receiver_pid on node 2
+    rt1.send(receiver_pid, rmpv::Value::String("cross-node-hello".into()))
+        .await
+        .unwrap();
+
+    // Node 1: process the outbound message (drain remote_rx1 → connection_manager)
+    if let Some(RouterCommand::Send { node_id, frame }) = remote_rx1.recv().await {
+        assert_eq!(node_id, 2);
+        mgr1.route(2, &frame).await.unwrap();
+    }
+
+    // Node 2: verify message received
+    let (from_node, payload) = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(from_node, 1);
+    assert_eq!(payload, "cross-node-hello");
+
+    // Ensure the background accept task completed cleanly
+    let _ = tokio::time::timeout(Duration::from_secs(1), server).await;
 }

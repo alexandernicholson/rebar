@@ -1,4 +1,5 @@
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProcessId {
@@ -24,6 +25,61 @@ impl fmt::Display for ProcessId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<{}.{}>", self.node_id, self.local_id)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Message {
+    from: ProcessId,
+    payload: rmpv::Value,
+    timestamp: u64,
+}
+
+impl Message {
+    pub fn new(from: ProcessId, payload: rmpv::Value) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        Self {
+            from,
+            payload,
+            timestamp,
+        }
+    }
+
+    pub fn from(&self) -> ProcessId {
+        self.from
+    }
+
+    pub fn payload(&self) -> &rmpv::Value {
+        &self.payload
+    }
+
+    pub fn timestamp(&self) -> u64 {
+        self.timestamp
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum ExitReason {
+    Normal,
+    Abnormal(String),
+    Kill,
+    LinkedExit(ProcessId, Box<ExitReason>),
+}
+
+impl ExitReason {
+    pub fn is_normal(&self) -> bool {
+        matches!(self, ExitReason::Normal)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SendError {
+    #[error("process dead: {0}")]
+    ProcessDead(ProcessId),
+    #[error("mailbox full for: {0}")]
+    MailboxFull(ProcessId),
 }
 
 #[cfg(test)]
@@ -80,5 +136,79 @@ mod tests {
         let pid = ProcessId::new(1, 1);
         let debug = format!("{:?}", pid);
         assert!(debug.contains("ProcessId"));
+    }
+
+    #[test]
+    fn message_creation() {
+        let from = ProcessId::new(1, 1);
+        let payload = rmpv::Value::String("hello".into());
+        let msg = Message::new(from, payload.clone());
+        assert_eq!(msg.from(), from);
+        assert_eq!(*msg.payload(), payload);
+        assert!(msg.timestamp() > 0);
+    }
+
+    #[test]
+    fn message_with_map_payload() {
+        let from = ProcessId::new(1, 1);
+        let payload = rmpv::Value::Map(vec![
+            (rmpv::Value::String("key".into()), rmpv::Value::Integer(42.into())),
+        ]);
+        let msg = Message::new(from, payload.clone());
+        assert_eq!(*msg.payload(), payload);
+    }
+
+    #[test]
+    fn message_with_nil_payload() {
+        let msg = Message::new(ProcessId::new(1, 1), rmpv::Value::Nil);
+        assert_eq!(*msg.payload(), rmpv::Value::Nil);
+    }
+
+    #[test]
+    fn message_with_binary_payload() {
+        let data = rmpv::Value::Binary(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let msg = Message::new(ProcessId::new(1, 1), data.clone());
+        assert_eq!(*msg.payload(), data);
+    }
+
+    #[test]
+    fn message_with_nested_array() {
+        let payload = rmpv::Value::Array(vec![
+            rmpv::Value::Integer(1.into()),
+            rmpv::Value::Array(vec![rmpv::Value::Integer(2.into())]),
+        ]);
+        let msg = Message::new(ProcessId::new(1, 1), payload.clone());
+        assert_eq!(*msg.payload(), payload);
+    }
+
+    #[test]
+    fn exit_reason_normal_is_normal() {
+        assert!(ExitReason::Normal.is_normal());
+    }
+
+    #[test]
+    fn exit_reason_abnormal_is_not_normal() {
+        assert!(!ExitReason::Abnormal("panicked".into()).is_normal());
+    }
+
+    #[test]
+    fn exit_reason_kill_is_not_normal() {
+        assert!(!ExitReason::Kill.is_normal());
+    }
+
+    #[test]
+    fn exit_reason_linked_exit() {
+        let reason = ExitReason::LinkedExit(
+            ProcessId::new(1, 5),
+            Box::new(ExitReason::Abnormal("crash".into())),
+        );
+        assert!(!reason.is_normal());
+    }
+
+    #[test]
+    fn send_error_display() {
+        let err = SendError::ProcessDead(ProcessId::new(1, 5));
+        let msg = format!("{}", err);
+        assert!(msg.contains("1") && msg.contains("5"));
     }
 }

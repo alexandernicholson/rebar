@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rebar-core",
+    "crates/rebar-cluster",
+    "crates/rebar",
+    "crates/rebar-ffi",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/alexandernicholson/rebar"

@@ -1,0 +1,11 @@
+[package]
+name = "rebar"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A BEAM-inspired distributed actor runtime"
+
+[dependencies]
+rebar-core = { path = "../rebar-core" }
+rebar-cluster = { path = "../rebar-cluster" }

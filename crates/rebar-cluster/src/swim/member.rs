@@ -86,6 +86,10 @@ impl MembershipList {
         self.members.retain(|_, m| m.state != NodeState::Dead);
     }
 
+    pub fn remove_node(&mut self, node_id: u64) {
+        self.members.remove(&node_id);
+    }
+
     pub fn alive_count(&self) -> usize {
         self.members
             .values()

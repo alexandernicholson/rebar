@@ -20,7 +20,23 @@ Rebar is a general-purpose distributed actor runtime built in Rust. It provides 
 | Supervision | OTP-style supervisor trees |
 | Interop | Polyglot via C-ABI FFI (Go, Python, TypeScript) |
 | Registry | Eventually consistent (OR-Set CRDT) |
-| Architecture | Rust core runtime + C-ABI shared library (`librebar`) |
+| Architecture | Multi-crate workspace: rebar-core, rebar-cluster, rebar (facade), rebar-ffi |
+
+### Crate Structure
+
+```
+crates/
+  rebar-core/     # ProcessId, Message, Mailbox, ProcessTable, Supervisor, Runtime (local only)
+                  # Zero networking dependencies
+  rebar-cluster/  # SWIM, Transport (TCP + QUIC), Registry (CRDT), ConnectionManager, Wire Protocol
+                  # Depends on rebar-core
+  rebar/          # Facade crate: re-exports core + cluster, provides unified distributed Runtime
+                  # Depends on rebar-core + rebar-cluster
+  rebar-ffi/      # C-ABI shared library (librebar.so / .dylib / .dll)
+                  # Depends on rebar
+```
+
+Users who only need local actors can depend on `rebar-core` without pulling in QUIC/TLS/networking. The full `rebar` crate wires everything together for distributed deployments.
 
 ---
 

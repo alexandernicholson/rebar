@@ -299,6 +299,8 @@ stateDiagram-v2
     Removed --> [*]
 ```
 
+The `Member` struct also carries an optional `cert_hash: Option<[u8; 32]>` field — the SHA-256 fingerprint of the node's TLS certificate. When present, this enables automatic QUIC transport connections: a node receiving an `Alive` gossip with a `cert_hash` can connect to the advertised address and verify the certificate fingerprint without a CA.
+
 ### Protocol Mechanics
 
 The SWIM protocol operates on a configurable tick cycle (default: 1 second `protocol_period`):

@@ -473,6 +473,39 @@ The `ReconnectPolicy` uses exponential backoff with the formula: `delay = min(ba
 
 The `TransportConnector` trait abstracts the transport implementation, allowing the `ConnectionManager` to work with TCP, QUIC, or mock transports interchangeably.
 
+### QUIC Transport
+
+Rebar includes a QUIC transport implementation (`rebar-cluster::transport::quic`) built on [quinn](https://docs.rs/quinn) 0.11. Key design decisions:
+
+- **Stream-per-frame model.** Each `send()` opens a new unidirectional QUIC stream, writes a 4-byte big-endian length prefix followed by the encoded frame, then finishes the stream. Each `recv()` accepts a unidirectional stream and reads the length-prefixed frame. This avoids head-of-line blocking between independent messages.
+- **Self-signed certificates.** `generate_self_signed_cert()` uses [rcgen](https://docs.rs/rcgen) to produce a DER certificate, PKCS8 private key, and SHA-256 fingerprint (`CertHash = [u8; 32]`).
+- **Fingerprint verification.** `FingerprintVerifier` implements `rustls::client::danger::ServerCertVerifier` to verify the remote certificate's SHA-256 hash matches the expected value. No CA trust chain is needed.
+- **SWIM integration.** The `cert_hash` field on `Member` and `GossipUpdate::Alive` allows nodes to exchange certificate fingerprints via gossip, enabling automatic QUIC connection establishment.
+
+See [QUIC Transport Internals](internals/quic-transport.md) for implementation details.
+
+### Graceful Node Drain
+
+The drain protocol (`rebar-cluster::drain`) provides orderly node shutdown in three phases:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Phase1_Announce
+    Phase1_Announce --> Phase2_Drain : gossip Leave sent, names removed
+    Phase2_Drain --> Phase3_Shutdown : outbound channel empty or timeout
+    Phase3_Shutdown --> [*] : connections closed
+```
+
+| Phase | Action | Timeout (default) |
+|-------|--------|-------------------|
+| 1. Announce | Broadcast `GossipUpdate::Leave`, unregister all names from registry | 5s |
+| 2. Drain Outbound | Process remaining `RouterCommand`s from channel | 30s |
+| 3. Shutdown | Close all connections via `ConnectionManager::drain_connections()` | 10s |
+
+`DrainResult` provides observability: `processes_stopped`, `messages_drained`, `phase_durations`, and `timed_out`.
+
+See [Node Drain Internals](internals/node-drain.md) for the full protocol specification.
+
 ## 10. FFI Layer
 
 The `rebar-ffi` crate provides a C-ABI interface that enables embedding the Rebar runtime in any language with C FFI support. It exposes opaque handle types and a set of `extern "C"` functions following Rust's `#[unsafe(no_mangle)]` convention.

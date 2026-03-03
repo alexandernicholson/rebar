@@ -120,28 +120,41 @@ sequenceDiagram
     end
 ```
 
-### Remote Messaging (Planned)
+### Remote Messaging
+
+When a process sends to a PID on a different node, the `MessageRouter` trait intercepts the call and routes it over the network. The `DistributedRouter` (from `rebar-cluster`) implements this trait: it delivers locally when `to.node_id() == self.node_id`, otherwise encodes the message as a `Frame` and sends a `RouterCommand::Send` to the transport layer via an mpsc channel.
+
+On the receiving node, `deliver_inbound_frame()` extracts addressing from the frame header and delivers the payload to the target process's mailbox.
 
 ```mermaid
 sequenceDiagram
     participant Sender as Sender Process
-    participant Router as Router
-    participant Frame as Frame Encoder
-    participant Transport as Transport Layer
-    participant Wire as TCP / Wire
-    participant RTransport as Remote Transport
-    participant RFrame as Frame Decoder
+    participant Router as DistributedRouter
+    participant Chan as RouterCommand Channel
+    participant CM as ConnectionManager
+    participant Wire as TCP / QUIC
+    participant RCM as Remote ConnectionManager
+    participant Deliver as deliver_inbound_frame()
     participant RTable as Remote ProcessTable
 
-    Sender->>Router: send(remote_pid, payload)
-    Router->>Frame: Frame::encode()<br>MsgType::Send
-    Frame->>Transport: send bytes
-    Transport->>Wire: TCP write
-    Wire->>RTransport: TCP read
-    RTransport->>RFrame: Frame::decode()
-    RFrame->>RTable: table.send(local_pid, msg)
-    RTable->>RTable: Local delivery<br>via ProcessHandle
+    Sender->>Router: ctx.send(remote_pid, payload)
+    Router->>Router: to.node_id() != self.node_id
+    Router->>Chan: RouterCommand::Send [node_id, Frame]
+    Chan->>CM: process_outbound()
+    CM->>Wire: connection.send(frame)
+    Wire->>RCM: connection.recv()
+    RCM->>Deliver: deliver_inbound_frame(table, frame)
+    Deliver->>RTable: table.send(local_pid, msg)
+    RTable->>RTable: Local delivery via ProcessHandle
 ```
+
+Key types:
+- **`MessageRouter`** trait (rebar-core) — `route(from, to, payload) -> Result<(), SendError>`
+- **`LocalRouter`** — default, wraps ProcessTable for single-node use
+- **`DistributedRouter`** — local + remote routing via RouterCommand channel
+- **`DistributedRuntime`** (rebar facade) — wires core Runtime with cluster ConnectionManager
+
+See [Distribution Layer Internals](internals/distribution-layer.md) for the full deep dive.
 
 ## 5. Supervisor Trees
 

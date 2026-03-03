@@ -126,6 +126,7 @@ async fn two_nodes_discover_via_swim() {
         node_id: 1,
         addr: test_addr(5000),
         incarnation: 0,
+        cert_hash: None,
     });
 
     // Node B prepares gossip about itself to send to A
@@ -134,6 +135,7 @@ async fn two_nodes_discover_via_swim() {
         node_id: 2,
         addr: test_addr(5001),
         incarnation: 0,
+        cert_hash: None,
     });
 
     // Apply gossip from A to B's list — B discovers node 1
@@ -143,6 +145,7 @@ async fn two_nodes_discover_via_swim() {
             node_id,
             addr,
             incarnation,
+            cert_hash: _,
         } = update
         {
             let member = Member::new(*node_id, *addr);
@@ -160,6 +163,7 @@ async fn two_nodes_discover_via_swim() {
             node_id,
             addr,
             incarnation,
+            cert_hash: _,
         } = update
         {
             let member = Member::new(*node_id, *addr);

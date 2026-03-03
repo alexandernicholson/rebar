@@ -9,6 +9,7 @@ pub enum GossipUpdate {
         node_id: u64,
         addr: SocketAddr,
         incarnation: u64,
+        cert_hash: Option<[u8; 32]>,
     },
     Suspect {
         node_id: u64,
@@ -62,6 +63,7 @@ mod tests {
             node_id: 1,
             addr: test_addr(4000),
             incarnation: 0,
+            cert_hash: None,
         });
         let items = q.drain(10);
         assert_eq!(items.len(), 1);
@@ -71,6 +73,7 @@ mod tests {
                 node_id: 1,
                 addr: test_addr(4000),
                 incarnation: 0,
+                cert_hash: None,
             }
         );
     }
@@ -84,6 +87,7 @@ mod tests {
                 node_id: i,
                 addr: test_addr(4000 + i as u16),
                 incarnation: 0,
+                cert_hash: None,
             });
         }
         let items = q.drain(3);
@@ -101,6 +105,7 @@ mod tests {
             node_id: 1,
             addr: test_addr(4000),
             incarnation: 0,
+            cert_hash: None,
         });
         q.add(GossipUpdate::Dead {
             node_id: 2,
@@ -125,6 +130,7 @@ mod tests {
             node_id: 42,
             addr: test_addr(5000),
             incarnation: 7,
+            cert_hash: None,
         };
         let bytes = rmp_serde::to_vec(&update).unwrap();
         let decoded: GossipUpdate = rmp_serde::from_slice(&bytes).unwrap();
@@ -176,6 +182,7 @@ mod tests {
             node_id: 1,
             addr: test_addr(4001),
             incarnation: 0,
+            cert_hash: None,
         });
         q.add(GossipUpdate::Suspect {
             node_id: 2,
@@ -193,6 +200,7 @@ mod tests {
                 node_id: 1,
                 addr: test_addr(4001),
                 incarnation: 0,
+                cert_hash: None,
             }
         );
         assert_eq!(
@@ -220,6 +228,7 @@ mod tests {
             node_id: 1,
             addr,
             incarnation: 0,
+            cert_hash: None,
         };
         let bytes = rmp_serde::to_vec(&update).unwrap();
         let decoded: GossipUpdate = rmp_serde::from_slice(&bytes).unwrap();
@@ -232,6 +241,23 @@ mod tests {
             assert_eq!(decoded_addr.port(), 9999);
         } else {
             panic!("Expected Alive variant");
+        }
+    }
+
+    #[test]
+    fn gossip_alive_with_cert_hash_roundtrip() {
+        let hash = [0xABu8; 32];
+        let update = GossipUpdate::Alive {
+            node_id: 1,
+            addr: test_addr(4000),
+            incarnation: 0,
+            cert_hash: Some(hash),
+        };
+        let bytes = rmp_serde::to_vec(&update).unwrap();
+        let decoded: GossipUpdate = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(update, decoded);
+        if let GossipUpdate::Alive { cert_hash, .. } = decoded {
+            assert_eq!(cert_hash, Some(hash));
         }
     }
 }

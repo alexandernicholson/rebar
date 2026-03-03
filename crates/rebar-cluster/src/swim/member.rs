@@ -16,6 +16,7 @@ pub struct Member {
     pub addr: SocketAddr,
     pub state: NodeState,
     pub incarnation: u64,
+    pub cert_hash: Option<[u8; 32]>,
 }
 
 impl Member {
@@ -25,6 +26,7 @@ impl Member {
             addr,
             state: NodeState::Alive,
             incarnation: 0,
+            cert_hash: None,
         }
     }
 
@@ -250,5 +252,13 @@ mod tests {
     fn membership_list_empty_random_returns_none() {
         let list = MembershipList::new();
         assert!(list.random_alive_member(0).is_none());
+    }
+
+    #[test]
+    fn member_with_cert_hash() {
+        let hash = [42u8; 32];
+        let mut member = Member::new(1, "127.0.0.1:4000".parse().unwrap());
+        member.cert_hash = Some(hash);
+        assert_eq!(member.cert_hash, Some(hash));
     }
 }

@@ -11,6 +11,7 @@
 
 - [protocol](#protocol) -- Wire protocol framing and message types
 - [transport](#transport) -- Async transport traits and TCP implementation
+- [router](#module-router) -- Distributed message routing
 - [swim](#swim) -- SWIM failure detection, membership, gossip
 - [registry](#registry) -- OR-Set CRDT global process name registry
 - [connection](#connection) -- Connection lifecycle and reconnection
@@ -353,6 +354,85 @@ pub struct TcpConnection {
 ```
 
 **Implements:** `TransportConnection`
+
+---
+
+## Module: `router`
+
+Distributed message routing. Extends `rebar-core::MessageRouter` with remote delivery via the transport layer.
+
+---
+
+### `RouterCommand`
+
+Commands sent to the remote transport layer for cross-node delivery.
+
+**Definition:**
+
+```rust
+#[derive(Debug)]
+pub enum RouterCommand {
+    Send { node_id: u64, frame: Frame },
+}
+```
+
+The `Send` variant carries the target node ID and the encoded `Frame` to transmit.
+
+---
+
+### `DistributedRouter`
+
+A distributed message router that delivers messages locally when the target is on this node, or encodes them as frames and forwards to the remote transport layer via an mpsc channel.
+
+**Definition:**
+
+```rust
+pub struct DistributedRouter {
+    node_id: u64,
+    table: Arc<ProcessTable>,
+    remote_tx: mpsc::Sender<RouterCommand>,
+}
+```
+
+**Methods:**
+
+- `new(node_id: u64, table: Arc<ProcessTable>, remote_tx: mpsc::Sender<RouterCommand>) -> Self` — Create a distributed router for the given node.
+
+**Implements:** `MessageRouter`
+- If `to.node_id() == self.node_id`: delivers locally via `table.send()`
+- Otherwise: encodes as `Frame` via `encode_send_frame()` and sends `RouterCommand::Send` to the channel
+- Returns `Err(SendError::NodeUnreachable(node_id))` if the channel is full
+
+---
+
+### `encode_send_frame`
+
+Encode a send message into a wire protocol frame.
+
+```rust
+pub fn encode_send_frame(
+    from: ProcessId,
+    to: ProcessId,
+    payload: rmpv::Value,
+) -> Frame
+```
+
+Returns a `Frame` with `MsgType::Send`, version 1, and a header map containing `from_node`, `from_local`, `to_node`, `to_local` fields.
+
+---
+
+### `deliver_inbound_frame`
+
+Deliver an inbound frame from the network to a local process.
+
+```rust
+pub fn deliver_inbound_frame(
+    table: &ProcessTable,
+    frame: &Frame,
+) -> Result<(), SendError>
+```
+
+Extracts `from_node`, `from_local`, `to_node`, `to_local` from the frame header map, constructs a `Message`, and delivers it to the target process via `table.send()`.
 
 ---
 

@@ -358,6 +358,95 @@ pub struct TcpConnection {
 
 ---
 
+### `CertHash`
+
+SHA-256 fingerprint of a DER-encoded certificate.
+
+```rust
+pub type CertHash = [u8; 32];
+```
+
+---
+
+### `generate_self_signed_cert`
+
+```rust
+pub fn generate_self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'static>, CertHash)
+```
+
+Generate a self-signed certificate using rcgen with subject "rebar-node". Returns the DER-encoded certificate, its PKCS8 private key, and the SHA-256 fingerprint.
+
+---
+
+### `cert_fingerprint`
+
+```rust
+pub fn cert_fingerprint(cert: &CertificateDer<'_>) -> CertHash
+```
+
+Compute the SHA-256 fingerprint of a DER-encoded certificate.
+
+---
+
+### `QuicTransport`
+
+QUIC transport using stream-per-frame with length-prefixed framing. Built on quinn 0.11.
+
+**Definition:**
+
+```rust
+pub struct QuicTransport {
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+}
+```
+
+**Methods:**
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `new` | `fn new(cert, key) -> Self` | Create a QUIC transport with the given credentials |
+| `listen` | `async fn listen(&self, addr: SocketAddr) -> Result<QuicListener, TransportError>` | Bind a QUIC server endpoint |
+| `connect` | `async fn connect(&self, addr, expected_cert_hash) -> Result<QuicConnection, TransportError>` | Connect to a remote endpoint, verifying certificate fingerprint |
+
+---
+
+### `QuicListener`
+
+QUIC server endpoint. **Implements:** `TransportListener<Connection = QuicConnection>`
+
+---
+
+### `QuicConnection`
+
+A single QUIC connection. **Implements:** `TransportConnection`
+
+Each `send()` opens a new unidirectional stream, writes `[4-byte BE length][encoded frame]`, then finishes the stream. Each `recv()` accepts a unidirectional stream and reads the length-prefixed frame.
+
+---
+
+### `QuicTransportConnector`
+
+A `TransportConnector` implementation backed by QUIC. Each `connect()` creates a fresh `QuicTransport` with cloned credentials and verifies the remote certificate fingerprint.
+
+**Definition:**
+
+```rust
+pub struct QuicTransportConnector {
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+    expected_cert_hash: CertHash,
+}
+```
+
+**Methods:**
+
+- `new(cert, key, expected_cert_hash) -> Self` — Create a QUIC connector.
+
+**Implements:** `TransportConnector`
+
+---
+
 ## Module: `router`
 
 Distributed message routing. Extends `rebar-core::MessageRouter` with remote delivery via the transport layer.
@@ -573,8 +662,11 @@ pub struct Member {
     pub addr: SocketAddr,
     pub state: NodeState,
     pub incarnation: u64,
+    pub cert_hash: Option<[u8; 32]>,
 }
 ```
+
+The `cert_hash` field holds the SHA-256 fingerprint of the node's TLS certificate, exchanged via SWIM gossip. Used by QUIC transport for certificate verification.
 
 **Methods:**
 
@@ -811,6 +903,7 @@ pub enum GossipUpdate {
         node_id: u64,
         addr: SocketAddr,
         incarnation: u64,
+        cert_hash: Option<[u8; 32]>,
     },
     Suspect {
         node_id: u64,
@@ -1196,6 +1289,7 @@ pub struct ConnectionManager {
 | `reconnect_attempt_count` | `fn reconnect_attempt_count(&self, node_id: u64) -> u32` | Get the current reconnect attempt count for a node. |
 | `drain_events` | `fn drain_events(&mut self) -> Vec<ConnectionEvent>` | Drain all pending events from the internal buffer. |
 | `reconnect_policy` | `fn reconnect_policy(&self) -> &ReconnectPolicy` | Get a reference to the reconnect policy. |
+| `drain_connections` | `async fn drain_connections(&mut self) -> usize` | Close all connections and return the count of connections closed. Used during graceful node drain (phase 3). |
 
 **Example:**
 

@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["gateway", "compute", "store", "common"]
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+rebar-core = { path = "../../crates/rebar-core" }
+rebar-cluster = { path = "../../crates/rebar-cluster" }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+rmpv = "1"
+reqwest = { version = "0.12", features = ["json"] }

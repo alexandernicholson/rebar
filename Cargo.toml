@@ -6,6 +6,7 @@ members = [
     "crates/rebar",
     "crates/rebar-ffi",
 ]
+exclude = ["bench/rebar"]
 
 [workspace.package]
 edition = "2024"

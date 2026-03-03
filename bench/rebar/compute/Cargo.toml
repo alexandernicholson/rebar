@@ -1,0 +1,14 @@
+[package]
+name = "bench-compute"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bench-common = { path = "../common" }
+rebar-core.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

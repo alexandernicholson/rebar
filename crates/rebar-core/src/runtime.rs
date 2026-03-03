@@ -137,14 +137,24 @@ mod tests {
     async fn send_message_between_processes() {
         let rt = Runtime::new(1);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let receiver = rt.spawn(move |mut ctx| async move {
-            let msg = ctx.recv().await.unwrap();
-            done_tx.send(msg.payload().as_str().unwrap().to_string()).unwrap();
-        }).await;
+        let receiver = rt
+            .spawn(move |mut ctx| async move {
+                let msg = ctx.recv().await.unwrap();
+                done_tx
+                    .send(msg.payload().as_str().unwrap().to_string())
+                    .unwrap();
+            })
+            .await;
         rt.spawn(move |ctx| async move {
-            ctx.send(receiver, rmpv::Value::String("hello".into())).await.unwrap();
-        }).await;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx).await.unwrap().unwrap();
+            ctx.send(receiver, rmpv::Value::String("hello".into()))
+                .await
+                .unwrap();
+        })
+        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result, "hello");
     }
 
@@ -152,10 +162,15 @@ mod tests {
     async fn self_pid_is_correct() {
         let rt = Runtime::new(1);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let pid = rt.spawn(move |ctx| async move {
-            done_tx.send(ctx.self_pid()).unwrap();
-        }).await;
-        let reported = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx).await.unwrap().unwrap();
+        let pid = rt
+            .spawn(move |ctx| async move {
+                done_tx.send(ctx.self_pid()).unwrap();
+            })
+            .await;
+        let reported = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(pid, reported);
     }
 
@@ -173,8 +188,12 @@ mod tests {
         rt.spawn(move |mut ctx| async move {
             let result = ctx.recv_timeout(std::time::Duration::from_millis(10)).await;
             done_tx.send(result.is_none()).unwrap();
-        }).await;
-        let was_none = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx).await.unwrap().unwrap();
+        })
+        .await;
+        let was_none = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(was_none);
     }
 
@@ -184,11 +203,19 @@ mod tests {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         rt.spawn(move |mut ctx| async move {
             let me = ctx.self_pid();
-            ctx.send(me, rmpv::Value::String("self-msg".into())).await.unwrap();
+            ctx.send(me, rmpv::Value::String("self-msg".into()))
+                .await
+                .unwrap();
             let msg = ctx.recv().await.unwrap();
-            done_tx.send(msg.payload().as_str().unwrap().to_string()).unwrap();
-        }).await;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx).await.unwrap().unwrap();
+            done_tx
+                .send(msg.payload().as_str().unwrap().to_string())
+                .unwrap();
+        })
+        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result, "self-msg");
     }
 
@@ -196,19 +223,31 @@ mod tests {
     async fn chain_of_three_processes() {
         let rt = Runtime::new(1);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let c = rt.spawn(move |mut ctx| async move {
-            let msg = ctx.recv().await.unwrap();
-            done_tx.send(msg.payload().as_u64().unwrap()).unwrap();
-        }).await;
-        let b = rt.spawn(move |mut ctx| async move {
-            let msg = ctx.recv().await.unwrap();
-            let val = msg.payload().as_u64().unwrap();
-            ctx.send(c, rmpv::Value::Integer((val + 1).into())).await.unwrap();
-        }).await;
+        let c = rt
+            .spawn(move |mut ctx| async move {
+                let msg = ctx.recv().await.unwrap();
+                done_tx.send(msg.payload().as_u64().unwrap()).unwrap();
+            })
+            .await;
+        let b = rt
+            .spawn(move |mut ctx| async move {
+                let msg = ctx.recv().await.unwrap();
+                let val = msg.payload().as_u64().unwrap();
+                ctx.send(c, rmpv::Value::Integer((val + 1).into()))
+                    .await
+                    .unwrap();
+            })
+            .await;
         rt.spawn(move |ctx| async move {
-            ctx.send(b, rmpv::Value::Integer(1u64.into())).await.unwrap();
-        }).await;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx).await.unwrap().unwrap();
+            ctx.send(b, rmpv::Value::Integer(1u64.into()))
+                .await
+                .unwrap();
+        })
+        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result, 2);
     }
 
@@ -219,21 +258,28 @@ mod tests {
         let mut workers = Vec::new();
         for _ in 0..5 {
             let tx = tx.clone();
-            let pid = rt.spawn(move |mut ctx| async move {
-                let msg = ctx.recv().await.unwrap();
-                let val = msg.payload().as_u64().unwrap();
-                tx.send(val * 2).await.unwrap();
-            }).await;
+            let pid = rt
+                .spawn(move |mut ctx| async move {
+                    let msg = ctx.recv().await.unwrap();
+                    let val = msg.payload().as_u64().unwrap();
+                    tx.send(val * 2).await.unwrap();
+                })
+                .await;
             workers.push(pid);
         }
         drop(tx);
         rt.spawn(move |ctx| async move {
             for (i, pid) in workers.iter().enumerate() {
-                ctx.send(*pid, rmpv::Value::Integer((i as u64).into())).await.unwrap();
+                ctx.send(*pid, rmpv::Value::Integer((i as u64).into()))
+                    .await
+                    .unwrap();
             }
-        }).await;
+        })
+        .await;
         let mut results = Vec::new();
-        while let Ok(Some(val)) = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+        while let Ok(Some(val)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
+        {
             results.push(val);
         }
         results.sort();
@@ -248,11 +294,14 @@ mod tests {
             let tx = tx.clone();
             rt.spawn(move |_ctx| async move {
                 tx.send(i).await.unwrap();
-            }).await;
+            })
+            .await;
         }
         drop(tx);
         let mut count = 0;
-        while let Ok(Some(_)) = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+        while let Ok(Some(_)) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+        {
             count += 1;
         }
         assert_eq!(count, 100);
@@ -263,13 +312,18 @@ mod tests {
         let rt = Runtime::new(1);
         rt.spawn(|_ctx| async move {
             panic!("intentional panic");
-        }).await;
+        })
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         rt.spawn(move |_ctx| async move {
             done_tx.send(42u64).unwrap();
-        }).await;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx).await.unwrap().unwrap();
+        })
+        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result, 42);
     }
 
@@ -283,18 +337,25 @@ mod tests {
     async fn multiple_messages_to_same_process() {
         let rt = Runtime::new(1);
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let receiver = rt.spawn(move |mut ctx| async move {
-            let mut sum = 0u64;
-            for _ in 0..5 {
-                let msg = ctx.recv().await.unwrap();
-                sum += msg.payload().as_u64().unwrap();
-            }
-            done_tx.send(sum).unwrap();
-        }).await;
+        let receiver = rt
+            .spawn(move |mut ctx| async move {
+                let mut sum = 0u64;
+                for _ in 0..5 {
+                    let msg = ctx.recv().await.unwrap();
+                    sum += msg.payload().as_u64().unwrap();
+                }
+                done_tx.send(sum).unwrap();
+            })
+            .await;
         for i in 1..=5u64 {
-            rt.send(receiver, rmpv::Value::Integer(i.into())).await.unwrap();
+            rt.send(receiver, rmpv::Value::Integer(i.into()))
+                .await
+                .unwrap();
         }
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx).await.unwrap().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result, 15);
     }
 
@@ -305,8 +366,12 @@ mod tests {
         rt.spawn(move |ctx| async move {
             let result = ctx.send(ProcessId::new(1, 999), rmpv::Value::Nil).await;
             done_tx.send(result.is_err()).unwrap();
-        }).await;
-        let was_err = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx).await.unwrap().unwrap();
+        })
+        .await;
+        let was_err = tokio::time::timeout(std::time::Duration::from_secs(1), done_rx)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(was_err);
     }
 }

@@ -96,14 +96,23 @@ mod tests {
     #[tokio::test]
     async fn connect_and_send_frame() {
         let transport = TcpTransport::new();
-        let listener = transport.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
             conn.recv().await.unwrap()
         });
         let mut client = transport.connect(addr).await.unwrap();
-        let frame = Frame { version: 1, msg_type: MsgType::Heartbeat, request_id: 0, header: rmpv::Value::Nil, payload: rmpv::Value::Nil };
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::Heartbeat,
+            request_id: 0,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::Nil,
+        };
         client.send(&frame).await.unwrap();
         client.close().await.unwrap();
         let received = server.await.unwrap();
@@ -113,7 +122,10 @@ mod tests {
     #[tokio::test]
     async fn bidirectional_echo() {
         let transport = TcpTransport::new();
-        let listener = transport.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
@@ -121,7 +133,13 @@ mod tests {
             conn.send(&frame).await.unwrap();
         });
         let mut client = transport.connect(addr).await.unwrap();
-        let frame = Frame { version: 1, msg_type: MsgType::Send, request_id: 42, header: rmpv::Value::Nil, payload: rmpv::Value::String("ping".into()) };
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::Send,
+            request_id: 42,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::String("ping".into()),
+        };
         client.send(&frame).await.unwrap();
         let response = client.recv().await.unwrap();
         assert_eq!(response.request_id, 42);
@@ -132,7 +150,10 @@ mod tests {
     #[tokio::test]
     async fn multiple_frames_sequential() {
         let transport = TcpTransport::new();
-        let listener = transport.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
@@ -144,7 +165,16 @@ mod tests {
         });
         let mut client = transport.connect(addr).await.unwrap();
         for i in 0..5u64 {
-            client.send(&Frame { version: 1, msg_type: MsgType::Send, request_id: i, header: rmpv::Value::Nil, payload: rmpv::Value::Integer(i.into()) }).await.unwrap();
+            client
+                .send(&Frame {
+                    version: 1,
+                    msg_type: MsgType::Send,
+                    request_id: i,
+                    header: rmpv::Value::Nil,
+                    payload: rmpv::Value::Integer(i.into()),
+                })
+                .await
+                .unwrap();
         }
         let frames = server.await.unwrap();
         assert_eq!(frames.len(), 5);
@@ -156,7 +186,10 @@ mod tests {
     #[tokio::test]
     async fn large_frame() {
         let transport = TcpTransport::new();
-        let listener = transport.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
@@ -164,7 +197,16 @@ mod tests {
         });
         let mut client = transport.connect(addr).await.unwrap();
         let big = "x".repeat(1_000_000);
-        client.send(&Frame { version: 1, msg_type: MsgType::Send, request_id: 0, header: rmpv::Value::Nil, payload: rmpv::Value::String(big.into()) }).await.unwrap();
+        client
+            .send(&Frame {
+                version: 1,
+                msg_type: MsgType::Send,
+                request_id: 0,
+                header: rmpv::Value::Nil,
+                payload: rmpv::Value::String(big.into()),
+            })
+            .await
+            .unwrap();
         let received = server.await.unwrap();
         assert_eq!(received.payload.as_str().unwrap().len(), 1_000_000);
     }
@@ -172,7 +214,10 @@ mod tests {
     #[tokio::test]
     async fn recv_after_close_returns_error() {
         let transport = TcpTransport::new();
-        let listener = transport.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let server = tokio::spawn(async move {
             let mut conn = listener.accept().await.unwrap();
@@ -187,7 +232,10 @@ mod tests {
     #[tokio::test]
     async fn multiple_clients() {
         let transport = TcpTransport::new();
-        let listener = transport.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let server = tokio::spawn(async move {
             let mut conn1 = listener.accept().await.unwrap();
@@ -198,8 +246,24 @@ mod tests {
         });
         let mut c1 = transport.connect(addr).await.unwrap();
         let mut c2 = transport.connect(addr).await.unwrap();
-        c1.send(&Frame { version: 1, msg_type: MsgType::Send, request_id: 100, header: rmpv::Value::Nil, payload: rmpv::Value::Nil }).await.unwrap();
-        c2.send(&Frame { version: 1, msg_type: MsgType::Send, request_id: 200, header: rmpv::Value::Nil, payload: rmpv::Value::Nil }).await.unwrap();
+        c1.send(&Frame {
+            version: 1,
+            msg_type: MsgType::Send,
+            request_id: 100,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::Nil,
+        })
+        .await
+        .unwrap();
+        c2.send(&Frame {
+            version: 1,
+            msg_type: MsgType::Send,
+            request_id: 200,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::Nil,
+        })
+        .await
+        .unwrap();
         let (r1, r2) = server.await.unwrap();
         let mut ids = vec![r1, r2];
         ids.sort();
@@ -209,7 +273,10 @@ mod tests {
     #[tokio::test]
     async fn high_throughput() {
         let transport = TcpTransport::new();
-        let listener = transport.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
         let count = 1000u64;
         let server = tokio::spawn(async move {
@@ -223,7 +290,16 @@ mod tests {
         });
         let mut client = transport.connect(addr).await.unwrap();
         for i in 0..count {
-            client.send(&Frame { version: 1, msg_type: MsgType::Heartbeat, request_id: i, header: rmpv::Value::Nil, payload: rmpv::Value::Nil }).await.unwrap();
+            client
+                .send(&Frame {
+                    version: 1,
+                    msg_type: MsgType::Heartbeat,
+                    request_id: i,
+                    header: rmpv::Value::Nil,
+                    payload: rmpv::Value::Nil,
+                })
+                .await
+                .unwrap();
         }
         let received = server.await.unwrap();
         assert_eq!(received, count);
@@ -239,9 +315,15 @@ mod tests {
     #[tokio::test]
     async fn listener_local_addr() {
         let transport = TcpTransport::new();
-        let listener = transport.listen("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
         let addr = listener.local_addr();
-        assert_eq!(addr.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
         assert_ne!(addr.port(), 0);
     }
 }

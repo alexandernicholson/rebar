@@ -296,7 +296,10 @@ async fn remote_process_monitor_fires_on_exit() {
 
     // Receive the ProcessDown response
     let timeout = tokio::time::timeout(Duration::from_secs(5), client.recv());
-    let down = timeout.await.expect("timed out waiting for ProcessDown").unwrap();
+    let down = timeout
+        .await
+        .expect("timed out waiting for ProcessDown")
+        .unwrap();
 
     assert_eq!(down.msg_type, MsgType::ProcessDown);
     assert_eq!(down.request_id, 100);

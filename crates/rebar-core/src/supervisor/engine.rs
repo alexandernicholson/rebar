@@ -8,15 +8,12 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::process::{ExitReason, ProcessId};
 use crate::runtime::Runtime;
-use crate::supervisor::spec::{
-    ChildSpec, RestartStrategy, ShutdownStrategy, SupervisorSpec,
-};
+use crate::supervisor::spec::{ChildSpec, RestartStrategy, ShutdownStrategy, SupervisorSpec};
 
 /// A factory that creates the child's async task. Must be callable multiple
 /// times (for restarts) and is shared via Arc.
-pub type ChildFactory = Arc<
-    dyn Fn() -> Pin<Box<dyn Future<Output = ExitReason> + Send>> + Send + Sync,
->;
+pub type ChildFactory =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ExitReason> + Send>> + Send + Sync>;
 
 /// Pairs a `ChildSpec` with its `ChildFactory` for supervisor startup.
 pub struct ChildEntry {
@@ -164,8 +161,7 @@ async fn supervisor_loop(
                 state.children[index].pid = None;
                 state.children[index].shutdown_tx = None;
 
-                let should_restart =
-                    state.children[index].spec.restart.should_restart(&reason);
+                let should_restart = state.children[index].spec.restart.should_restart(&reason);
 
                 if !should_restart {
                     continue;
@@ -351,8 +347,8 @@ async fn shutdown_all_children(children: &mut Vec<ChildState>) {
 mod tests {
     use super::*;
     use crate::supervisor::spec::RestartType;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use tokio::sync::Mutex;
 
     /// Helper to create a runtime for tests.
@@ -536,10 +532,8 @@ mod tests {
         let c1r = Arc::clone(&child_1_restarts);
 
         let entries = vec![
-            ChildEntry::new(ChildSpec::new("crasher"), move || {
-                async move {
-                    ExitReason::Abnormal("crash".into())
-                }
+            ChildEntry::new(ChildSpec::new("crasher"), move || async move {
+                ExitReason::Abnormal("crash".into())
             }),
             ChildEntry::new(ChildSpec::new("stable"), move || {
                 let alive = Arc::clone(&c1a);
@@ -976,16 +970,13 @@ mod tests {
         let start_count = Arc::new(AtomicU32::new(0));
         let sc = Arc::clone(&start_count);
 
-        let entries = vec![ChildEntry::new(
-            ChildSpec::new("crasher"),
-            move || {
-                let sc = Arc::clone(&sc);
-                async move {
-                    sc.fetch_add(1, Ordering::SeqCst);
-                    ExitReason::Abnormal("crash".into())
-                }
-            },
-        )];
+        let entries = vec![ChildEntry::new(ChildSpec::new("crasher"), move || {
+            let sc = Arc::clone(&sc);
+            async move {
+                sc.fetch_add(1, Ordering::SeqCst);
+                ExitReason::Abnormal("crash".into())
+            }
+        })];
 
         // max 2 restarts in 10 seconds
         let spec = SupervisorSpec::new(RestartStrategy::OneForOne)
@@ -1012,25 +1003,22 @@ mod tests {
         let start_count = Arc::new(AtomicU32::new(0));
         let sc = Arc::clone(&start_count);
 
-        let entries = vec![ChildEntry::new(
-            ChildSpec::new("slow_crasher"),
-            move || {
-                let sc = Arc::clone(&sc);
-                async move {
-                    let c = sc.fetch_add(1, Ordering::SeqCst);
-                    if c < 4 {
-                        // Crash, but with delays between each
-                        // The window is 1 second. We space crashes >1s apart
-                        // so the counter resets.
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        ExitReason::Abnormal("crash".into())
-                    } else {
-                        tokio::time::sleep(Duration::from_secs(60)).await;
-                        ExitReason::Normal
-                    }
+        let entries = vec![ChildEntry::new(ChildSpec::new("slow_crasher"), move || {
+            let sc = Arc::clone(&sc);
+            async move {
+                let c = sc.fetch_add(1, Ordering::SeqCst);
+                if c < 4 {
+                    // Crash, but with delays between each
+                    // The window is 1 second. We space crashes >1s apart
+                    // so the counter resets.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ExitReason::Abnormal("crash".into())
+                } else {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    ExitReason::Normal
                 }
-            },
-        )];
+            }
+        })];
 
         // max 2 restarts in 1 second — but since all crashes happen quickly,
         // this WILL exceed the limit. To test reset, we need crashes spaced apart.
@@ -1061,16 +1049,13 @@ mod tests {
         let start_count = Arc::new(AtomicU32::new(0));
         let sc = Arc::clone(&start_count);
 
-        let entries = vec![ChildEntry::new(
-            ChildSpec::new("crasher"),
-            move || {
-                let sc = Arc::clone(&sc);
-                async move {
-                    sc.fetch_add(1, Ordering::SeqCst);
-                    ExitReason::Abnormal("crash".into())
-                }
-            },
-        )];
+        let entries = vec![ChildEntry::new(ChildSpec::new("crasher"), move || {
+            let sc = Arc::clone(&sc);
+            async move {
+                sc.fetch_add(1, Ordering::SeqCst);
+                ExitReason::Abnormal("crash".into())
+            }
+        })];
 
         let spec = SupervisorSpec::new(RestartStrategy::OneForOne)
             .max_restarts(0)
@@ -1210,11 +1195,9 @@ mod tests {
         let rc = Arc::clone(&restart_count);
 
         let entries = vec![
-            ChildEntry::new(ChildSpec::new("crasher"), move || {
-                async move {
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    ExitReason::Abnormal("crash".into())
-                }
+            ChildEntry::new(ChildSpec::new("crasher"), move || async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                ExitReason::Abnormal("crash".into())
             }),
             ChildEntry::new(ChildSpec::new("linked"), move || {
                 let rc = Arc::clone(&rc);
@@ -1337,23 +1320,20 @@ mod tests {
                 let isc = Arc::clone(&isc);
                 let rt_inner = Arc::clone(&rt2);
                 async move {
-                    let inner_entries = vec![ChildEntry::new(
-                        ChildSpec::new("inner_child"),
-                        move || {
+                    let inner_entries =
+                        vec![ChildEntry::new(ChildSpec::new("inner_child"), move || {
                             let isc = Arc::clone(&isc);
                             async move {
                                 isc.fetch_add(1, Ordering::SeqCst);
                                 ExitReason::Abnormal("crash".into())
                             }
-                        },
-                    )];
+                        })];
 
                     let inner_spec = SupervisorSpec::new(RestartStrategy::OneForOne)
                         .max_restarts(0) // escalate immediately
                         .max_seconds(10);
 
-                    let _inner_handle =
-                        start_supervisor(rt_inner, inner_spec, inner_entries).await;
+                    let _inner_handle = start_supervisor(rt_inner, inner_spec, inner_entries).await;
 
                     // Wait for the inner supervisor to exit (it will escalate)
                     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1396,9 +1376,8 @@ mod tests {
                 let ics = Arc::clone(&ics);
                 let rt_inner = Arc::clone(&rt2);
                 async move {
-                    let inner_entries = vec![ChildEntry::new(
-                        ChildSpec::new("inner_child"),
-                        move || {
+                    let inner_entries =
+                        vec![ChildEntry::new(ChildSpec::new("inner_child"), move || {
                             let ics = Arc::clone(&ics);
                             async move {
                                 let c = ics.fetch_add(1, Ordering::SeqCst);
@@ -1409,15 +1388,13 @@ mod tests {
                                     ExitReason::Normal
                                 }
                             }
-                        },
-                    )];
+                        })];
 
                     let inner_spec = SupervisorSpec::new(RestartStrategy::OneForOne)
                         .max_restarts(5)
                         .max_seconds(10);
 
-                    let _inner_handle =
-                        start_supervisor(rt_inner, inner_spec, inner_entries).await;
+                    let _inner_handle = start_supervisor(rt_inner, inner_spec, inner_entries).await;
 
                     // Keep inner supervisor alive
                     tokio::time::sleep(Duration::from_secs(60)).await;

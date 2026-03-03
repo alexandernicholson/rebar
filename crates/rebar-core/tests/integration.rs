@@ -3,8 +3,8 @@
 //! These tests exercise the full runtime from the outside, using only
 //! the crate's public API.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use rebar_core::process::ExitReason;
@@ -103,8 +103,7 @@ async fn fan_out_to_multiple_workers() {
 
     // Collect results.
     let mut results = Vec::new();
-    while let Ok(Some(val)) =
-        tokio::time::timeout(Duration::from_secs(2), results_rx.recv()).await
+    while let Ok(Some(val)) = tokio::time::timeout(Duration::from_secs(2), results_rx.recv()).await
     {
         results.push(val);
     }
@@ -255,9 +254,8 @@ async fn supervisor_one_for_all_cascade() {
                         ExitReason::Abnormal("crash".into())
                     } else {
                         // Check if all children have been started at least twice.
-                        let all_reached = counters_check
-                            .iter()
-                            .all(|c| c.load(Ordering::SeqCst) >= 2);
+                        let all_reached =
+                            counters_check.iter().all(|c| c.load(Ordering::SeqCst) >= 2);
                         if all_reached {
                             if let Some(tx) = all_tx.lock().await.take() {
                                 let _ = tx.send(());
@@ -321,11 +319,7 @@ async fn process_monitor_receives_down() {
         let mut detected = false;
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            if ctx
-                .send(target, rmpv::Value::Nil)
-                .await
-                .is_err()
-            {
+            if ctx.send(target, rmpv::Value::Nil).await.is_err() {
                 detected = true;
                 break;
             }
@@ -439,9 +433,7 @@ async fn spawn_1000_processes_all_complete() {
     drop(tx);
 
     let mut count = 0u64;
-    while let Ok(Some(_)) =
-        tokio::time::timeout(Duration::from_secs(10), rx.recv()).await
-    {
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await {
         count += 1;
     }
 

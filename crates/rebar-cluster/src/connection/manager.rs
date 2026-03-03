@@ -182,10 +182,7 @@ impl ConnectionManager {
 
     /// Attempt to reconnect to a node. Returns the backoff delay that should
     /// be waited before the next attempt if this attempt fails.
-    pub async fn attempt_reconnect(
-        &mut self,
-        node_id: u64,
-    ) -> Result<Duration, ConnectionError> {
+    pub async fn attempt_reconnect(&mut self, node_id: u64) -> Result<Duration, ConnectionError> {
         let addr = self
             .addresses
             .get(&node_id)

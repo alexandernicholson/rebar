@@ -144,9 +144,10 @@ mod tests {
             version: 1,
             msg_type: MsgType::Send,
             request_id: 0,
-            header: rmpv::Value::Map(vec![
-                (rmpv::Value::String("dest".into()), rmpv::Value::Integer(42.into())),
-            ]),
+            header: rmpv::Value::Map(vec![(
+                rmpv::Value::String("dest".into()),
+                rmpv::Value::Integer(42.into()),
+            )]),
             payload: rmpv::Value::String("hello".into()),
         };
         let bytes = frame.encode();
@@ -158,14 +159,26 @@ mod tests {
 
     #[test]
     fn encode_decode_heartbeat() {
-        let frame = Frame { version: 1, msg_type: MsgType::Heartbeat, request_id: 0, header: rmpv::Value::Nil, payload: rmpv::Value::Nil };
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::Heartbeat,
+            request_id: 0,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::Nil,
+        };
         let decoded = Frame::decode(&frame.encode()).unwrap();
         assert_eq!(decoded.msg_type, MsgType::Heartbeat);
     }
 
     #[test]
     fn encode_decode_with_request_id() {
-        let frame = Frame { version: 1, msg_type: MsgType::NameLookup, request_id: 12345, header: rmpv::Value::Nil, payload: rmpv::Value::Nil };
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::NameLookup,
+            request_id: 12345,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::Nil,
+        };
         let decoded = Frame::decode(&frame.encode()).unwrap();
         assert_eq!(decoded.request_id, 12345);
     }
@@ -173,14 +186,28 @@ mod tests {
     #[test]
     fn all_msg_types_roundtrip() {
         let types = [
-            MsgType::Send, MsgType::Monitor, MsgType::Demonitor,
-            MsgType::Link, MsgType::Unlink, MsgType::Exit,
-            MsgType::ProcessDown, MsgType::NameLookup,
-            MsgType::NameRegister, MsgType::NameUnregister,
-            MsgType::Heartbeat, MsgType::HeartbeatAck, MsgType::NodeInfo,
+            MsgType::Send,
+            MsgType::Monitor,
+            MsgType::Demonitor,
+            MsgType::Link,
+            MsgType::Unlink,
+            MsgType::Exit,
+            MsgType::ProcessDown,
+            MsgType::NameLookup,
+            MsgType::NameRegister,
+            MsgType::NameUnregister,
+            MsgType::Heartbeat,
+            MsgType::HeartbeatAck,
+            MsgType::NodeInfo,
         ];
         for msg_type in types {
-            let frame = Frame { version: 1, msg_type, request_id: 0, header: rmpv::Value::Nil, payload: rmpv::Value::Nil };
+            let frame = Frame {
+                version: 1,
+                msg_type,
+                request_id: 0,
+                header: rmpv::Value::Nil,
+                payload: rmpv::Value::Nil,
+            };
             let decoded = Frame::decode(&frame.encode()).unwrap();
             assert_eq!(decoded.msg_type, msg_type);
         }
@@ -188,7 +215,14 @@ mod tests {
 
     #[test]
     fn decode_invalid_msg_type() {
-        let mut bytes = Frame { version: 1, msg_type: MsgType::Send, request_id: 0, header: rmpv::Value::Nil, payload: rmpv::Value::Nil }.encode();
+        let mut bytes = Frame {
+            version: 1,
+            msg_type: MsgType::Send,
+            request_id: 0,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::Nil,
+        }
+        .encode();
         bytes[1] = 0xFF;
         assert!(Frame::decode(&bytes).is_err());
     }
@@ -200,7 +234,13 @@ mod tests {
 
     #[test]
     fn decode_truncated_payload() {
-        let frame = Frame { version: 1, msg_type: MsgType::Send, request_id: 0, header: rmpv::Value::Nil, payload: rmpv::Value::String("data".into()) };
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::Send,
+            request_id: 0,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::String("data".into()),
+        };
         let bytes = frame.encode();
         let truncated = &bytes[..bytes.len() - 2];
         assert!(Frame::decode(truncated).is_err());
@@ -214,7 +254,13 @@ mod tests {
     #[test]
     fn large_payload_roundtrip() {
         let big_string = "x".repeat(100_000);
-        let frame = Frame { version: 1, msg_type: MsgType::Send, request_id: 0, header: rmpv::Value::Nil, payload: rmpv::Value::String(big_string.clone().into()) };
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::Send,
+            request_id: 0,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::String(big_string.clone().into()),
+        };
         let decoded = Frame::decode(&frame.encode()).unwrap();
         assert_eq!(decoded.payload.as_str().unwrap().len(), 100_000);
     }
@@ -222,40 +268,72 @@ mod tests {
     #[test]
     fn binary_payload_roundtrip() {
         let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let frame = Frame { version: 1, msg_type: MsgType::Send, request_id: 0, header: rmpv::Value::Nil, payload: rmpv::Value::Binary(data.clone()) };
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::Send,
+            request_id: 0,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::Binary(data.clone()),
+        };
         let decoded = Frame::decode(&frame.encode()).unwrap();
         assert_eq!(decoded.payload, rmpv::Value::Binary(data));
     }
 
     #[test]
     fn nested_map_payload() {
-        let payload = rmpv::Value::Map(vec![
-            (rmpv::Value::String("nested".into()), rmpv::Value::Map(vec![
-                (rmpv::Value::String("deep".into()), rmpv::Value::Integer(42.into())),
-            ])),
-        ]);
-        let frame = Frame { version: 1, msg_type: MsgType::Send, request_id: 0, header: rmpv::Value::Nil, payload };
+        let payload = rmpv::Value::Map(vec![(
+            rmpv::Value::String("nested".into()),
+            rmpv::Value::Map(vec![(
+                rmpv::Value::String("deep".into()),
+                rmpv::Value::Integer(42.into()),
+            )]),
+        )]);
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::Send,
+            request_id: 0,
+            header: rmpv::Value::Nil,
+            payload,
+        };
         let decoded = Frame::decode(&frame.encode()).unwrap();
         assert_eq!(decoded.payload.as_map().unwrap().len(), 1);
     }
 
     #[test]
     fn max_request_id() {
-        let frame = Frame { version: 1, msg_type: MsgType::Send, request_id: u64::MAX, header: rmpv::Value::Nil, payload: rmpv::Value::Nil };
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::Send,
+            request_id: u64::MAX,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::Nil,
+        };
         let decoded = Frame::decode(&frame.encode()).unwrap();
         assert_eq!(decoded.request_id, u64::MAX);
     }
 
     #[test]
     fn version_preserved() {
-        let frame = Frame { version: 42, msg_type: MsgType::Send, request_id: 0, header: rmpv::Value::Nil, payload: rmpv::Value::Nil };
+        let frame = Frame {
+            version: 42,
+            msg_type: MsgType::Send,
+            request_id: 0,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::Nil,
+        };
         let decoded = Frame::decode(&frame.encode()).unwrap();
         assert_eq!(decoded.version, 42);
     }
 
     #[test]
     fn encode_deterministic() {
-        let frame = Frame { version: 1, msg_type: MsgType::Heartbeat, request_id: 0, header: rmpv::Value::Nil, payload: rmpv::Value::Nil };
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::Heartbeat,
+            request_id: 0,
+            header: rmpv::Value::Nil,
+            payload: rmpv::Value::Nil,
+        };
         let a = frame.encode();
         let b = frame.encode();
         assert_eq!(a, b);
@@ -264,11 +342,23 @@ mod tests {
     #[test]
     fn header_and_payload_both_populated() {
         let header = rmpv::Value::Map(vec![
-            (rmpv::Value::String("from".into()), rmpv::Value::Integer(1.into())),
-            (rmpv::Value::String("to".into()), rmpv::Value::Integer(2.into())),
+            (
+                rmpv::Value::String("from".into()),
+                rmpv::Value::Integer(1.into()),
+            ),
+            (
+                rmpv::Value::String("to".into()),
+                rmpv::Value::Integer(2.into()),
+            ),
         ]);
         let payload = rmpv::Value::String("body".into());
-        let frame = Frame { version: 1, msg_type: MsgType::Send, request_id: 7, header, payload };
+        let frame = Frame {
+            version: 1,
+            msg_type: MsgType::Send,
+            request_id: 7,
+            header,
+            payload,
+        };
         let decoded = Frame::decode(&frame.encode()).unwrap();
         assert_eq!(decoded.header.as_map().unwrap().len(), 2);
         assert_eq!(decoded.payload.as_str().unwrap(), "body");

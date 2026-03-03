@@ -127,9 +127,9 @@ See [Benchmarks](docs/benchmarks.md) for full methodology and results.
 - [x] OR-Set CRDT global process registry
 - [x] Connection manager with exponential backoff
 - [x] C-ABI FFI bindings
-- [ ] QUIC transport
-- [ ] Hot code reloading
-- [ ] Distribution layer integration (cluster <-> core)
+- [ ] QUIC transport (`quinn`-based, replacing TCP as production default)
+- [ ] Distribution layer integration (cluster <-> core, transparent remote `send()`)
+- [ ] Graceful node drain (coordinated shutdown with state migration)
 
 ## Documentation
 

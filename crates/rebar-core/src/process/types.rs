@@ -151,9 +151,10 @@ mod tests {
     #[test]
     fn message_with_map_payload() {
         let from = ProcessId::new(1, 1);
-        let payload = rmpv::Value::Map(vec![
-            (rmpv::Value::String("key".into()), rmpv::Value::Integer(42.into())),
-        ]);
+        let payload = rmpv::Value::Map(vec![(
+            rmpv::Value::String("key".into()),
+            rmpv::Value::Integer(42.into()),
+        )]);
         let msg = Message::new(from, payload.clone());
         assert_eq!(*msg.payload(), payload);
     }

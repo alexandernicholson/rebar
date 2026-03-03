@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
+use dashmap::mapref::one::Ref;
 
 use crate::process::mailbox::MailboxTx;
 use crate::process::{Message, ProcessId, SendError};

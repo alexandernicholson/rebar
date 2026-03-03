@@ -1,5 +1,5 @@
-use std::time::Duration;
 use crate::process::ExitReason;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub enum RestartStrategy {

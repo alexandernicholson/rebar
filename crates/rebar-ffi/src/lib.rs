@@ -194,11 +194,7 @@ pub extern "C" fn rebar_spawn(
 ///
 /// Returns 0 on success, or a negative error code on failure.
 #[unsafe(no_mangle)]
-pub extern "C" fn rebar_send(
-    rt: *mut RebarRuntime,
-    dest: RebarPid,
-    msg: *const RebarMsg,
-) -> i32 {
+pub extern "C" fn rebar_send(rt: *mut RebarRuntime, dest: RebarPid, msg: *const RebarMsg) -> i32 {
     if rt.is_null() || msg.is_null() {
         return REBAR_ERR_NULL_PTR;
     }
@@ -207,9 +203,9 @@ pub extern "C" fn rebar_send(
     let dest_pid = dest.to_process_id();
     let payload = rmpv::Value::Binary(msg.data.clone());
 
-    let result = rt.tokio_rt.block_on(async {
-        rt.runtime.send(dest_pid, payload).await
-    });
+    let result = rt
+        .tokio_rt
+        .block_on(async { rt.runtime.send(dest_pid, payload).await });
 
     match result {
         Ok(()) => REBAR_OK,
@@ -314,9 +310,9 @@ pub extern "C" fn rebar_send_named(
     let msg_ref = unsafe { &*msg };
     let payload = rmpv::Value::Binary(msg_ref.data.clone());
 
-    let result = rt_ref.tokio_rt.block_on(async {
-        rt_ref.runtime.send(dest_pid, payload).await
-    });
+    let result = rt_ref
+        .tokio_rt
+        .block_on(async { rt_ref.runtime.send(dest_pid, payload).await });
 
     match result {
         Ok(()) => REBAR_OK,

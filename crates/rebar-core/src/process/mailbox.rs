@@ -92,8 +92,7 @@ impl MailboxTx {
         match &self.inner {
             TxInner::Unbounded(tx) => {
                 let from = msg.from();
-                tx.send(msg)
-                    .map_err(|_| SendError::ProcessDead(from))
+                tx.send(msg).map_err(|_| SendError::ProcessDead(from))
             }
             TxInner::Bounded(tx) => {
                 let from = msg.from();
@@ -114,8 +113,7 @@ impl MailboxTx {
         match &self.inner {
             TxInner::Unbounded(tx) => {
                 let from = msg.from();
-                tx.send(msg)
-                    .map_err(|_| SendError::ProcessDead(from))
+                tx.send(msg).map_err(|_| SendError::ProcessDead(from))
             }
             TxInner::Bounded(tx) => {
                 let from = msg.from();
@@ -144,7 +142,10 @@ impl MailboxRx {
     /// Returns `Some(message)` if a message arrives within the given duration,
     /// or `None` if the timeout expires or the channel is closed.
     pub async fn recv_timeout(&mut self, duration: Duration) -> Option<Message> {
-        tokio::time::timeout(duration, self.recv()).await.ok().flatten()
+        tokio::time::timeout(duration, self.recv())
+            .await
+            .ok()
+            .flatten()
     }
 }
 
@@ -191,7 +192,11 @@ mod tests {
     async fn multiple_messages_fifo() {
         let (tx, mut rx) = Mailbox::unbounded();
         for i in 0..5u64 {
-            tx.send(Message::new(ProcessId::new(1, i), rmpv::Value::Integer(i.into()))).unwrap();
+            tx.send(Message::new(
+                ProcessId::new(1, i),
+                rmpv::Value::Integer(i.into()),
+            ))
+            .unwrap();
         }
         for i in 0..5u64 {
             let msg = rx.recv().await.unwrap();
@@ -236,7 +241,11 @@ mod tests {
         let (tx, mut rx) = Mailbox::unbounded();
         let count = 10_000;
         for i in 0..count {
-            tx.send(Message::new(ProcessId::new(1, 1), rmpv::Value::Integer(i.into()))).unwrap();
+            tx.send(Message::new(
+                ProcessId::new(1, 1),
+                rmpv::Value::Integer(i.into()),
+            ))
+            .unwrap();
         }
         for _ in 0..count {
             rx.recv().await.unwrap();
@@ -250,14 +259,22 @@ mod tests {
         for i in 0..10u64 {
             let tx = tx.clone();
             handles.push(tokio::spawn(async move {
-                tx.send(Message::new(ProcessId::new(1, i), rmpv::Value::Integer(i.into()))).unwrap();
+                tx.send(Message::new(
+                    ProcessId::new(1, i),
+                    rmpv::Value::Integer(i.into()),
+                ))
+                .unwrap();
             }));
         }
         for h in handles {
             h.await.unwrap();
         }
         let mut received = 0;
-        while rx.recv_timeout(std::time::Duration::from_millis(100)).await.is_some() {
+        while rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .await
+            .is_some()
+        {
             received += 1;
         }
         assert_eq!(received, 10);
@@ -266,10 +283,11 @@ mod tests {
     #[tokio::test]
     async fn bounded_try_send_full_returns_mailbox_full() {
         let (tx, _rx) = Mailbox::bounded(1);
-        tx.send(Message::new(ProcessId::new(1, 1), rmpv::Value::Nil)).unwrap();
+        tx.send(Message::new(ProcessId::new(1, 1), rmpv::Value::Nil))
+            .unwrap();
         let result = tx.try_send(Message::new(ProcessId::new(1, 2), rmpv::Value::Nil));
         match result {
-            Err(SendError::MailboxFull(_)) => {},
+            Err(SendError::MailboxFull(_)) => {}
             other => panic!("expected MailboxFull, got {:?}", other),
         }
     }

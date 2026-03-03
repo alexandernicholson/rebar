@@ -70,7 +70,9 @@ impl FailureDetector {
         let expired: Vec<u64> = self
             .suspect_timers
             .iter()
-            .filter(|(_, suspected_at)| now.duration_since(**suspected_at) >= config.suspect_timeout)
+            .filter(|(_, suspected_at)| {
+                now.duration_since(**suspected_at) >= config.suspect_timeout
+            })
             .map(|(&id, _)| id)
             .collect();
 
@@ -316,7 +318,11 @@ mod tests {
             seen.insert(target);
         }
         // Probabilistically should have seen all 3 nodes
-        assert!(seen.len() >= 2, "Expected at least 2 distinct targets, got {}", seen.len());
+        assert!(
+            seen.len() >= 2,
+            "Expected at least 2 distinct targets, got {}",
+            seen.len()
+        );
     }
 
     #[test]

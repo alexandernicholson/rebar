@@ -220,6 +220,21 @@ impl ConnectionManager {
     pub fn reconnect_policy(&self) -> &ReconnectPolicy {
         &self.reconnect_policy
     }
+
+    /// Drain all connections. Closes each connection and clears the table.
+    /// Returns the number of connections closed.
+    pub async fn drain_connections(&mut self) -> usize {
+        let count = self.connections.len();
+        let node_ids: Vec<u64> = self.connections.keys().copied().collect();
+        for node_id in node_ids {
+            if let Some(mut conn) = self.connections.remove(&node_id) {
+                let _ = conn.close().await;
+            }
+        }
+        self.addresses.clear();
+        self.reconnect_attempts.clear();
+        count
+    }
 }
 
 #[cfg(test)]
@@ -614,5 +629,22 @@ mod tests {
         mgr.disconnect(1).await.unwrap();
         mgr.disconnect(3).await.unwrap();
         assert_eq!(mgr.connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_connections_closes_all() {
+        let setup = MockSetup::new();
+        let (mut mgr, _mock) = setup.manager();
+
+        mgr.connect(1, test_addr(4001)).await.unwrap();
+        mgr.connect(2, test_addr(4002)).await.unwrap();
+        mgr.connect(3, test_addr(4003)).await.unwrap();
+
+        let closed = mgr.drain_connections().await;
+        assert_eq!(closed, 3);
+        assert_eq!(mgr.connection_count(), 0);
+        assert!(!mgr.is_connected(1));
+        assert!(!mgr.is_connected(2));
+        assert!(!mgr.is_connected(3));
     }
 }

@@ -103,6 +103,47 @@ impl NodeDrain {
 
         (drained, timed_out)
     }
+
+    /// Execute the full three-phase drain protocol.
+    pub async fn drain(
+        &self,
+        node_id: u64,
+        addr: SocketAddr,
+        gossip: &mut GossipQueue,
+        registry: &mut Registry,
+        remote_rx: &mut tokio::sync::mpsc::Receiver<crate::router::RouterCommand>,
+        connection_manager: &mut crate::connection::manager::ConnectionManager,
+        process_count: usize,
+    ) -> DrainResult {
+        let mut phase_durations = [Duration::ZERO; 3];
+        let mut timed_out = false;
+
+        // Phase 1: Announce
+        let phase1_start = Instant::now();
+        let _names_removed = self.announce(node_id, addr, gossip, registry);
+        phase_durations[0] = phase1_start.elapsed();
+
+        // Phase 2: Drain outbound
+        let phase2_start = Instant::now();
+        let (messages_drained, phase2_timed_out) =
+            self.drain_outbound(remote_rx, connection_manager).await;
+        phase_durations[1] = phase2_start.elapsed();
+        if phase2_timed_out {
+            timed_out = true;
+        }
+
+        // Phase 3: Shutdown connections
+        let phase3_start = Instant::now();
+        let _connections_closed = connection_manager.drain_connections().await;
+        phase_durations[2] = phase3_start.elapsed();
+
+        DrainResult {
+            processes_stopped: process_count,
+            messages_drained,
+            phase_durations,
+            timed_out,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -297,5 +338,149 @@ mod tests {
         assert!(elapsed < Duration::from_secs(1));
 
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn full_drain_protocol() {
+        use crate::connection::manager::ConnectionManager;
+        use crate::protocol::{Frame, MsgType};
+        use crate::router::RouterCommand;
+        use crate::transport::{TransportConnection, TransportError};
+
+        struct NullConn;
+        #[async_trait::async_trait]
+        impl TransportConnection for NullConn {
+            async fn send(&mut self, _: &Frame) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn recv(&mut self) -> Result<Frame, TransportError> {
+                Err(TransportError::ConnectionClosed)
+            }
+            async fn close(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        struct NullConnector;
+        #[async_trait::async_trait]
+        impl crate::connection::manager::TransportConnector for NullConnector {
+            async fn connect(
+                &self,
+                _: SocketAddr,
+            ) -> Result<Box<dyn TransportConnection>, TransportError> {
+                Ok(Box::new(NullConn))
+            }
+        }
+
+        let mut gossip = GossipQueue::new();
+        let mut registry = Registry::new();
+        registry.register("svc", ProcessId::new(1, 1), 1, 100);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RouterCommand>(64);
+        let mut mgr = ConnectionManager::new(Box::new(NullConnector));
+        mgr.connect(2, test_addr()).await.unwrap();
+
+        tx.send(RouterCommand::Send {
+            node_id: 2,
+            frame: Frame {
+                version: 1,
+                msg_type: MsgType::Send,
+                request_id: 0,
+                header: rmpv::Value::Nil,
+                payload: rmpv::Value::Nil,
+            },
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let drain = NodeDrain::new(DrainConfig {
+            announce_timeout: Duration::from_millis(100),
+            drain_timeout: Duration::from_secs(1),
+            shutdown_timeout: Duration::from_millis(100),
+        });
+
+        let result = drain
+            .drain(
+                1,
+                test_addr(),
+                &mut gossip,
+                &mut registry,
+                &mut rx,
+                &mut mgr,
+                5,
+            )
+            .await;
+
+        assert_eq!(result.messages_drained, 1);
+        assert_eq!(result.processes_stopped, 5);
+        assert!(!result.timed_out);
+        assert!(registry.lookup("svc").is_none());
+
+        let updates = gossip.drain(10);
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, GossipUpdate::Leave { node_id: 1, .. }))
+        );
+        assert_eq!(mgr.connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_returns_stats() {
+        use crate::connection::manager::ConnectionManager;
+        use crate::router::RouterCommand;
+        use crate::transport::{TransportConnection, TransportError};
+
+        struct NullConn;
+        #[async_trait::async_trait]
+        impl TransportConnection for NullConn {
+            async fn send(&mut self, _: &crate::protocol::Frame) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn recv(&mut self) -> Result<crate::protocol::Frame, TransportError> {
+                Err(TransportError::ConnectionClosed)
+            }
+            async fn close(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        struct NullConnector;
+        #[async_trait::async_trait]
+        impl crate::connection::manager::TransportConnector for NullConnector {
+            async fn connect(
+                &self,
+                _: SocketAddr,
+            ) -> Result<Box<dyn TransportConnection>, TransportError> {
+                Ok(Box::new(NullConn))
+            }
+        }
+
+        let mut gossip = GossipQueue::new();
+        let mut registry = Registry::new();
+        let (_tx, mut rx) = tokio::sync::mpsc::channel::<RouterCommand>(64);
+        drop(_tx);
+        let mut mgr = ConnectionManager::new(Box::new(NullConnector));
+
+        let drain = NodeDrain::new(DrainConfig::default());
+        let result = drain
+            .drain(
+                1,
+                test_addr(),
+                &mut gossip,
+                &mut registry,
+                &mut rx,
+                &mut mgr,
+                0,
+            )
+            .await;
+
+        for d in &result.phase_durations {
+            assert!(*d >= Duration::ZERO);
+        }
+        assert_eq!(result.messages_drained, 0);
+        assert_eq!(result.processes_stopped, 0);
+        assert!(!result.timed_out);
     }
 }

@@ -76,3 +76,21 @@ func (r *Runtime) SendNamed(name string, data []byte) error {
 	)
 	return checkError(rc)
 }
+
+// SpawnActor spawns a new process backed by the given Actor.
+// The actor's HandleMessage is called with a nil message on startup
+// (as a lifecycle hook), and the process PID is returned.
+func (r *Runtime) SpawnActor(actor Actor) (Pid, error) {
+	id := registerActor(actor, r)
+
+	actorMu.Lock()
+	activeActorID = id
+	actorMu.Unlock()
+
+	var pidOut C.rebar_pid_t
+	rc := C.rebar_spawn_go(r.ptr, &pidOut)
+	if err := checkError(rc); err != nil {
+		return Pid{}, err
+	}
+	return pidFromC(pidOut), nil
+}

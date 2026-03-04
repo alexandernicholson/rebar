@@ -3,6 +3,6 @@
   "version": "0.1.0",
   "exports": "./src/mod.ts",
   "tasks": {
-    "test": "deno test --unstable-ffi --allow-ffi tests/"
+    "test": "deno test --unstable-ffi --allow-ffi --allow-env tests/"
   }
 }

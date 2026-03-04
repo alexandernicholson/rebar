@@ -36,10 +36,13 @@ export class Context {
   }
 }
 
+// deno-lint-ignore no-explicit-any
+type AnyCallback = Deno.UnsafeCallback<any>;
+
 /** Manages a Rebar actor runtime. Implements Disposable for `using`. */
 export class Runtime implements Disposable {
   private ptr: Deno.PointerValue;
-  private callbacks: Deno.UnsafeCallback[] = [];
+  private callbacks: AnyCallback[] = [];
 
   constructor(nodeId: number | bigint = 1n) {
     this.ptr = lib.symbols.rebar_runtime_new(BigInt(nodeId));
@@ -66,11 +69,15 @@ export class Runtime implements Disposable {
 
   /** Send a message to a process by PID. */
   send(dest: Pid, data: Uint8Array): void {
-    const msg = lib.symbols.rebar_msg_create(data, data.byteLength);
+    const msg = lib.symbols.rebar_msg_create(
+      data as BufferSource,
+      BigInt(data.byteLength),
+    );
     try {
+      const pidBuf = new BigUint64Array([BigInt(dest.nodeId), BigInt(dest.localId)]);
       const rc = lib.symbols.rebar_send(
         this.ptr,
-        new BigUint64Array([BigInt(dest.nodeId), BigInt(dest.localId)]),
+        pidBuf as unknown as BufferSource,
         msg,
       );
       checkError(rc);
@@ -82,11 +89,12 @@ export class Runtime implements Disposable {
   /** Register a name for a PID. */
   register(name: string, pid: Pid): void {
     const nameBytes = new TextEncoder().encode(name);
+    const pidBuf = new BigUint64Array([BigInt(pid.nodeId), BigInt(pid.localId)]);
     const rc = lib.symbols.rebar_register(
       this.ptr,
-      nameBytes,
-      nameBytes.byteLength,
-      new BigUint64Array([BigInt(pid.nodeId), BigInt(pid.localId)]),
+      nameBytes as BufferSource,
+      BigInt(nameBytes.byteLength),
+      pidBuf as unknown as BufferSource,
     );
     checkError(rc);
   }
@@ -97,9 +105,9 @@ export class Runtime implements Disposable {
     const pidBuf = new BigUint64Array(2);
     const rc = lib.symbols.rebar_whereis(
       this.ptr,
-      nameBytes,
-      nameBytes.byteLength,
-      pidBuf,
+      nameBytes as BufferSource,
+      BigInt(nameBytes.byteLength),
+      pidBuf as unknown as BufferSource,
     );
     checkError(rc);
     return new Pid(pidBuf[0], pidBuf[1]);
@@ -108,12 +116,15 @@ export class Runtime implements Disposable {
   /** Send a message to a named process. */
   sendNamed(name: string, data: Uint8Array): void {
     const nameBytes = new TextEncoder().encode(name);
-    const msg = lib.symbols.rebar_msg_create(data, data.byteLength);
+    const msg = lib.symbols.rebar_msg_create(
+      data as BufferSource,
+      BigInt(data.byteLength),
+    );
     try {
       const rc = lib.symbols.rebar_send_named(
         this.ptr,
-        nameBytes,
-        nameBytes.byteLength,
+        nameBytes as BufferSource,
+        BigInt(nameBytes.byteLength),
         msg,
       );
       checkError(rc);
@@ -132,15 +143,36 @@ export class Runtime implements Disposable {
         parameters: [{ struct: ["u64", "u64"] }],
         result: "void",
       } as const,
-      (pidStruct: BigUint64Array) => {
-        const pid = new Pid(pidStruct[0], pidStruct[1]);
+      // deno-lint-ignore no-explicit-any
+      (pidStruct: any) => {
+        // Deno passes struct parameters as a Uint8Array containing the raw bytes.
+        // We need to reinterpret as BigUint64Array to read the two u64 fields.
+        let nodeId: bigint;
+        let localId: bigint;
+        if (pidStruct instanceof BigUint64Array) {
+          nodeId = pidStruct[0];
+          localId = pidStruct[1];
+        } else if (pidStruct instanceof Uint8Array) {
+          const view = new DataView(pidStruct.buffer);
+          nodeId = view.getBigUint64(0, true);
+          localId = view.getBigUint64(8, true);
+        } else {
+          // Fallback: treat as BigUint64Array-like
+          nodeId = BigInt(pidStruct[0]);
+          localId = BigInt(pidStruct[1]);
+        }
+        const pid = new Pid(nodeId, localId);
         const ctx = new Context(pid, runtimeRef);
         actor.handleMessage(ctx, null);
       },
     );
     this.callbacks.push(callback);
 
-    const rc = lib.symbols.rebar_spawn(this.ptr, callback.pointer, pidBuf);
+    const rc = lib.symbols.rebar_spawn(
+      this.ptr,
+      callback.pointer,
+      pidBuf as unknown as BufferSource,
+    );
     checkError(rc);
     return new Pid(pidBuf[0], pidBuf[1]);
   }

@@ -20,6 +20,18 @@ Rebar brings Erlang/OTP's battle-tested actor model to Rust. It provides lightwe
 - **C-ABI FFI bindings** — Call into the actor runtime from Go, Python, and TypeScript via a stable C interface
 - **229 passing tests** — Comprehensive test coverage across all crates
 
+### Client Libraries
+
+Idiomatic wrappers for embedding Rebar in Go, Python, and TypeScript applications:
+
+| Language | Package | Actor Pattern |
+|----------|---------|--------------|
+| Go | `clients/go/` | `Actor` interface with `HandleMessage(ctx, msg)` |
+| Python | `clients/python/` | `Actor` ABC with `handle_message(ctx, msg)` |
+| TypeScript | `clients/typescript/` | `Actor` abstract class with `handleMessage(ctx, msg)` |
+
+See [Client Libraries](clients/README.md) for build instructions.
+
 ## Architecture Overview
 
 ```mermaid

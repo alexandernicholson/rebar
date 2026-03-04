@@ -736,4 +736,5 @@ Key points:
 - Check the API Reference: [rebar-core](api/rebar-core.md) | [rebar-cluster](api/rebar-cluster.md) | [rebar-ffi](api/rebar-ffi.md) for complete type documentation.
 - Explore the internals: [Supervisor Engine](internals/supervisor-engine.md) | [Wire Protocol](internals/wire-protocol.md) | [SWIM Protocol](internals/swim-protocol.md) | [CRDT Registry](internals/crdt-registry.md).
 - Deep dives: [QUIC Transport](internals/quic-transport.md) | [Distribution Layer](internals/distribution-layer.md) | [Node Drain](internals/node-drain.md).
+- Client libraries: [Go](clients/go/README.md) | [Python](clients/python/README.md) | [TypeScript](clients/typescript/README.md) for using Rebar from other languages.
 - Run the [benchmarks](benchmarks.md) to see Rebar's performance characteristics.

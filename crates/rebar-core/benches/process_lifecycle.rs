@@ -10,10 +10,10 @@ fn tokio_rt() -> TokioRuntime {
 /// Benchmark: single process spawn latency
 fn bench_spawn_single(c: &mut Criterion) {
     let tokio_rt = tokio_rt();
+    let rt = tokio_rt.block_on(async { Runtime::new(1) });
     c.bench_function("process_lifecycle/spawn_single", |b| {
         b.iter(|| {
             tokio_rt.block_on(async {
-                let rt = Runtime::new(1);
                 let (done_tx, done_rx) = tokio::sync::oneshot::channel();
                 rt.spawn(move |_ctx| async move {
                     let _ = done_tx.send(());
@@ -36,9 +36,9 @@ fn bench_spawn_batch(c: &mut Criterion) {
             &count,
             |b, &count| {
                 let tokio_rt = tokio_rt();
+                let rt = tokio_rt.block_on(async { Runtime::new(1) });
                 b.iter(|| {
                     tokio_rt.block_on(async {
-                        let rt = Runtime::new(1);
                         let (done_tx, mut done_rx) =
                             tokio::sync::mpsc::channel::<()>(count);
 
@@ -101,10 +101,10 @@ fn bench_spawn_teardown(c: &mut Criterion) {
 /// Benchmark: spawn with immediate message send (realistic usage)
 fn bench_spawn_and_send(c: &mut Criterion) {
     let tokio_rt = tokio_rt();
+    let rt = tokio_rt.block_on(async { Runtime::new(1) });
     c.bench_function("process_lifecycle/spawn_and_send", |b| {
         b.iter(|| {
             tokio_rt.block_on(async {
-                let rt = Runtime::new(1);
                 let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
                 let pid = rt

@@ -18,9 +18,9 @@ fn bench_ping_pong(c: &mut Criterion) {
             &count,
             |b, &count| {
                 let tokio_rt = tokio_rt();
+                let rt = tokio_rt.block_on(async { Runtime::new(1) });
                 b.iter(|| {
                     tokio_rt.block_on(async {
-                        let rt = Runtime::new(1);
                         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
                         let receiver = rt
@@ -56,9 +56,9 @@ fn bench_fan_out(c: &mut Criterion) {
             &n_receivers,
             |b, &n_receivers| {
                 let tokio_rt = tokio_rt();
+                let rt = tokio_rt.block_on(async { Runtime::new(1) });
                 b.iter(|| {
                     tokio_rt.block_on(async {
-                        let rt = Runtime::new(1);
                         let (done_tx, mut done_rx) =
                             tokio::sync::mpsc::channel::<()>(n_receivers);
 
@@ -101,9 +101,9 @@ fn bench_fan_in(c: &mut Criterion) {
             &n_senders,
             |b, &n_senders| {
                 let tokio_rt = tokio_rt();
+                let rt = tokio_rt.block_on(async { Runtime::new(1) });
                 b.iter(|| {
                     tokio_rt.block_on(async {
-                        let rt = Runtime::new(1);
                         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
                         let receiver = rt
@@ -152,10 +152,10 @@ fn bench_message_sizes(c: &mut Criterion) {
     for (name, payload) in payloads {
         group.bench_with_input(BenchmarkId::new("send_recv", name), &payload, |b, payload| {
             let tokio_rt = tokio_rt();
+            let rt = tokio_rt.block_on(async { Runtime::new(1) });
             let payload = payload.clone();
             b.iter(|| {
                 tokio_rt.block_on(async {
-                    let rt = Runtime::new(1);
                     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
                     let payload_clone = payload.clone();
 

@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 use tokio::sync::{mpsc, oneshot};
@@ -118,7 +119,7 @@ pub async fn start_supervisor(
 }
 
 /// The main supervisor loop.
-#[instrument(level = "trace", skip(spec, children, msg_rx, msg_tx))]
+#[cfg_attr(feature = "tracing", instrument(level = "trace", skip(spec, children, msg_rx, msg_tx)))]
 async fn supervisor_loop(
     spec: SupervisorSpec,
     children: Vec<ChildEntry>,
@@ -272,7 +273,7 @@ impl SupervisorState {
 }
 
 /// Start (or restart) a child, spawning it as a tokio task.
-#[instrument(level = "trace", skip(child, msg_tx))]
+#[cfg_attr(feature = "tracing", instrument(level = "trace", skip(child, msg_tx)))]
 fn start_child(
     child: &mut ChildState,
     index: usize,
@@ -318,7 +319,7 @@ fn start_child(
 }
 
 /// Stop a single child according to its shutdown strategy.
-#[instrument(level = "trace", skip(child))]
+#[cfg_attr(feature = "tracing", instrument(level = "trace", skip(child)))]
 async fn stop_child(child: &mut ChildState) {
     if let Some(tx) = child.shutdown_tx.take() {
         match &child.spec.shutdown {

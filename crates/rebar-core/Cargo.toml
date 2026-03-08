@@ -6,13 +6,17 @@ license.workspace = true
 repository.workspace = true
 description = "Core actor primitives and supervision for the Rebar runtime"
 
+[features]
+default = []
+tracing = ["dep:tracing"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 dashmap = "6"
 rmpv = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-tracing = "0.1"
+tracing = { version = "0.1", optional = true }
 async-trait = "0.1"
 rustc-hash = "2"
 

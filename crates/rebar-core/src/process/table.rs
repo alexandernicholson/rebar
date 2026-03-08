@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 use dashmap::mapref::one::Ref;
 use rustc_hash::FxBuildHasher;
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 use crate::process::mailbox::MailboxTx;
@@ -70,7 +71,7 @@ impl ProcessTable {
     }
 
     /// Insert a process handle into the table under the given PID.
-    #[instrument(level = "trace", skip(self, handle))]
+    #[cfg_attr(feature = "tracing", instrument(level = "trace", skip(self, handle)))]
     pub fn insert(&self, pid: ProcessId, handle: ProcessHandle) {
         self.processes.insert(pid, handle);
     }
@@ -86,7 +87,7 @@ impl ProcessTable {
     /// Remove a process from the table.
     ///
     /// Returns the removed PID and handle, or `None` if the PID was not found.
-    #[instrument(level = "trace", skip(self))]
+    #[cfg_attr(feature = "tracing", instrument(level = "trace", skip(self)))]
     pub fn remove(&self, pid: &ProcessId) -> Option<(ProcessId, ProcessHandle)> {
         self.processes.remove(pid)
     }
@@ -94,7 +95,7 @@ impl ProcessTable {
     /// Send a message to a process by its PID.
     ///
     /// Returns `SendError::ProcessDead` if the PID is not in the table.
-    #[instrument(level = "trace", skip(self, msg))]
+    #[cfg_attr(feature = "tracing", instrument(level = "trace", skip(self, msg)))]
     pub fn send(&self, pid: ProcessId, msg: Message) -> Result<(), SendError> {
         match self.processes.get(&pid) {
             Some(handle) => handle.send(msg),

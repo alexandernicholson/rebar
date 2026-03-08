@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
+#[cfg(feature = "tracing")]
 use tracing::instrument;
 
 use crate::process::mailbox::{Mailbox, MailboxRx};
@@ -93,7 +94,7 @@ impl Runtime {
     /// The spawned task is wrapped so that panics are caught and do not
     /// crash the runtime. After the handler completes (normally or via panic),
     /// the process is removed from the process table.
-    #[instrument(level = "trace", skip(self, handler), fields(node_id = self.node_id))]
+    #[cfg_attr(feature = "tracing", instrument(level = "trace", skip(self, handler), fields(node_id = self.node_id)))]
     pub async fn spawn<F, Fut>(&self, handler: F) -> ProcessId
     where
         F: FnOnce(ProcessContext) -> Fut + Send + 'static,
@@ -145,7 +146,7 @@ impl Runtime {
     /// Send a message to a process by PID from outside any process context.
     ///
     /// Uses a synthetic PID of <node_id, 0> as the sender.
-    #[instrument(level = "trace", skip(self, payload))]
+    #[cfg_attr(feature = "tracing", instrument(level = "trace", skip(self, payload)))]
     pub async fn send(&self, dest: ProcessId, payload: rmpv::Value) -> Result<(), SendError> {
         let from = ProcessId::new(self.node_id, 0);
         self.router.route(from, dest, payload)

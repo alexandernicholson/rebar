@@ -31,10 +31,11 @@ impl fmt::Display for ProcessId {
 pub struct Message {
     from: ProcessId,
     payload: rmpv::Value,
-    timestamp: u64,
+    timestamp: Option<u64>,
 }
 
 impl Message {
+    /// Create a new message with a timestamp (for external/user-facing messages).
     pub fn new(from: ProcessId, payload: rmpv::Value) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -43,7 +44,16 @@ impl Message {
         Self {
             from,
             payload,
-            timestamp,
+            timestamp: Some(timestamp),
+        }
+    }
+
+    /// Create a message without a timestamp (for internal routing, lower overhead).
+    pub fn new_internal(from: ProcessId, payload: rmpv::Value) -> Self {
+        Self {
+            from,
+            payload,
+            timestamp: None,
         }
     }
 
@@ -55,7 +65,8 @@ impl Message {
         &self.payload
     }
 
-    pub fn timestamp(&self) -> u64 {
+    /// Returns the timestamp if one was set, or None for internal messages.
+    pub fn timestamp(&self) -> Option<u64> {
         self.timestamp
     }
 }
@@ -147,7 +158,7 @@ mod tests {
         let msg = Message::new(from, payload.clone());
         assert_eq!(msg.from(), from);
         assert_eq!(*msg.payload(), payload);
-        assert!(msg.timestamp() > 0);
+        assert!(msg.timestamp().unwrap() > 0);
     }
 
     #[test]
@@ -182,6 +193,13 @@ mod tests {
         ]);
         let msg = Message::new(ProcessId::new(1, 1), payload.clone());
         assert_eq!(*msg.payload(), payload);
+    }
+
+    #[test]
+    fn message_new_internal_has_no_timestamp() {
+        let msg = Message::new_internal(ProcessId::new(1, 1), rmpv::Value::Nil);
+        assert!(msg.timestamp().is_none());
+        assert_eq!(msg.from(), ProcessId::new(1, 1));
     }
 
     #[test]

@@ -23,7 +23,7 @@ impl LocalRouter {
 impl MessageRouter for LocalRouter {
     #[instrument(level = "trace", skip(self, payload))]
     fn route(&self, from: ProcessId, to: ProcessId, payload: rmpv::Value) -> Result<(), SendError> {
-        let msg = Message::new(from, payload);
+        let msg = Message::new_internal(from, payload);
         self.table.send(to, msg)
     }
 }

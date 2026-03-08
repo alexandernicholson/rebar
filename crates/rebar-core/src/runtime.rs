@@ -125,7 +125,14 @@ impl Runtime {
             }
             impl Drop for CleanupGuard {
                 fn drop(&mut self) {
-                    self.table.remove(&self.pid);
+                    // Remove from table but defer the expensive channel
+                    // deallocation (mpsc block freeing) off the hot path
+                    // by moving the ProcessHandle to a spawned task.
+                    if let Some((_pid, handle)) = self.table.remove(&self.pid) {
+                        tokio::spawn(async move {
+                            drop(handle);
+                        });
+                    }
                 }
             }
             let _guard = CleanupGuard { table, pid };

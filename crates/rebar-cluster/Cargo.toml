@@ -25,3 +25,6 @@ sha2 = "0.10"
 
 [dev-dependencies]
 tokio-test = "0.4"
+rebar = { path = "../rebar" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"

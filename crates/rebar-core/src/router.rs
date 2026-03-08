@@ -1,6 +1,7 @@
 use crate::process::table::ProcessTable;
 use crate::process::{Message, ProcessId, SendError};
 use std::sync::Arc;
+use tracing::instrument;
 
 /// Trait for routing messages between processes.
 /// Implementations decide whether to deliver locally or over the network.
@@ -20,6 +21,7 @@ impl LocalRouter {
 }
 
 impl MessageRouter for LocalRouter {
+    #[instrument(level = "trace", skip(self, payload))]
     fn route(&self, from: ProcessId, to: ProcessId, payload: rmpv::Value) -> Result<(), SendError> {
         let msg = Message::new(from, payload);
         self.table.send(to, msg)

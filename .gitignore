@@ -1,2 +1,3 @@
 /target
 bench/flamegraphs/
+.worktrees/

@@ -12,3 +12,9 @@ exclude = ["bench/rebar", "bench/actix"]
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/alexandernicholson/rebar"
+
+[profile.bench]
+debug = true
+
+[profile.release]
+debug = 1

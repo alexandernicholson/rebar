@@ -16,3 +16,20 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "message_passing"
+harness = false
+
+[[bench]]
+name = "process_lifecycle"
+harness = false
+
+[[bench]]
+name = "supervisor"
+harness = false
+
+[[bench]]
+name = "process_table"
+harness = false

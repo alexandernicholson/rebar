@@ -13,6 +13,7 @@ rmpv = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing = "0.1"
+async-trait = "0.1"
 
 [dev-dependencies]
 tokio-test = "0.4"

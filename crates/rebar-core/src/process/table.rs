@@ -1,8 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use tracing::instrument;
 use dashmap::mapref::one::Ref;
+use rustc_hash::FxBuildHasher;
+use tracing::instrument;
 
 use crate::process::mailbox::MailboxTx;
 use crate::process::{Message, ProcessId, SendError};
@@ -35,7 +36,7 @@ impl ProcessHandle {
 pub struct ProcessTable {
     node_id: u64,
     next_id: AtomicU64,
-    processes: DashMap<ProcessId, ProcessHandle>,
+    processes: DashMap<ProcessId, ProcessHandle, FxBuildHasher>,
 }
 
 impl ProcessTable {
@@ -44,7 +45,7 @@ impl ProcessTable {
         Self {
             node_id,
             next_id: AtomicU64::new(1),
-            processes: DashMap::new(),
+            processes: DashMap::with_hasher(FxBuildHasher),
         }
     }
 
@@ -55,7 +56,7 @@ impl ProcessTable {
         Self {
             node_id,
             next_id: AtomicU64::new(1),
-            processes: DashMap::with_capacity(capacity),
+            processes: DashMap::with_capacity_and_hasher(capacity, FxBuildHasher),
         }
     }
 

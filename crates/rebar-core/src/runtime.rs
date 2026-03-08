@@ -138,6 +138,66 @@ impl Runtime {
     }
 }
 
+/// Builder for creating a rebar Runtime with a configured tokio Runtime.
+pub struct RuntimeBuilder {
+    node_id: u64,
+    worker_threads: Option<usize>,
+    thread_name: Option<String>,
+}
+
+impl RuntimeBuilder {
+    /// Create a new builder for the given node ID.
+    pub fn new(node_id: u64) -> Self {
+        Self {
+            node_id,
+            worker_threads: None,
+            thread_name: None,
+        }
+    }
+
+    /// Set the number of worker threads. Defaults to the number of CPU cores.
+    pub fn worker_threads(mut self, n: usize) -> Self {
+        self.worker_threads = Some(n);
+        self
+    }
+
+    /// Set the thread name prefix for worker threads.
+    pub fn thread_name(mut self, name: impl Into<String>) -> Self {
+        self.thread_name = Some(name.into());
+        self
+    }
+
+    /// Build and return a (tokio Runtime, rebar Runtime) pair.
+    pub fn build(self) -> Result<(tokio::runtime::Runtime, Runtime), std::io::Error> {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+
+        if let Some(n) = self.worker_threads {
+            builder.worker_threads(n);
+        }
+        if let Some(name) = &self.thread_name {
+            builder.thread_name(name);
+        }
+
+        let tokio_rt = builder.build()?;
+        let rebar_rt = Runtime::new(self.node_id);
+
+        Ok((tokio_rt, rebar_rt))
+    }
+
+    /// Build a runtime and run a future on it. Blocks until the future completes.
+    pub fn start<F, Fut>(self, f: F) -> Result<(), std::io::Error>
+    where
+        F: FnOnce(Arc<Runtime>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (tokio_rt, rebar_rt) = self.build()?;
+        let rt = Arc::new(rebar_rt);
+        tokio_rt.block_on(f(rt));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,5 +513,54 @@ mod tests {
             .unwrap();
         assert_eq!(result, "routed");
         assert!(counter_ref.count.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn runtime_builder_default_builds() {
+        let (tokio_rt, rebar_rt) = RuntimeBuilder::new(1).build().unwrap();
+        assert_eq!(rebar_rt.node_id(), 1);
+        tokio_rt.block_on(async {
+            let pid = rebar_rt.spawn(|_ctx| async {}).await;
+            assert_eq!(pid.node_id(), 1);
+        });
+    }
+
+    #[test]
+    fn runtime_builder_custom_threads() {
+        let (tokio_rt, rebar_rt) = RuntimeBuilder::new(2)
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        assert_eq!(rebar_rt.node_id(), 2);
+        tokio_rt.block_on(async {
+            let pid = rebar_rt.spawn(|_ctx| async {}).await;
+            assert_eq!(pid.node_id(), 2);
+        });
+    }
+
+    #[test]
+    fn runtime_builder_thread_name() {
+        let (tokio_rt, _rebar_rt) = RuntimeBuilder::new(1)
+            .thread_name("rebar-test")
+            .build()
+            .unwrap();
+        drop(tokio_rt);
+    }
+
+    #[test]
+    fn runtime_builder_start_runs_closure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_clone = Arc::clone(&ran);
+
+        RuntimeBuilder::new(1)
+            .start(move |rt| async move {
+                ran_clone.store(true, Ordering::SeqCst);
+                let pid = rt.spawn(|_ctx| async {}).await;
+                assert_eq!(pid.node_id(), 1);
+            })
+            .unwrap();
+
+        assert!(ran.load(Ordering::SeqCst));
     }
 }

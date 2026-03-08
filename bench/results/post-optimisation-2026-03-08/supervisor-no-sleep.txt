@@ -1,0 +1,235 @@
+   Compiling async-trait v0.1.89
+   Compiling rebar-core v0.1.0 (/home/alexandernicholson/.pxycrab/workspace/rebar/crates/rebar-core)
+warning: unused import: `Message`
+ --> crates/rebar-core/src/gen_server/engine.rs:9:34
+  |
+9 | use crate::process::{ExitReason, Message, ProcessId, SendError};
+  |                                  ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::fmt`
+ --> crates/rebar-core/src/gen_server/types.rs:1:5
+  |
+1 | use std::fmt;
+  |     ^^^^^^^^
+
+warning: unused import: `std::time::Duration`
+ --> crates/rebar-core/src/gen_server/types.rs:3:5
+  |
+3 | use std::time::Duration;
+  |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `mpsc`
+ --> crates/rebar-core/src/gen_server/types.rs:5:19
+  |
+5 | use tokio::sync::{mpsc, oneshot};
+  |                   ^^^^
+
+warning: unused imports: `ExitReason`, `Message`, and `SendError`
+  --> crates/rebar-core/src/gen_server/mod.rs:10:26
+   |
+10 |     use crate::process::{ExitReason, Message, ProcessId, SendError};
+   |                          ^^^^^^^^^^  ^^^^^^^             ^^^^^^^^^
+
+warning: unused import: `crate::router::MessageRouter`
+  --> crates/rebar-core/src/gen_server/mod.rs:11:9
+   |
+11 |     use crate::router::MessageRouter;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> crates/rebar-core/src/gen_server/types.rs:28:19
+   |
+26 | impl GenServerContext {
+   | --------------------- associated function in this implementation
+27 |     /// Create a new context (used internally by the engine).
+28 |     pub(crate) fn new(pid: ProcessId) -> Self {
+   |                   ^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `counting_factory` is never used
+   --> crates/rebar-core/src/supervisor/dynamic.rs:457:8
+    |
+457 |     fn counting_factory(
+    |        ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `rebar-core` (lib) generated 5 warnings (run `cargo fix --lib -p rebar-core` to apply 4 suggestions)
+warning: `rebar-core` (lib test) generated 7 warnings (4 duplicates) (run `cargo fix --lib -p rebar-core --tests` to apply 2 suggestions)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 34.05s
+     Running unittests src/lib.rs (target/release/deps/rebar_core-740c2d6d170474a4)
+
+running 45 tests
+test supervisor::dynamic::tests::count_children_after_start ... ignored
+test supervisor::dynamic::tests::handle_is_clone ... ignored
+test supervisor::dynamic::tests::permanent_child_is_restarted ... ignored
+test supervisor::dynamic::tests::remove_child_removes_spec ... ignored
+test supervisor::dynamic::tests::shutdown_stops_all_children ... ignored
+test supervisor::dynamic::tests::start_child_returns_pid ... ignored
+test supervisor::dynamic::tests::start_dynamic_supervisor_returns_handle ... ignored
+test supervisor::dynamic::tests::temporary_child_not_restarted ... ignored
+test supervisor::dynamic::tests::terminate_child_stops_it ... ignored
+test supervisor::dynamic::tests::which_children_lists_all ... ignored
+test supervisor::engine::tests::add_child_dynamically ... ignored
+test supervisor::engine::tests::brutal_kill_immediate ... ignored
+test supervisor::engine::tests::child_exit_sends_signal_to_linked ... ignored
+test supervisor::engine::tests::graceful_shutdown_sends_exit_signal ... ignored
+test supervisor::engine::tests::max_restarts_within_window_escalates ... ignored
+test supervisor::engine::tests::max_restarts_zero_means_never_restart ... ignored
+test supervisor::engine::tests::nested_supervisor_escalation ... ignored
+test supervisor::engine::tests::nested_supervisor_independent_restart ... ignored
+test supervisor::engine::tests::no_trap_exit_propagates_death ... ignored
+test supervisor::engine::tests::one_for_all_restarts_all_on_single_failure ... ignored
+test supervisor::engine::tests::one_for_all_stops_in_reverse_starts_in_order ... ignored
+test supervisor::engine::tests::one_for_one_other_children_unaffected ... ignored
+test supervisor::engine::tests::one_for_one_permanent_child_always_restarts ... ignored
+test supervisor::engine::tests::one_for_one_restarts_only_failed_child ... ignored
+test supervisor::engine::tests::one_for_one_temporary_child_never_restarts ... ignored
+test supervisor::engine::tests::one_for_one_transient_child_abnormal_restarts ... ignored
+test supervisor::engine::tests::one_for_one_transient_child_normal_exit_no_restart ... ignored
+test supervisor::engine::tests::rest_for_one_earlier_children_unaffected ... ignored
+test supervisor::engine::tests::rest_for_one_restarts_failed_and_subsequent ... ignored
+test supervisor::engine::tests::restarts_outside_window_reset_counter ... ignored
+test supervisor::engine::tests::shutdown_timeout_respected ... ignored
+test supervisor::engine::tests::supervisor_is_a_process_with_pid ... ignored
+test supervisor::engine::tests::supervisor_starts_children_in_order ... ignored
+test supervisor::engine::tests::supervisor_stops_children_in_reverse_order ... ignored
+test supervisor::engine::tests::trap_exit_converts_signal_to_message ... ignored
+test supervisor::spec::tests::child_spec_builder ... ignored
+test supervisor::spec::tests::child_spec_defaults ... ignored
+test supervisor::spec::tests::permanent_restarts_on_abnormal ... ignored
+test supervisor::spec::tests::permanent_restarts_on_kill ... ignored
+test supervisor::spec::tests::permanent_restarts_on_normal ... ignored
+test supervisor::spec::tests::supervisor_spec_builder ... ignored
+test supervisor::spec::tests::supervisor_spec_with_children ... ignored
+test supervisor::spec::tests::temporary_never_restarts ... ignored
+test supervisor::spec::tests::transient_does_not_restart_on_normal ... ignored
+test supervisor::spec::tests::transient_restarts_on_abnormal ... ignored
+
+test result: ok. 0 passed; 0 failed; 45 ignored; 0 measured; 88 filtered out; finished in 0.00s
+
+     Running benches/message_passing.rs (target/release/deps/message_passing-c4144efb99e247c3)
+Gnuplot not found, using plotters backend
+     Running benches/process_lifecycle.rs (target/release/deps/process_lifecycle-318538b81ddfe98b)
+Gnuplot not found, using plotters backend
+     Running benches/process_table.rs (target/release/deps/process_table-6f7f1aa345227df0)
+Gnuplot not found, using plotters backend
+     Running benches/supervisor.rs (target/release/deps/supervisor-ffd5be8e253b2133)
+Gnuplot not found, using plotters backend
+Benchmarking supervisor/startup/1
+Benchmarking supervisor/startup/1: Warming up for 3.0000 s
+Benchmarking supervisor/startup/1: Collecting 100 samples in estimated 5.0246 s (616k iterations)
+Benchmarking supervisor/startup/1: Analyzing
+supervisor/startup/1    time:   [8.1529 µs 8.1885 µs 8.2299 µs]
+                        thrpt:  [121.51 Kelem/s 122.12 Kelem/s 122.66 Kelem/s]
+                 change:
+                        time:   [-99.928% -99.928% -99.927%] (p = 0.00 < 0.05)
+                        thrpt:  [+137829% +138637% +139448%]
+                        Performance has improved.
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) low mild
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+Benchmarking supervisor/startup/5
+Benchmarking supervisor/startup/5: Warming up for 3.0000 s
+Benchmarking supervisor/startup/5: Collecting 100 samples in estimated 5.0042 s (429k iterations)
+Benchmarking supervisor/startup/5: Analyzing
+supervisor/startup/5    time:   [11.540 µs 11.680 µs 11.863 µs]
+                        thrpt:  [421.46 Kelem/s 428.08 Kelem/s 433.27 Kelem/s]
+                 change:
+                        time:   [-99.902% -99.899% -99.897%] (p = 0.00 < 0.05)
+                        thrpt:  [+97255% +99213% +101628%]
+                        Performance has improved.
+Found 12 outliers among 100 measurements (12.00%)
+  5 (5.00%) low severe
+  3 (3.00%) low mild
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+Benchmarking supervisor/startup/10
+Benchmarking supervisor/startup/10: Warming up for 3.0000 s
+Benchmarking supervisor/startup/10: Collecting 100 samples in estimated 5.0524 s (283k iterations)
+Benchmarking supervisor/startup/10: Analyzing
+supervisor/startup/10   time:   [13.536 µs 13.761 µs 13.987 µs]
+                        thrpt:  [714.94 Kelem/s 726.71 Kelem/s 738.78 Kelem/s]
+                 change:
+                        time:   [-99.887% -99.880% -99.867%] (p = 0.00 < 0.05)
+                        thrpt:  [+75339% +83457% +88763%]
+                        Performance has improved.
+Found 9 outliers among 100 measurements (9.00%)
+  4 (4.00%) low severe
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+Benchmarking supervisor/startup/50
+Benchmarking supervisor/startup/50: Warming up for 3.0000 s
+Benchmarking supervisor/startup/50: Collecting 100 samples in estimated 5.1284 s (187k iterations)
+Benchmarking supervisor/startup/50: Analyzing
+supervisor/startup/50   time:   [20.858 µs 22.633 µs 24.355 µs]
+                        thrpt:  [2.0530 Melem/s 2.2091 Melem/s 2.3971 Melem/s]
+                 change:
+                        time:   [-99.817% -99.746% -99.570%] (p = 0.00 < 0.05)
+                        thrpt:  [+23145% +39300% +54434%]
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+
+Benchmarking supervisor/add_child/1
+Benchmarking supervisor/add_child/1: Warming up for 3.0000 s
+Benchmarking supervisor/add_child/1: Collecting 100 samples in estimated 5.0227 s (146k iterations)
+Benchmarking supervisor/add_child/1: Analyzing
+supervisor/add_child/1  time:   [32.401 µs 33.134 µs 34.128 µs]
+                        thrpt:  [29.302 Kelem/s 30.181 Kelem/s 30.863 Kelem/s]
+                 change:
+                        time:   [-99.719% -99.714% -99.707%] (p = 0.00 < 0.05)
+                        thrpt:  [+33999% +34806% +35478%]
+                        Performance has improved.
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+Benchmarking supervisor/add_child/10
+Benchmarking supervisor/add_child/10: Warming up for 3.0000 s
+Benchmarking supervisor/add_child/10: Collecting 100 samples in estimated 5.6586 s (20k iterations)
+Benchmarking supervisor/add_child/10: Analyzing
+supervisor/add_child/10 time:   [270.46 µs 275.90 µs 282.40 µs]
+                        thrpt:  [35.411 Kelem/s 36.244 Kelem/s 36.975 Kelem/s]
+                 change:
+                        time:   [-97.754% -97.691% -97.629%] (p = 0.00 < 0.05)
+                        thrpt:  [+4117.6% +4230.7% +4352.4%]
+                        Performance has improved.
+Found 15 outliers among 100 measurements (15.00%)
+  6 (6.00%) low severe
+  5 (5.00%) low mild
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+Benchmarking supervisor/add_child/50
+Benchmarking supervisor/add_child/50: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 7.3s, enable flat sampling, or reduce sample count to 50.
+Benchmarking supervisor/add_child/50: Collecting 100 samples in estimated 7.2551 s (5050 iterations)
+Benchmarking supervisor/add_child/50: Analyzing
+supervisor/add_child/50 time:   [1.3715 ms 1.3877 ms 1.4059 ms]
+                        thrpt:  [35.564 Kelem/s 36.030 Kelem/s 36.458 Kelem/s]
+                 change:
+                        time:   [-89.542% -89.340% -89.178%] (p = 0.00 < 0.05)
+                        thrpt:  [+824.06% +838.06% +856.21%]
+                        Performance has improved.
+Found 11 outliers among 100 measurements (11.00%)
+  4 (4.00%) low severe
+  3 (3.00%) low mild
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+
+Benchmarking supervisor/restart_one_for_one
+Benchmarking supervisor/restart_one_for_one: Warming up for 3.0000 s
+Benchmarking supervisor/restart_one_for_one: Collecting 100 samples in estimated 5.0590 s (162k iterations)
+Benchmarking supervisor/restart_one_for_one: Analyzing
+supervisor/restart_one_for_one
+                        time:   [31.065 µs 31.693 µs 32.479 µs]
+                        change: [-99.729% -99.724% -99.719%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high severe
+

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tokio::runtime::Runtime as TokioRuntime;
@@ -45,7 +46,7 @@ fn bench_supervisor_startup(c: &mut Criterion) {
                         // Brief wait for children to actually start
                         tokio::task::yield_now().await;
                         handle.shutdown();
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        task::yield_now().await;
                     });
                 });
             },
@@ -83,7 +84,7 @@ fn bench_add_child(c: &mut Criterion) {
                         }
 
                         handle.shutdown();
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        task::yield_now().await;
                     });
                 });
             },
@@ -139,7 +140,7 @@ fn bench_restart_one_for_one(c: &mut Criterion) {
                     .unwrap();
 
                 handle.shutdown();
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                task::yield_now().await;
             });
         });
     });

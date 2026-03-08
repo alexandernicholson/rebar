@@ -28,6 +28,27 @@ impl MessageRouter for LocalRouter {
     }
 }
 
+/// Router that's either a concrete LocalRouter (fast path) or a dynamic trait object.
+/// Using an enum avoids vtable dispatch on the common local-routing path.
+pub enum RouterKind {
+    Local(LocalRouter),
+    Custom(Arc<dyn MessageRouter>),
+}
+
+impl MessageRouter for RouterKind {
+    fn route(
+        &self,
+        from: ProcessId,
+        to: ProcessId,
+        payload: rmpv::Value,
+    ) -> Result<(), SendError> {
+        match self {
+            RouterKind::Local(r) => r.route(from, to, payload),
+            RouterKind::Custom(r) => r.route(from, to, payload),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

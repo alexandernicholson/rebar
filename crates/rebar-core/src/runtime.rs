@@ -6,14 +6,14 @@ use tracing::instrument;
 use crate::process::mailbox::{Mailbox, MailboxRx};
 use crate::process::table::{ProcessHandle, ProcessTable};
 use crate::process::{Message, ProcessId, SendError};
-use crate::router::{LocalRouter, MessageRouter};
+use crate::router::{LocalRouter, MessageRouter, RouterKind};
 
 /// Context provided to each spawned process, giving it access to its own
 /// PID, mailbox, and the ability to send messages to other processes.
 pub struct ProcessContext {
     pid: ProcessId,
     rx: MailboxRx,
-    router: Arc<dyn MessageRouter>,
+    router: Arc<RouterKind>,
 }
 
 impl ProcessContext {
@@ -47,14 +47,14 @@ impl ProcessContext {
 pub struct Runtime {
     node_id: u64,
     table: Arc<ProcessTable>,
-    router: Arc<dyn MessageRouter>,
+    router: Arc<RouterKind>,
 }
 
 impl Runtime {
     /// Create a new runtime for the given node ID.
     pub fn new(node_id: u64) -> Self {
         let table = Arc::new(ProcessTable::new(node_id));
-        let router = Arc::new(LocalRouter::new(Arc::clone(&table)));
+        let router = Arc::new(RouterKind::Local(LocalRouter::new(Arc::clone(&table))));
         Self {
             node_id,
             table,
@@ -71,7 +71,7 @@ impl Runtime {
         Self {
             node_id,
             table,
-            router,
+            router: Arc::new(RouterKind::Custom(router)),
         }
     }
 

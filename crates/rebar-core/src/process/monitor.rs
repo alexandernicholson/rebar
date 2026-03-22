@@ -12,8 +12,15 @@ static MONITOR_COUNTER: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MonitorRef(u64);
 
+impl Default for MonitorRef {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MonitorRef {
     /// Allocate a new globally-unique monitor reference.
+    #[must_use]
     pub fn new() -> Self {
         Self(MONITOR_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
@@ -30,8 +37,15 @@ pub struct MonitorSet {
     by_target: HashMap<ProcessId, Vec<MonitorRef>>,
 }
 
+impl Default for MonitorSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MonitorSet {
     /// Create a new empty monitor set.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             by_ref: HashMap::new(),
@@ -54,12 +68,12 @@ impl MonitorSet {
     ///
     /// If the reference does not exist, this is a no-op.
     pub fn remove_monitor(&mut self, mref: MonitorRef) {
-        if let Some(target) = self.by_ref.remove(&mref) {
-            if let Some(refs) = self.by_target.get_mut(&target) {
-                refs.retain(|r| *r != mref);
-                if refs.is_empty() {
-                    self.by_target.remove(&target);
-                }
+        if let Some(target) = self.by_ref.remove(&mref)
+            && let Some(refs) = self.by_target.get_mut(&target)
+        {
+            refs.retain(|r| *r != mref);
+            if refs.is_empty() {
+                self.by_target.remove(&target);
             }
         }
     }
@@ -82,8 +96,15 @@ pub struct LinkSet {
     links: HashSet<ProcessId>,
 }
 
+impl Default for LinkSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LinkSet {
     /// Create a new empty link set.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             links: HashSet::new(),
@@ -101,6 +122,7 @@ impl LinkSet {
     }
 
     /// Check whether this set contains a link to the given process.
+    #[must_use]
     pub fn is_linked(&self, pid: ProcessId) -> bool {
         self.links.contains(&pid)
     }
@@ -206,8 +228,7 @@ mod tests {
         let mut set = LinkSet::new();
         set.add_link(ProcessId::new(1, 1));
         set.add_link(ProcessId::new(1, 2));
-        let pids: Vec<_> = set.linked_pids().collect();
-        assert_eq!(pids.len(), 2);
+        assert_eq!(set.linked_pids().count(), 2);
     }
 
     #[test]

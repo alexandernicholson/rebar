@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Core actor primitives and supervision for the Rebar runtime"
 
+[lints]
+workspace = true
+
 [features]
 default = []
 tracing = ["dep:tracing"]

@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "A BEAM-inspired distributed actor runtime"
 
+[lints]
+workspace = true
+
 [dependencies]
 rebar-core = { path = "../rebar-core" }
 rebar-cluster = { path = "../rebar-cluster" }

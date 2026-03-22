@@ -30,7 +30,7 @@ fn bench_spawn_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("process_lifecycle/spawn_batch");
 
     for count in [10, 100, 1_000] {
-        group.throughput(Throughput::Elements(count as u64));
+        group.throughput(Throughput::Elements(u64::try_from(count).unwrap()));
         group.bench_with_input(
             BenchmarkId::from_parameter(count),
             &count,
@@ -67,7 +67,7 @@ fn bench_spawn_teardown(c: &mut Criterion) {
     let mut group = c.benchmark_group("process_lifecycle/spawn_teardown");
 
     for count in [10, 100, 500] {
-        group.throughput(Throughput::Elements(count as u64));
+        group.throughput(Throughput::Elements(u64::try_from(count).unwrap()));
         group.bench_with_input(
             BenchmarkId::from_parameter(count),
             &count,

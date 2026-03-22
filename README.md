@@ -10,15 +10,29 @@ Rebar brings Erlang/OTP's battle-tested actor model to Rust. It provides lightwe
 
 ## Feature Highlights
 
+### Core Actor Primitives
 - **Lightweight processes** — Spawn thousands of async processes, each with its own mailbox
 - **Supervision trees** — OneForOne, OneForAll, and RestForOne restart strategies with configurable thresholds
 - **Process monitoring & linking** — Bidirectional failure propagation between related processes
+- **GenServer** — Typed stateful server with synchronous calls and async casts
+- **GenStatem** — State machine behavior with enter callbacks, timeouts, and event postponement
+- **Task** — Lightweight async/await primitives with `async_task`, `yield_result`, `async_map`
+- **Agent** — Simple shared state with `get`/`update`/`get_and_update` (no custom messages needed)
+- **Timer** — `send_after`, `send_interval`, `apply_after` with cancellation
+- **Process Groups** — Named groups with join/leave/broadcast (Erlang `pg` equivalent)
+- **Application** — Top-level lifecycle with dependency ordering and environment config
+- **PartitionSupervisor** — N identical children partitioned by key hash for load distribution
+- **Sys Debug** — Runtime introspection: `get_state`, `suspend`/`resume`, tracing
+
+### Distribution & Networking
 - **SWIM gossip protocol** — Automatic node discovery and failure detection across the cluster
-- **TCP transport with wire protocol** — Efficient binary serialization using MessagePack
+- **TCP + QUIC transport** — Efficient binary serialization using MessagePack
 - **OR-Set CRDT registry** — Conflict-free global process registry that converges across nodes
 - **Connection manager** — Exponential backoff reconnection with jitter
+- **Graceful node drain** — Coordinated shutdown with state migration
+
+### Polyglot FFI
 - **C-ABI FFI bindings** — Call into the actor runtime from Go, Python, and TypeScript via a stable C interface
-- **229 passing tests** — Comprehensive test coverage across all crates
 
 ### Client Libraries
 
@@ -45,6 +59,11 @@ graph TB
         MB["Mailbox<br>Async message queues"]
         SV["Supervisors<br>OneForOne / OneForAll /<br>RestForOne"]
         MON["Monitors & Links<br>Failure propagation"]
+        GS["GenServer / GenStatem<br>Stateful actors &<br>state machines"]
+        TK["Task / Agent<br>Lightweight async &<br>shared state"]
+        PG["Process Groups<br>Pub/sub & broadcast"]
+        TM["Timer<br>send_after /<br>send_interval"]
+        APP["Application<br>Lifecycle &<br>dependency ordering"]
     end
 
     subgraph "rebar-cluster"
@@ -63,6 +82,11 @@ graph TB
     RT --> MB
     RT --> SV
     RT --> MON
+    RT --> GS
+    RT --> TK
+    RT --> PG
+    RT --> TM
+    RT --> APP
     SW --> TR
     SW --> CR
     TR --> CM
@@ -117,6 +141,98 @@ let spec = SupervisorSpec::new(RestartStrategy::OneForOne)
 let handle = start_supervisor(runtime.clone(), spec, vec![]).await;
 ```
 
+### GenServer (Stateful Actor)
+
+```rust
+use rebar_core::gen_server::*;
+use rebar_core::runtime::Runtime;
+use std::sync::Arc;
+use std::time::Duration;
+
+struct Counter;
+
+#[async_trait::async_trait]
+impl GenServer for Counter {
+    type State = u64;
+    type Call = String;
+    type Cast = String;
+    type Reply = u64;
+
+    async fn init(&self, _ctx: &GenServerContext) -> Result<u64, String> { Ok(0) }
+
+    async fn handle_call(&self, msg: String, _from: ProcessId, state: &mut u64, _ctx: &GenServerContext) -> u64 {
+        if msg == "get" { *state } else { 0 }
+    }
+
+    async fn handle_cast(&self, msg: String, state: &mut u64, _ctx: &GenServerContext) {
+        if msg == "inc" { *state += 1; }
+    }
+}
+
+let rt = Arc::new(Runtime::new(1));
+let server = spawn_gen_server(rt, Counter).await;
+server.cast("inc".into()).unwrap();
+let count = server.call("get".into(), Duration::from_secs(1)).await.unwrap();
+assert_eq!(count, 1);
+```
+
+### Task (Lightweight Async)
+
+```rust
+use rebar_core::task::*;
+use rebar_core::runtime::Runtime;
+
+let rt = Runtime::new(1);
+let mut task = async_task(&rt, || async { 2 + 2 }).await;
+let result = task.await_result(Duration::from_secs(1)).await.unwrap();
+assert_eq!(result, 4);
+```
+
+### Agent (Simple Shared State)
+
+```rust
+use rebar_core::agent::*;
+use rebar_core::runtime::Runtime;
+
+let rt = Arc::new(Runtime::new(1));
+let agent = start_agent(rt, || vec!["hello".to_string()]).await;
+
+agent.update(|s: &mut Vec<String>| s.push("world".into()), Duration::from_secs(1)).await.unwrap();
+let len = agent.get(|s: &Vec<String>| s.len(), Duration::from_secs(1)).await.unwrap();
+assert_eq!(len, 2);
+```
+
+### Timer
+
+```rust
+use rebar_core::runtime::Runtime;
+
+let rt = Runtime::new(1);
+rt.spawn(|mut ctx| async move {
+    // Send yourself a message in 100ms
+    ctx.send_after(rmpv::Value::String("wake up".into()), Duration::from_millis(100));
+    let msg = ctx.recv().await.unwrap();
+    println!("got: {:?}", msg.payload());
+}).await;
+```
+
+### Process Groups (Pub/Sub)
+
+```rust
+use rebar_core::pg::PgScope;
+use rebar_core::process::ProcessId;
+
+let scope = PgScope::new();
+let pid1 = ProcessId::new(1, 1);
+let pid2 = ProcessId::new(1, 2);
+
+scope.join("notifications", pid1);
+scope.join("notifications", pid2);
+
+// Broadcast to all members
+let members = scope.get_members("notifications"); // [pid1, pid2]
+```
+
 ## Benchmark Results
 
 HTTP microservices mesh benchmark (3 services, 2 CPU / 512MB per container):
@@ -131,17 +247,33 @@ See [Benchmarks](docs/benchmarks.md) for full methodology and results.
 
 ## Project Status
 
+### Core
 - [x] Process spawning with mailbox messaging
 - [x] Supervisor trees (OneForOne/OneForAll/RestForOne)
+- [x] Dynamic supervisors
 - [x] Process monitoring and linking
+- [x] GenServer (typed stateful actors)
+- [x] GenStatem (state machine behavior)
+- [x] Task / Task.Supervisor (lightweight async)
+- [x] Agent (simple shared state)
+- [x] Timer (send_after, send_interval, apply_after)
+- [x] Process Groups (pg — named groups with pub/sub)
+- [x] Sys Debug (get_state, suspend/resume, tracing)
+- [x] Application (lifecycle, deps, config)
+- [x] PartitionSupervisor (key-partitioned children)
+- [x] handle_continue (deferred GenServer initialization)
+
+### Distribution
 - [x] SWIM gossip protocol for node discovery
 - [x] TCP transport with wire protocol
+- [x] QUIC transport (`quinn`-based, replacing TCP as production default)
 - [x] OR-Set CRDT global process registry
 - [x] Connection manager with exponential backoff
-- [x] C-ABI FFI bindings
-- [x] QUIC transport (`quinn`-based, replacing TCP as production default)
 - [x] Distribution layer integration (cluster <-> core, transparent remote `send()`)
 - [x] Graceful node drain (coordinated shutdown with state migration)
+
+### FFI
+- [x] C-ABI FFI bindings (Go, Python, TypeScript)
 
 ## Documentation
 

@@ -6,7 +6,7 @@ use rebar_core::process::mailbox::Mailbox;
 use rebar_core::process::table::{ProcessHandle, ProcessTable};
 use rebar_core::process::{Message, ProcessId};
 
-/// Benchmark: allocate_pid throughput (AtomicU64 contention)
+/// Benchmark: `allocate_pid` throughput (`AtomicU64` contention)
 fn bench_allocate_pid(c: &mut Criterion) {
     let mut group = c.benchmark_group("process_table/allocate_pid");
 
@@ -49,7 +49,7 @@ fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("process_table/insert");
 
     for count in [100, 1_000, 10_000] {
-        group.throughput(Throughput::Elements(count as u64));
+        group.throughput(Throughput::Elements(u64::try_from(count).unwrap()));
         group.bench_with_input(
             BenchmarkId::from_parameter(count),
             &count,

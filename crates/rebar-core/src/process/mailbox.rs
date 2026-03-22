@@ -22,8 +22,8 @@ pub struct MailboxTx {
 impl Clone for TxInner {
     fn clone(&self) -> Self {
         match self {
-            TxInner::Unbounded(tx) => TxInner::Unbounded(tx.clone()),
-            TxInner::Bounded(tx) => TxInner::Bounded(tx.clone()),
+            Self::Unbounded(tx) => Self::Unbounded(tx.clone()),
+            Self::Bounded(tx) => Self::Bounded(tx.clone()),
         }
     }
 }
@@ -50,6 +50,7 @@ impl Mailbox {
     ///
     /// The sender will never block or fail due to capacity constraints.
     /// Messages are only lost if the receiver is dropped.
+    #[must_use]
     pub fn unbounded() -> (MailboxTx, MailboxRx) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
@@ -66,6 +67,7 @@ impl Mailbox {
     ///
     /// When the mailbox is full, `try_send` will return `SendError::MailboxFull`
     /// and `send` will also return an error for bounded channels at capacity.
+    #[must_use]
     pub fn bounded(capacity: usize) -> (MailboxTx, MailboxRx) {
         let (tx, rx) = mpsc::channel(capacity);
         (
@@ -88,6 +90,11 @@ impl MailboxTx {
     /// For bounded channels, this uses `try_send` semantics: if the channel is
     /// full, returns `SendError::MailboxFull`; if the receiver is dropped,
     /// returns `SendError::ProcessDead`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError::ProcessDead` if the receiver has been dropped, or
+    /// `SendError::MailboxFull` if the bounded channel is at capacity.
     pub fn send(&self, msg: Message) -> Result<(), SendError> {
         match &self.inner {
             TxInner::Unbounded(tx) => {
@@ -109,6 +116,11 @@ impl MailboxTx {
     /// For unbounded channels, behaves the same as `send`.
     /// For bounded channels, returns `SendError::MailboxFull` if the channel
     /// is at capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError::ProcessDead` if the receiver has been dropped, or
+    /// `SendError::MailboxFull` if the bounded channel is at capacity.
     pub fn try_send(&self, msg: Message) -> Result<(), SendError> {
         match &self.inner {
             TxInner::Unbounded(tx) => {
@@ -299,7 +311,7 @@ mod tests {
         let result = tx.try_send(Message::new(ProcessId::new(1, 2), rmpv::Value::Nil));
         match result {
             Err(SendError::MailboxFull(_)) => {}
-            other => panic!("expected MailboxFull, got {:?}", other),
+            other => panic!("expected MailboxFull, got {other:?}"),
         }
     }
 }

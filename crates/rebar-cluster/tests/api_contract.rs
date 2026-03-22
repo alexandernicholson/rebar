@@ -40,7 +40,7 @@ fn transport_connector_requires_send_sync() {
 /// must remain object-safe.
 #[test]
 fn transport_connector_returns_boxed_dyn_connection() {
-    fn accepts_boxed(_connector: Box<dyn rebar_cluster::connection::manager::TransportConnector>) {}
+    fn _accepts_boxed(_connector: Box<dyn rebar_cluster::connection::manager::TransportConnector>) {}
     // Compiling this function is the test — it proves the trait is object-safe.
 }
 
@@ -133,7 +133,7 @@ async fn quic_send_recv_roundtrip() {
 /// which broke the facade crate's public API.
 #[test]
 fn distributed_runtime_is_not_generic() {
-    fn accepts_ref(_rt: &rebar::DistributedRuntime) {}
+    fn _accepts_ref(_rt: &rebar::DistributedRuntime) {}
     // Compiling this function is the test — if DistributedRuntime were generic,
     // this would fail because the type parameters would be unresolved.
 }

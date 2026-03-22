@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "tracing")]
@@ -12,6 +13,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::process::{ExitReason, ProcessId};
 use crate::runtime::Runtime;
 use crate::supervisor::spec::{ChildSpec, RestartStrategy, ShutdownStrategy, SupervisorSpec};
+
+static CHILD_PID_COUNTER: AtomicU64 = AtomicU64::new(1_000_000);
 
 /// A factory that creates the child's async task. Must be callable multiple
 /// times (for restarts) and is shared via Arc.
@@ -77,11 +80,16 @@ pub struct SupervisorHandle {
 
 impl SupervisorHandle {
     /// The supervisor's own process ID.
-    pub fn pid(&self) -> ProcessId {
+    #[must_use]
+    pub const fn pid(&self) -> ProcessId {
         self.pid
     }
 
     /// Dynamically add a child to the running supervisor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the supervisor has shut down.
     pub async fn add_child(&self, entry: ChildEntry) -> Result<ProcessId, String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.msg_tx
@@ -183,61 +191,8 @@ async fn supervisor_loop(
     loop {
         match msg_rx.recv().await {
             Some(SupervisorMsg::ChildExited { index, pid, reason }) => {
-                // Verify this is still the current PID for that index
-                if index >= state.children.len() {
-                    continue;
-                }
-                if state.children[index].pid != Some(pid) {
-                    continue;
-                }
-
-                state.children[index].pid = None;
-                state.children[index].shutdown_tx = None;
-
-                let should_restart = state.children[index].spec.restart.should_restart(&reason);
-
-                if !should_restart {
-                    continue;
-                }
-
-                // Check restart limits
-                if !state.check_restart_limit() {
-                    // Exceeded max restarts, shut down everything
-                    shutdown_all_children(&mut state.children).await;
+                if state.handle_child_exit(index, pid, &reason, &msg_tx).await {
                     break;
-                }
-
-                // Apply restart strategy
-                match state.strategy {
-                    RestartStrategy::OneForOne => {
-                        start_child(&mut state.children[index], index, &msg_tx);
-                    }
-                    RestartStrategy::OneForAll => {
-                        // Stop all children in reverse order (except the one that already exited)
-                        let len = state.children.len();
-                        for i in (0..len).rev() {
-                            if i != index && state.children[i].pid.is_some() {
-                                stop_child(&mut state.children[i]).await;
-                            }
-                        }
-                        // Restart all in order
-                        for i in 0..len {
-                            start_child(&mut state.children[i], i, &msg_tx);
-                        }
-                    }
-                    RestartStrategy::RestForOne => {
-                        // Stop children after the failed one, in reverse order
-                        let len = state.children.len();
-                        for i in (index + 1..len).rev() {
-                            if state.children[i].pid.is_some() {
-                                stop_child(&mut state.children[i]).await;
-                            }
-                        }
-                        // Restart failed child and all subsequent
-                        for i in index..len {
-                            start_child(&mut state.children[i], i, &msg_tx);
-                        }
-                    }
                 }
             }
             Some(SupervisorMsg::AddChild { entry, reply }) => {
@@ -292,6 +247,63 @@ struct SupervisorState {
 }
 
 impl SupervisorState {
+    /// Handle a child exit event. Returns `true` if the supervisor should stop.
+    async fn handle_child_exit(
+        &mut self,
+        index: usize,
+        pid: ProcessId,
+        reason: &ExitReason,
+        msg_tx: &mpsc::UnboundedSender<SupervisorMsg>,
+    ) -> bool {
+        // Verify this is still the current PID for that index
+        if index >= self.children.len() || self.children[index].pid != Some(pid) {
+            return false;
+        }
+
+        self.children[index].pid = None;
+        self.children[index].shutdown_tx = None;
+
+        if !self.children[index].spec.restart.should_restart(reason) {
+            return false;
+        }
+
+        // Check restart limits
+        if !self.check_restart_limit() {
+            shutdown_all_children(&mut self.children).await;
+            return true;
+        }
+
+        // Apply restart strategy
+        match self.strategy {
+            RestartStrategy::OneForOne => {
+                start_child(&mut self.children[index], index, msg_tx);
+            }
+            RestartStrategy::OneForAll => {
+                let len = self.children.len();
+                for i in (0..len).rev() {
+                    if i != index && self.children[i].pid.is_some() {
+                        stop_child(&mut self.children[i]).await;
+                    }
+                }
+                for i in 0..len {
+                    start_child(&mut self.children[i], i, msg_tx);
+                }
+            }
+            RestartStrategy::RestForOne => {
+                let len = self.children.len();
+                for i in (index + 1..len).rev() {
+                    if self.children[i].pid.is_some() {
+                        stop_child(&mut self.children[i]).await;
+                    }
+                }
+                for i in index..len {
+                    start_child(&mut self.children[i], i, msg_tx);
+                }
+            }
+        }
+        false
+    }
+
     /// Check if we've exceeded the restart limit. Returns true if restart is allowed.
     fn check_restart_limit(&mut self) -> bool {
         if self.max_restarts == 0 {
@@ -299,7 +311,7 @@ impl SupervisorState {
         }
 
         let now = Instant::now();
-        let window = Duration::from_secs(self.max_seconds as u64);
+        let window = Duration::from_secs(u64::from(self.max_seconds));
 
         // Add current restart
         self.restart_times.push_back(now);
@@ -314,7 +326,7 @@ impl SupervisorState {
         }
 
         // Check if count exceeds max
-        (self.restart_times.len() as u32) <= self.max_restarts
+        self.restart_times.len() <= self.max_restarts as usize
     }
 }
 
@@ -329,12 +341,6 @@ fn start_child(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let msg_tx = msg_tx.clone();
 
-    // We need to generate a PID. We'll use a simple approach: generate a unique
-    // ID via a static counter, same node_id = 0 (supervisor-managed).
-    // Actually, we need real PIDs from the runtime, but we don't have access here.
-    // Let's use a global atomic for now and create synthetic PIDs.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static CHILD_PID_COUNTER: AtomicU64 = AtomicU64::new(1_000_000);
     let local_id = CHILD_PID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = ProcessId::new(0, local_id);
 
@@ -385,7 +391,7 @@ async fn stop_child(child: &mut ChildState) {
 }
 
 /// Shut down all children in reverse order.
-async fn shutdown_all_children(children: &mut Vec<ChildState>) {
+async fn shutdown_all_children(children: &mut [ChildState]) {
     for i in (0..children.len()).rev() {
         if children[i].pid.is_some() {
             stop_child(&mut children[i]).await;
@@ -418,7 +424,7 @@ mod tests {
         for i in 0..3u32 {
             let order = Arc::clone(&order);
             entries.push(ChildEntry::new(
-                ChildSpec::new(format!("child_{}", i)),
+                ChildSpec::new(format!("child_{i}")),
                 move || {
                     let order = Arc::clone(&order);
                     async move {
@@ -451,9 +457,6 @@ mod tests {
     async fn supervisor_stops_children_in_reverse_order() {
         // Use a channel to record when each child's task is cancelled/dropped.
         // We use a Drop guard struct to detect cancellation order.
-        let rt = test_runtime();
-        let stop_order = Arc::new(Mutex::new(Vec::<u32>::new()));
-
         struct DropGuard {
             id: u32,
             stop_order: Arc<Mutex<Vec<u32>>>,
@@ -467,11 +470,13 @@ mod tests {
             }
         }
 
+        let rt = test_runtime();
+        let stop_order = Arc::new(Mutex::new(Vec::<u32>::new()));
         let mut entries = Vec::new();
         for i in 0..3u32 {
             let so = Arc::clone(&stop_order);
             entries.push(ChildEntry::new(
-                ChildSpec::new(format!("child_{}", i))
+                ChildSpec::new(format!("child_{i}"))
                     .restart(RestartType::Temporary)
                     .shutdown(ShutdownStrategy::Timeout(Duration::from_millis(50))),
                 move || {
@@ -626,12 +631,10 @@ mod tests {
                 let sc = Arc::clone(&sc);
                 async move {
                     let c = sc.fetch_add(1, Ordering::SeqCst);
-                    if c < 2 {
-                        ExitReason::Normal // Even normal exit restarts permanent
-                    } else {
+                    if c >= 2 {
                         tokio::time::sleep(Duration::from_secs(60)).await;
-                        ExitReason::Normal
                     }
+                    ExitReason::Normal // Even normal exit restarts permanent
                 }
             },
         )];
@@ -1529,7 +1532,7 @@ mod tests {
         let entries: Vec<ChildEntry> = (0..5)
             .map(|i| {
                 let sc = Arc::clone(&started_count);
-                ChildEntry::new(ChildSpec::new(format!("batch-{}", i)), move || {
+                ChildEntry::new(ChildSpec::new(format!("batch-{i}")), move || {
                     let sc = Arc::clone(&sc);
                     async move {
                         sc.fetch_add(1, Ordering::SeqCst);

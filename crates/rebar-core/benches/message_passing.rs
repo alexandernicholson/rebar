@@ -12,7 +12,7 @@ fn bench_ping_pong(c: &mut Criterion) {
     let mut group = c.benchmark_group("message_passing/ping_pong");
 
     for count in [100, 1_000, 10_000] {
-        group.throughput(Throughput::Elements(count as u64));
+        group.throughput(Throughput::Elements(u64::try_from(count).unwrap()));
         group.bench_with_input(
             BenchmarkId::from_parameter(count),
             &count,
@@ -50,7 +50,7 @@ fn bench_fan_out(c: &mut Criterion) {
     let mut group = c.benchmark_group("message_passing/fan_out");
 
     for n_receivers in [10, 50, 100] {
-        group.throughput(Throughput::Elements(n_receivers as u64));
+        group.throughput(Throughput::Elements(u64::try_from(n_receivers).unwrap()));
         group.bench_with_input(
             BenchmarkId::from_parameter(n_receivers),
             &n_receivers,
@@ -95,7 +95,7 @@ fn bench_fan_in(c: &mut Criterion) {
     let mut group = c.benchmark_group("message_passing/fan_in");
 
     for n_senders in [10, 50, 100] {
-        group.throughput(Throughput::Elements(n_senders as u64));
+        group.throughput(Throughput::Elements(u64::try_from(n_senders).unwrap()));
         group.bench_with_input(
             BenchmarkId::from_parameter(n_senders),
             &n_senders,

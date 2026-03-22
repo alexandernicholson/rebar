@@ -1,13 +1,11 @@
-use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
 use crate::process::{ExitReason, Message, ProcessId, SendError};
 use crate::router::MessageRouter;
 
-/// Errors returned by GenServerRef::call.
+/// Errors returned by `GenServerRef::call`.
 #[derive(Debug, thiserror::Error)]
 pub enum CallError {
     #[error("call timeout: server did not respond in time")]
@@ -16,42 +14,108 @@ pub enum CallError {
     ServerDead,
 }
 
-/// Context available to GenServer callbacks.
-/// Provides access to the server's PID and message routing.
+/// Context available to `GenServer` callbacks.
+/// Provides access to the server's PID, message routing, and continue signaling.
 pub struct GenServerContext {
     pid: ProcessId,
     router: Option<Arc<dyn MessageRouter>>,
+    continue_tx: Option<mpsc::UnboundedSender<rmpv::Value>>,
 }
 
 impl GenServerContext {
-    /// Create a new context (used internally by the engine).
-    pub(crate) fn new(pid: ProcessId) -> Self {
-        Self { pid, router: None }
-    }
-
-    /// Create a context with a router for sending messages.
-    pub(crate) fn with_router(pid: ProcessId, router: Arc<dyn MessageRouter>) -> Self {
+    /// Create a context with a router and continue channel.
+    pub(crate) fn with_continue(
+        pid: ProcessId,
+        router: Arc<dyn MessageRouter>,
+        continue_tx: mpsc::UnboundedSender<rmpv::Value>,
+    ) -> Self {
         Self {
             pid,
             router: Some(router),
+            continue_tx: Some(continue_tx),
         }
     }
 
     /// Return this server's PID.
-    pub fn self_pid(&self) -> ProcessId {
+    #[must_use]
+    pub const fn self_pid(&self) -> ProcessId {
         self.pid
     }
 
     /// Send a raw message to another process.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError::ProcessDead` if no router is configured or the
+    /// destination process is not reachable.
     pub fn send(&self, dest: ProcessId, payload: rmpv::Value) -> Result<(), SendError> {
-        match &self.router {
-            Some(router) => router.route(self.pid, dest, payload),
-            None => Err(SendError::ProcessDead(dest)),
+        self.router
+            .as_ref()
+            .map_or(Err(SendError::ProcessDead(dest)), |router| {
+                router.route(self.pid, dest, payload)
+            })
+    }
+
+    /// Enqueue a continue message to be processed before the next mailbox message.
+    ///
+    /// This is the Rust equivalent of returning `{:noreply, state, {:continue, term}}`
+    /// in Elixir's `GenServer`. The continue message will be passed to `handle_continue`.
+    pub fn continue_with(&self, payload: rmpv::Value) {
+        if let Some(tx) = &self.continue_tx {
+            let _ = tx.send(payload);
+        }
+    }
+
+    /// Send a message to `dest` after `delay`. Convenience wrapper around [`crate::timer::send_after`].
+    #[must_use]
+    pub fn send_after(
+        &self,
+        dest: ProcessId,
+        payload: rmpv::Value,
+        delay: std::time::Duration,
+    ) -> Option<crate::timer::TimerRef> {
+        let router = self.router.as_ref()?.clone();
+        Some(crate::timer::send_after(router, self.pid, dest, payload, delay))
+    }
+
+    /// Send a message to self after `delay`.
+    #[must_use]
+    pub fn send_after_self(
+        &self,
+        payload: rmpv::Value,
+        delay: std::time::Duration,
+    ) -> Option<crate::timer::TimerRef> {
+        self.send_after(self.pid, payload, delay)
+    }
+
+    /// Send a message to `dest` at regular intervals.
+    #[must_use]
+    pub fn send_interval(
+        &self,
+        dest: ProcessId,
+        payload: rmpv::Value,
+        interval: std::time::Duration,
+    ) -> Option<crate::timer::TimerRef> {
+        let router = self.router.as_ref()?.clone();
+        Some(crate::timer::send_interval(
+            router, self.pid, dest, payload, interval,
+        ))
+    }
+}
+
+#[cfg(test)]
+impl GenServerContext {
+    /// Create a new context (used in tests).
+    pub(crate) fn new(pid: ProcessId) -> Self {
+        Self {
+            pid,
+            router: None,
+            continue_tx: None,
         }
     }
 }
 
-/// The GenServer trait. Implement this for your server's logic.
+/// The `GenServer` trait. Implement this for your server's logic.
 ///
 /// Associated types define the message protocol:
 /// - `State`: server state, mutated by callbacks
@@ -87,6 +151,7 @@ pub trait GenServer: Send + Sync + 'static {
 
     /// Handle a raw info message from the standard mailbox.
     /// Default: ignores the message.
+    #[allow(clippy::unused_async)]
     async fn handle_info(
         &self,
         _msg: Message,
@@ -95,7 +160,27 @@ pub trait GenServer: Send + Sync + 'static {
     ) {
     }
 
+    /// Handle a continue message. Called when `ctx.continue_with(payload)` was
+    /// invoked during `init`, `handle_call`, `handle_cast`, `handle_info`, or
+    /// a previous `handle_continue`.
+    ///
+    /// Continue messages are processed before the next message from the mailbox,
+    /// allowing deferred initialization or multi-step processing without blocking
+    /// the caller.
+    ///
+    /// Equivalent to Elixir's `handle_continue/2`.
+    /// Default: ignores the message.
+    #[allow(clippy::unused_async)]
+    async fn handle_continue(
+        &self,
+        _msg: rmpv::Value,
+        _state: &mut Self::State,
+        _ctx: &GenServerContext,
+    ) {
+    }
+
     /// Called when the server is shutting down.
+    #[allow(clippy::unused_async)]
     async fn terminate(&self, _reason: ExitReason, _state: &mut Self::State) {}
 }
 

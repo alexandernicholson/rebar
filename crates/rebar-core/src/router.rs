@@ -7,16 +7,22 @@ use tracing::instrument;
 /// Trait for routing messages between processes.
 /// Implementations decide whether to deliver locally or over the network.
 pub trait MessageRouter: Send + Sync {
+    /// Route a message from one process to another.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError` if the message cannot be delivered.
     fn route(&self, from: ProcessId, to: ProcessId, payload: rmpv::Value) -> Result<(), SendError>;
 }
 
-/// Default router that delivers messages to the local ProcessTable.
+/// Default router that delivers messages to the local `ProcessTable`.
 pub struct LocalRouter {
     table: Arc<ProcessTable>,
 }
 
 impl LocalRouter {
-    pub fn new(table: Arc<ProcessTable>) -> Self {
+    #[must_use]
+    pub const fn new(table: Arc<ProcessTable>) -> Self {
         Self { table }
     }
 }
@@ -29,7 +35,7 @@ impl MessageRouter for LocalRouter {
     }
 }
 
-/// Router that's either a concrete LocalRouter (fast path) or a dynamic trait object.
+/// Router that's either a concrete `LocalRouter` (fast path) or a dynamic trait object.
 /// Using an enum avoids vtable dispatch on the common local-routing path.
 pub enum RouterKind {
     Local(LocalRouter),
@@ -44,8 +50,8 @@ impl MessageRouter for RouterKind {
         payload: rmpv::Value,
     ) -> Result<(), SendError> {
         match self {
-            RouterKind::Local(r) => r.route(from, to, payload),
-            RouterKind::Custom(r) => r.route(from, to, payload),
+            Self::Local(r) => r.route(from, to, payload),
+            Self::Custom(r) => r.route(from, to, payload),
         }
     }
 }

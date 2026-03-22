@@ -947,6 +947,563 @@ A `SupervisorHandle` with the supervisor's PID and a channel for sending command
 
 ---
 
+---
+
+## Module: `timer`
+
+Time-based message delivery. Equivalent to Erlang's `:timer` module.
+
+---
+
+### `TimerRef`
+
+An opaque reference to a running timer. Can be used to cancel the timer before it fires.
+
+#### Methods
+
+- `cancel(&self)` -- Cancel the timer. Idempotent — safe to call multiple times.
+- `is_finished(&self) -> bool` -- Returns true if the timer has fired or been cancelled.
+
+---
+
+### `send_after()`
+
+Send a message to a process after a delay.
+
+```rust
+pub fn send_after(
+    router: Arc<dyn MessageRouter>,
+    from: ProcessId,
+    dest: ProcessId,
+    payload: rmpv::Value,
+    delay: Duration,
+) -> TimerRef
+```
+
+Spawns a tokio task that sleeps for `delay` then routes the message. The returned `TimerRef` can cancel the timer before it fires.
+
+---
+
+### `send_interval()`
+
+Send a message repeatedly at a fixed interval.
+
+```rust
+pub fn send_interval(
+    router: Arc<dyn MessageRouter>,
+    from: ProcessId,
+    dest: ProcessId,
+    payload: rmpv::Value,
+    interval: Duration,
+) -> TimerRef
+```
+
+The first message is sent after one interval (not immediately). Automatically stops if the destination process is dead.
+
+---
+
+### `apply_after()` / `apply_interval()`
+
+Execute a function after a delay, or repeatedly at an interval.
+
+```rust
+pub fn apply_after<F, Fut>(delay: Duration, f: F) -> TimerRef
+pub fn apply_interval<F, Fut>(interval: Duration, f: F) -> TimerRef
+```
+
+---
+
+### `ProcessContext` Timer Methods
+
+Convenience methods available inside spawned processes:
+
+- `send_after(&self, payload, delay) -> TimerRef` -- Send to self after delay
+- `send_after_to(&self, dest, payload, delay) -> TimerRef` -- Send to another process after delay
+- `send_interval(&self, payload, interval) -> TimerRef` -- Send to self repeatedly
+
+---
+
+### `GenServerContext` Timer Methods
+
+Available inside GenServer callbacks:
+
+- `send_after(&self, dest, payload, delay) -> Option<TimerRef>`
+- `send_after_self(&self, payload, delay) -> Option<TimerRef>`
+- `send_interval(&self, dest, payload, interval) -> Option<TimerRef>`
+
+---
+
+### `handle_continue`
+
+Added to the `GenServer` trait. Called when `ctx.continue_with(payload)` is invoked from any callback.
+
+```rust
+async fn handle_continue(&self, msg: rmpv::Value, state: &mut Self::State, ctx: &GenServerContext) {}
+```
+
+Continue messages are processed before the next mailbox message, enabling deferred initialization.
+
+---
+
+## Module: `task`
+
+Lightweight async work primitives. Equivalent to Elixir's `Task` module.
+
+---
+
+### `Task<T>`
+
+A handle to a spawned async task with a typed result.
+
+#### Methods
+
+- `pid(&self) -> ProcessId` -- The task's process ID.
+- `async await_result(&mut self, timeout: Duration) -> Result<T, TaskError>` -- Block until the task completes. Can only be called once.
+- `async yield_result(&mut self, timeout: Duration) -> Option<Result<T, TaskError>>` -- Non-blocking check. Returns `None` if still running.
+- `async shutdown(self) -> Option<T>` -- Kill the task, returning the result if already complete.
+
+---
+
+### `async_task()` / `async_task_ctx()`
+
+Spawn a task and get a handle to await its result.
+
+```rust
+pub async fn async_task<F, Fut, T>(runtime: &Runtime, f: F) -> Task<T>
+pub async fn async_task_ctx<F, Fut, T>(runtime: &Runtime, f: F) -> Task<T>  // with ProcessContext
+```
+
+---
+
+### `start_task()`
+
+Fire-and-forget task (no result tracking).
+
+```rust
+pub async fn start_task<F, Fut>(runtime: &Runtime, f: F) -> ProcessId
+```
+
+---
+
+### `async_map()`
+
+Process a collection concurrently with bounded parallelism.
+
+```rust
+pub async fn async_map<I, F, Fut, T>(
+    runtime: Arc<Runtime>,
+    items: I,
+    f: F,
+    opts: StreamOpts,
+) -> Vec<Result<T, TaskError>>
+```
+
+Options: `max_concurrency`, `ordered` (preserve input order), `timeout` (per-task).
+
+---
+
+## Module: `agent`
+
+Simple shared state without custom message types. Equivalent to Elixir's `Agent` module.
+
+---
+
+### `AgentRef`
+
+A cloneable handle to a running agent. All operations are type-erased internally — you specify the state type `S` at each call site.
+
+#### Methods
+
+- `pid(&self) -> ProcessId`
+- `async get<S, F, T>(&self, f: F, timeout) -> Result<T, AgentError>` -- Read from state via a function.
+- `async update<S, F>(&self, f: F, timeout) -> Result<(), AgentError>` -- Mutate state via a function.
+- `async get_and_update<S, F, T>(&self, f: F, timeout) -> Result<T, AgentError>` -- Read + mutate atomically.
+- `cast<S, F>(&self, f: F) -> Result<(), AgentError>` -- Fire-and-forget mutation.
+- `async stop(&self, timeout) -> Result<(), AgentError>` -- Shut down the agent.
+
+---
+
+### `start_agent()`
+
+Start a new agent with initial state.
+
+```rust
+pub async fn start_agent<S, F>(runtime: Arc<Runtime>, init: F) -> AgentRef
+where
+    S: Send + 'static,
+    F: FnOnce() -> S + Send + 'static,
+```
+
+#### Example
+
+```rust
+let agent = start_agent(rt, || HashMap::new()).await;
+agent.update(|s: &mut HashMap<String, u64>| { s.insert("key".into(), 42); }, timeout).await?;
+let val = agent.get(|s: &HashMap<String, u64>| s["key"], timeout).await?;
+```
+
+---
+
+## Module: `pg`
+
+Named process groups with pub/sub semantics. Equivalent to Erlang's `pg` module.
+
+---
+
+### `PgScope`
+
+A process group scope. Groups are created lazily when processes join and removed when empty.
+
+#### Methods
+
+- `new() -> Arc<Self>` -- Create a new scope.
+- `join(&self, group: &str, pid: ProcessId)` -- Add a process to a group. Can join multiple times.
+- `leave(&self, group: &str, pid: ProcessId) -> Result<(), PgError>` -- Remove one membership.
+- `get_members(&self, group: &str) -> Vec<ProcessId>` -- All members of a group.
+- `get_local_members(&self, group: &str, node_id: u64) -> Vec<ProcessId>` -- Members on a specific node.
+- `which_groups(&self) -> Vec<String>` -- All group names.
+- `remove_pid(&self, pid: ProcessId)` -- Remove all memberships for a process (on death).
+- `remove_node(&self, node_id: u64)` -- Remove all memberships for a node (on disconnect).
+- `broadcast(&self, group, from, payload, router) -> Vec<Result<(), SendError>>` -- Send to all members.
+- `member_count(&self, group: &str) -> usize`
+
+#### Example
+
+```rust
+let scope = PgScope::new();
+scope.join("workers", pid1);
+scope.join("workers", pid2);
+
+// Fan out
+scope.broadcast("workers", from, &payload, &router);
+
+// Cleanup on process death
+scope.remove_pid(pid1);
+```
+
+---
+
+## Module: `sys`
+
+Runtime introspection for `GenServer` processes. Equivalent to Erlang's `:sys` module.
+
+The sys debug interface adds methods directly to `GenServerRef<S>`:
+
+### `GenServerRef` Sys Methods
+
+- `async sys_get_state(&self, timeout) -> Result<S::State, CallError>` -- Read the server's current state. Requires `S::State: Clone`.
+- `async sys_suspend(&self, timeout) -> Result<(), CallError>` -- Pause message processing. Only sys commands are handled while suspended.
+- `async sys_resume(&self, timeout) -> Result<(), CallError>` -- Resume a suspended server.
+- `async sys_get_status(&self, timeout) -> Result<ProcessStatus, CallError>` -- Get server status.
+
+### Types
+
+- `ProcessStatus` -- PID, run state, and debug options.
+- `ProcessRunState` -- `Running` or `Suspended`.
+- `DebugOpts` -- Trace, log, and statistics flags.
+- `SystemEvent` -- Trace events (`In`, `Out`, `StateChange`, `Noreply`).
+- `ProcessStatistics` -- `start_time`, `messages_in`, `messages_out`.
+
+### Example
+
+```rust
+let server = spawn_gen_server(rt, MyServer).await;
+
+// Inspect state at runtime
+let state = server.sys_get_state(Duration::from_secs(1)).await.unwrap();
+
+// Pause the server
+server.sys_suspend(Duration::from_secs(1)).await.unwrap();
+let status = server.sys_get_status(Duration::from_secs(1)).await.unwrap();
+// status.status == ProcessRunState::Suspended
+
+// Resume normal operation
+server.sys_resume(Duration::from_secs(1)).await.unwrap();
+```
+
+---
+
+## Module: `application`
+
+Top-level application lifecycle with dependency ordering and configuration. Equivalent to Elixir's `Application` module.
+
+---
+
+### `Application` (trait)
+
+The entry point for an OTP-style application. Implementations start a supervision tree.
+
+```rust
+#[async_trait]
+pub trait Application: Send + Sync + 'static {
+    async fn start(&self, runtime: Arc<Runtime>, env: &AppEnv) -> Result<SupervisorHandle, AppError>;
+    async fn prep_stop(&self, _env: &AppEnv) {}  // called before supervisor shutdown
+    async fn stop(&self, _env: &AppEnv) {}        // called after supervisor shutdown
+}
+```
+
+---
+
+### `AppEnv`
+
+Concurrent configuration store backed by `DashMap`.
+
+#### Methods
+
+- `new() -> Self`
+- `get(&self, key: &str) -> Option<rmpv::Value>`
+- `get_or(&self, key: &str, default: rmpv::Value) -> rmpv::Value`
+- `fetch(&self, key: &str) -> Result<rmpv::Value, AppError>` -- errors if key missing
+- `put(&self, key: &str, value: rmpv::Value)`
+- `delete(&self, key: &str)`
+- `all(&self) -> Vec<(String, rmpv::Value)>`
+
+---
+
+### `ApplicationManager`
+
+Manages registered applications with dependency-ordered startup/shutdown.
+
+#### Methods
+
+- `new(runtime: Arc<Runtime>) -> Self`
+- `register<A: Application>(&self, spec: AppSpec, app: A)` -- register an app
+- `async start(&self, name: &str) -> Result<(), AppError>` -- start one app
+- `async ensure_all_started(&self, name: &str) -> Result<Vec<String>, AppError>` -- start with all transitive deps (topological sort)
+- `async stop(&self, name: &str) -> Result<(), AppError>` -- lifecycle: prep_stop -> shutdown -> stop
+- `async stop_all(&self) -> Result<(), AppError>` -- reverse start order
+- `started_applications(&self) -> Vec<String>`
+- `env(&self, name: &str) -> Option<AppEnv>`
+
+---
+
+### `AppSpec`
+
+Builder for application specification.
+
+```rust
+AppSpec::new("my_app")
+    .dependency("logger")
+    .dependency("database")
+    .env("port", rmpv::Value::from(8080))
+```
+
+---
+
+## Module: `gen_statem`
+
+Generic state machine behavior with enter callbacks, timeouts, and event postponement. Equivalent to Erlang's `gen_statem`.
+
+---
+
+### `GenStatem` (trait)
+
+The state machine behavior. All events flow through a single `handle_event` callback.
+
+```rust
+#[async_trait]
+pub trait GenStatem: Send + Sync + 'static {
+    type State: Send + Clone + PartialEq + Debug + 'static;
+    type Data: Send + 'static;
+    type Call: Send + 'static;
+    type Cast: Send + 'static;
+    type Reply: Send + 'static;
+
+    fn callback_mode(&self) -> (CallbackMode, bool);  // (mode, state_enter)
+    async fn init(&self) -> Result<(Self::State, Self::Data), String>;
+    async fn handle_event(
+        &self, event_type: EventType<Self::Reply>, event: rmpv::Value,
+        state: &Self::State, data: &mut Self::Data,
+    ) -> TransitionResult<Self::State, Self::Data, Self::Reply>;
+    async fn terminate(&self, reason: ExitReason, state: &Self::State, data: &mut Self::Data) {}
+}
+```
+
+---
+
+### `TransitionResult`
+
+What happens after handling an event:
+
+- `NextState { state, data, actions }` -- transition to a new state
+- `KeepState { data, actions }` -- stay in current state, update data
+- `KeepStateAndData { actions }` -- no changes, optionally with actions
+- `Stop { reason, data }` -- shut down
+- `StopAndReply { reason, data, replies }` -- shut down with pending replies
+
+---
+
+### `Action`
+
+Actions returned from `handle_event`:
+
+- `Reply(sender, value)` -- reply to a caller
+- `StateTimeout(duration, payload)` -- cancelled on state change
+- `EventTimeout(duration, payload)` -- cancelled on any event
+- `GenericTimeout(name, duration, payload)` -- independent named timeout
+- `CancelTimeout(kind)` -- cancel a timeout
+- `Postpone` -- re-queue event, replay on next state change
+- `NextEvent(payload)` -- inject an internal event
+- `Hibernate` -- memory optimization hint
+
+---
+
+### `EventType`
+
+- `Call(reply_sender)` -- synchronous request
+- `Cast` -- async fire-and-forget
+- `Info` -- raw mailbox message
+- `StateTimeout` / `EventTimeout` / `Timeout(name)` -- timeout fired
+- `Internal` -- from `NextEvent` action
+- `Enter { old_state_name }` -- state enter callback
+
+---
+
+### `GenStatemRef`
+
+Handle to a running state machine. Same API pattern as `GenServerRef`.
+
+- `pid(&self) -> ProcessId`
+- `async call(&self, msg, timeout) -> Result<Reply, CallError>`
+- `cast(&self, msg) -> Result<(), SendError>`
+
+---
+
+### Example: Connection State Machine
+
+```rust
+#[derive(Clone, PartialEq, Debug)]
+enum ConnState { Connecting, Connected, Disconnected }
+
+// handle_event dispatches on (state, event_type):
+// - Connecting + StateTimeout → retry or give up
+// - Connected + Cast("disconnect") → transition to Disconnected
+// - Enter on any state → log transition, set state timeout
+```
+
+---
+
+## Module: `gen_stage`
+
+Back-pressure-aware producer/consumer pipelines. Equivalent to Elixir's `GenStage`.
+
+---
+
+### `GenStage` (trait)
+
+The stage behavior. Stages are producers, consumers, or producer-consumers.
+
+```rust
+#[async_trait]
+pub trait GenStage: Send + Sync + 'static {
+    type State: Send + 'static;
+    async fn init(&self) -> Result<(StageType, Self::State), String>;
+    async fn handle_demand(&self, demand: usize, state: &mut Self::State) -> Vec<rmpv::Value>;
+    async fn handle_events(&self, events: Vec<rmpv::Value>, from: SubscriptionTag, state: &mut Self::State) -> Vec<rmpv::Value>;
+    async fn handle_subscribe(&self, role: StageType, opts: &SubscribeOpts, from: SubscriptionTag, state: &mut Self::State) -> DemandMode;
+    async fn handle_cancel(&self, reason: CancelReason, from: SubscriptionTag, state: &mut Self::State);
+}
+```
+
+### Stage Types
+
+- `Producer` — generates events in response to demand via `handle_demand`
+- `Consumer` — processes events via `handle_events`
+- `ProducerConsumer` — receives events, transforms, and emits downstream
+
+### Demand Flow
+
+1. Consumer subscribes to producer via `GenStageRef::subscribe()`
+2. Consumer sends initial demand of `max_demand`
+3. Producer calls `handle_demand()`, returns events
+4. Events dispatched to consumers via the dispatcher
+5. Consumer re-asks when processed count hits `min_demand`
+
+### Dispatchers
+
+- `DemandDispatcher` (default) — distribute events to consumers based on pending demand
+- `BroadcastDispatcher` — send all events to all consumers
+
+### `GenStageRef`
+
+- `pid() -> ProcessId`
+- `async subscribe(&self, producer, opts) -> Result<SubscriptionTag, StageError>`
+- `async cancel(&self, tag) -> Result<(), StageError>`
+- `async ask(&self, tag, demand) -> Result<(), StageError>` — for manual demand mode
+- `async call(&self, msg, timeout) -> Result<rmpv::Value, StageError>`
+- `cast(&self, msg) -> Result<(), StageError>`
+
+### Example: ETL Pipeline
+
+```rust
+// Producer: generates numbers
+let producer = spawn_stage(rt.clone(), NumberProducer).await;
+
+// Consumer: processes numbers
+let consumer = spawn_stage(rt.clone(), NumberConsumer).await;
+
+// Wire them together
+let tag = consumer.subscribe(&producer, SubscribeOpts::default()).await?;
+// Events now flow automatically with back-pressure
+```
+
+---
+
+## Module: `partition_supervisor`
+
+Starts N identical children partitioned by key hash. Equivalent to Elixir's `PartitionSupervisor`.
+
+---
+
+### `PartitionSupervisorHandle`
+
+Handle to a running partition supervisor with key-based routing.
+
+#### Methods
+
+- `pid(&self) -> ProcessId` -- supervisor PID
+- `partitions(&self) -> usize` -- number of partitions
+- `which_partition(&self, key: u64) -> ProcessId` -- route by integer (`key % N`)
+- `which_partition_by_hash<K: Hash>(&self, key: &K) -> ProcessId` -- route by hash
+- `partition_pid(&self, index: usize) -> Option<ProcessId>` -- get PID by index
+- `shutdown(&self)` -- stop all partitions
+
+---
+
+### `start_partition_supervisor()`
+
+```rust
+pub async fn start_partition_supervisor(
+    runtime: Arc<Runtime>,
+    spec: PartitionSupervisorSpec,
+    factory: PartitionFactory,
+) -> PartitionSupervisorHandle
+```
+
+The factory receives the partition index (0..N):
+```rust
+let factory: PartitionFactory = Arc::new(|partition_idx| {
+    Box::pin(async move {
+        println!("Partition {partition_idx} running");
+        loop { tokio::time::sleep(Duration::from_secs(3600)).await; }
+        ExitReason::Normal
+    })
+});
+```
+
+#### Example
+
+```rust
+let spec = PartitionSupervisorSpec::new().partitions(4);
+let handle = start_partition_supervisor(rt, spec, factory).await;
+
+// Route work to a partition by key
+let worker = handle.which_partition(user_id);
+runtime.send(worker, payload).await?;
+```
+
+---
+
 ## See Also
 
 - [Supervisor Engine Internals](../internals/supervisor-engine.md) -- deep dive into restart limiting, child lifecycle, and shutdown strategies

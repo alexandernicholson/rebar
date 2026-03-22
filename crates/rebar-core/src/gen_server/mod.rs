@@ -7,8 +7,10 @@ pub use types::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::{ExitReason, Message, ProcessId, SendError};
-    use crate::router::MessageRouter;
+    use crate::process::ProcessId;
+    use crate::runtime::Runtime;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     // Test: GenServer trait is object-safe enough to implement
     struct CounterServer;
@@ -59,14 +61,10 @@ mod tests {
     #[test]
     fn call_error_display() {
         let err = CallError::Timeout;
-        assert!(format!("{}", err).contains("timeout"));
+        assert!(format!("{err}").contains("timeout"));
         let err = CallError::ServerDead;
-        assert!(format!("{}", err).contains("dead"));
+        assert!(format!("{err}").contains("dead"));
     }
-
-    use crate::runtime::Runtime;
-    use std::sync::Arc;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn spawn_gen_server_returns_ref_with_pid() {

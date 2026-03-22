@@ -19,7 +19,8 @@ pub struct ProcessContext {
 
 impl ProcessContext {
     /// Return this process's own PID.
-    pub fn self_pid(&self) -> ProcessId {
+    #[must_use]
+    pub const fn self_pid(&self) -> ProcessId {
         self.pid
     }
 
@@ -39,8 +40,50 @@ impl ProcessContext {
     }
 
     /// Send a message to another process by PID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError` if the destination process is not reachable.
+    #[allow(clippy::unused_async)]
     pub async fn send(&self, dest: ProcessId, payload: rmpv::Value) -> Result<(), SendError> {
         self.router.route(self.pid, dest, payload)
+    }
+
+    /// Send a message to self after `delay`.
+    ///
+    /// The message will be delivered to this process's mailbox after the delay.
+    /// Returns a [`TimerRef`](crate::timer::TimerRef) that can be used to cancel the timer.
+    #[must_use]
+    pub fn send_after(
+        &self,
+        payload: rmpv::Value,
+        delay: std::time::Duration,
+    ) -> crate::timer::TimerRef {
+        let router: Arc<dyn crate::router::MessageRouter> = self.router.clone();
+        crate::timer::send_after(router, self.pid, self.pid, payload, delay)
+    }
+
+    /// Send a message to another process after `delay`.
+    #[must_use]
+    pub fn send_after_to(
+        &self,
+        dest: ProcessId,
+        payload: rmpv::Value,
+        delay: std::time::Duration,
+    ) -> crate::timer::TimerRef {
+        let router: Arc<dyn crate::router::MessageRouter> = self.router.clone();
+        crate::timer::send_after(router, self.pid, dest, payload, delay)
+    }
+
+    /// Send a message to self at regular intervals.
+    #[must_use]
+    pub fn send_interval(
+        &self,
+        payload: rmpv::Value,
+        interval: std::time::Duration,
+    ) -> crate::timer::TimerRef {
+        let router: Arc<dyn crate::router::MessageRouter> = self.router.clone();
+        crate::timer::send_interval(router, self.pid, self.pid, payload, interval)
     }
 }
 
@@ -53,6 +96,7 @@ pub struct Runtime {
 
 impl Runtime {
     /// Create a new runtime for the given node ID.
+    #[must_use]
     pub fn new(node_id: u64) -> Self {
         let table = Arc::new(ProcessTable::new(node_id));
         let router = Arc::new(RouterKind::Local(LocalRouter::new(Arc::clone(&table))));
@@ -77,12 +121,14 @@ impl Runtime {
     }
 
     /// Return a reference to the process table.
-    pub fn table(&self) -> &Arc<ProcessTable> {
+    #[must_use]
+    pub const fn table(&self) -> &Arc<ProcessTable> {
         &self.table
     }
 
     /// Return this runtime's node ID.
-    pub fn node_id(&self) -> u64 {
+    #[must_use]
+    pub const fn node_id(&self) -> u64 {
         self.node_id
     }
 
@@ -95,6 +141,7 @@ impl Runtime {
     /// crash the runtime. After the handler completes (normally or via panic),
     /// the process is removed from the process table.
     #[cfg_attr(feature = "tracing", instrument(level = "trace", skip(self, handler), fields(node_id = self.node_id)))]
+    #[allow(clippy::unused_async)]
     pub async fn spawn<F, Fut>(&self, handler: F) -> ProcessId
     where
         F: FnOnce(ProcessContext) -> Fut + Send + 'static,
@@ -145,8 +192,13 @@ impl Runtime {
 
     /// Send a message to a process by PID from outside any process context.
     ///
-    /// Uses a synthetic PID of <node_id, 0> as the sender.
+    /// Uses a synthetic PID of `<node_id, 0>` as the sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError` if the destination process is not reachable.
     #[cfg_attr(feature = "tracing", instrument(level = "trace", skip(self, payload)))]
+    #[allow(clippy::unused_async)]
     pub async fn send(&self, dest: ProcessId, payload: rmpv::Value) -> Result<(), SendError> {
         let from = ProcessId::new(self.node_id, 0);
         self.router.route(from, dest, payload)
@@ -162,7 +214,8 @@ pub struct RuntimeBuilder {
 
 impl RuntimeBuilder {
     /// Create a new builder for the given node ID.
-    pub fn new(node_id: u64) -> Self {
+    #[must_use]
+    pub const fn new(node_id: u64) -> Self {
         Self {
             node_id,
             worker_threads: None,
@@ -171,18 +224,24 @@ impl RuntimeBuilder {
     }
 
     /// Set the number of worker threads. Defaults to the number of CPU cores.
-    pub fn worker_threads(mut self, n: usize) -> Self {
+    #[must_use]
+    pub const fn worker_threads(mut self, n: usize) -> Self {
         self.worker_threads = Some(n);
         self
     }
 
     /// Set the thread name prefix for worker threads.
+    #[must_use]
     pub fn thread_name(mut self, name: impl Into<String>) -> Self {
         self.thread_name = Some(name.into());
         self
     }
 
     /// Build and return a (tokio Runtime, rebar Runtime) pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` if the tokio runtime fails to build.
     pub fn build(self) -> Result<(tokio::runtime::Runtime, Runtime), std::io::Error> {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder.enable_all();
@@ -201,6 +260,10 @@ impl RuntimeBuilder {
     }
 
     /// Build a runtime and run a future on it. Blocks until the future completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `std::io::Error` if the tokio runtime fails to build.
     pub fn start<F, Fut>(self, f: F) -> Result<(), std::io::Error>
     where
         F: FnOnce(Arc<Runtime>) -> Fut + Send + 'static,
@@ -382,7 +445,7 @@ mod tests {
         {
             results.push(val);
         }
-        results.sort();
+        results.sort_unstable();
         assert_eq!(results, vec![0, 2, 4, 6, 8]);
     }
 

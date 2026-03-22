@@ -8,15 +8,18 @@ pub struct ProcessId {
 }
 
 impl ProcessId {
-    pub fn new(node_id: u64, local_id: u64) -> Self {
+    #[must_use]
+    pub const fn new(node_id: u64, local_id: u64) -> Self {
         Self { node_id, local_id }
     }
 
-    pub fn node_id(&self) -> u64 {
+    #[must_use]
+    pub const fn node_id(&self) -> u64 {
         self.node_id
     }
 
-    pub fn local_id(&self) -> u64 {
+    #[must_use]
+    pub const fn local_id(&self) -> u64 {
         self.local_id
     }
 }
@@ -36,11 +39,19 @@ pub struct Message {
 
 impl Message {
     /// Create a new message with a timestamp (for external/user-facing messages).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is before the Unix epoch.
+    #[must_use]
     pub fn new(from: ProcessId, payload: rmpv::Value) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let timestamp = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .expect("timestamp overflow");
         Self {
             from,
             payload,
@@ -49,7 +60,8 @@ impl Message {
     }
 
     /// Create a message without a timestamp (for internal routing, lower overhead).
-    pub fn new_internal(from: ProcessId, payload: rmpv::Value) -> Self {
+    #[must_use]
+    pub const fn new_internal(from: ProcessId, payload: rmpv::Value) -> Self {
         Self {
             from,
             payload,
@@ -57,16 +69,19 @@ impl Message {
         }
     }
 
-    pub fn from(&self) -> ProcessId {
+    #[must_use]
+    pub const fn from(&self) -> ProcessId {
         self.from
     }
 
-    pub fn payload(&self) -> &rmpv::Value {
+    #[must_use]
+    pub const fn payload(&self) -> &rmpv::Value {
         &self.payload
     }
 
-    /// Returns the timestamp if one was set, or None for internal messages.
-    pub fn timestamp(&self) -> Option<u64> {
+    /// Returns the timestamp if one was set, or `None` for internal messages.
+    #[must_use]
+    pub const fn timestamp(&self) -> Option<u64> {
         self.timestamp
     }
 }
@@ -76,12 +91,13 @@ pub enum ExitReason {
     Normal,
     Abnormal(String),
     Kill,
-    LinkedExit(ProcessId, Box<ExitReason>),
+    LinkedExit(ProcessId, Box<Self>),
 }
 
 impl ExitReason {
-    pub fn is_normal(&self) -> bool {
-        matches!(self, ExitReason::Normal)
+    #[must_use]
+    pub const fn is_normal(&self) -> bool {
+        matches!(self, Self::Normal)
     }
 }
 
@@ -147,7 +163,7 @@ mod tests {
     #[test]
     fn process_id_debug() {
         let pid = ProcessId::new(1, 1);
-        let debug = format!("{:?}", pid);
+        let debug = format!("{pid:?}");
         assert!(debug.contains("ProcessId"));
     }
 
@@ -229,7 +245,7 @@ mod tests {
     #[test]
     fn send_error_display() {
         let err = SendError::ProcessDead(ProcessId::new(1, 5));
-        let msg = format!("{}", err);
-        assert!(msg.contains("1") && msg.contains("5"));
+        let msg = format!("{err}");
+        assert!(msg.contains('1') && msg.contains('5'));
     }
 }

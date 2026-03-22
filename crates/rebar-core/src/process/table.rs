@@ -19,11 +19,17 @@ pub struct ProcessHandle {
 
 impl ProcessHandle {
     /// Create a new process handle wrapping the given mailbox sender.
-    pub fn new(tx: MailboxTx) -> Self {
+    #[must_use]
+    pub const fn new(tx: MailboxTx) -> Self {
         Self { tx }
     }
 
     /// Send a message to this process's mailbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError::ProcessDead` or `SendError::MailboxFull` if the
+    /// mailbox cannot accept the message.
     pub fn send(&self, msg: Message) -> Result<(), SendError> {
         self.tx.send(msg)
     }
@@ -42,6 +48,7 @@ pub struct ProcessTable {
 
 impl ProcessTable {
     /// Create a new process table for the given node ID.
+    #[must_use]
     pub fn new(node_id: u64) -> Self {
         Self {
             node_id,
@@ -53,6 +60,7 @@ impl ProcessTable {
     /// Create a new process table with a pre-sized capacity hint.
     ///
     /// Pre-sizing avoids rehashing when the expected number of processes is known.
+    #[must_use]
     pub fn with_capacity(node_id: u64, capacity: usize) -> Self {
         Self {
             node_id,
@@ -65,6 +73,7 @@ impl ProcessTable {
     ///
     /// Uses atomic fetch-and-add for lock-free, concurrent-safe allocation.
     /// PIDs start at 1 and increment monotonically.
+    #[must_use]
     pub fn allocate_pid(&self) -> ProcessId {
         let local_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         ProcessId::new(self.node_id, local_id)
@@ -94,21 +103,25 @@ impl ProcessTable {
 
     /// Send a message to a process by its PID.
     ///
+    /// # Errors
+    ///
     /// Returns `SendError::ProcessDead` if the PID is not in the table.
     #[cfg_attr(feature = "tracing", instrument(level = "trace", skip(self, msg)))]
     pub fn send(&self, pid: ProcessId, msg: Message) -> Result<(), SendError> {
-        match self.processes.get(&pid) {
-            Some(handle) => handle.send(msg),
-            None => Err(SendError::ProcessDead(pid)),
-        }
+        self.processes.get(&pid).map_or(
+            Err(SendError::ProcessDead(pid)),
+            |handle| handle.send(msg),
+        )
     }
 
     /// Return the number of processes currently in the table.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.processes.len()
     }
 
     /// Return whether the table is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.processes.is_empty()
     }
@@ -209,7 +222,7 @@ mod tests {
         let mut all_pids = HashSet::new();
         for h in handles {
             for pid in h.join().unwrap() {
-                assert!(all_pids.insert(pid), "duplicate PID: {}", pid);
+                assert!(all_pids.insert(pid), "duplicate PID: {pid}");
             }
         }
         assert_eq!(all_pids.len(), 1000);

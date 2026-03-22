@@ -72,7 +72,7 @@ async fn fan_out_to_multiple_workers() {
     let rt = Runtime::new(1);
     let n: u64 = 10;
 
-    let (results_tx, mut results_rx) = tokio::sync::mpsc::channel::<u64>(n as usize);
+    let (results_tx, mut results_rx) = tokio::sync::mpsc::channel::<u64>(usize::try_from(n).unwrap());
 
     // Spawn N workers. Each receives a value and sends value*2 to the results
     // channel.
@@ -107,7 +107,7 @@ async fn fan_out_to_multiple_workers() {
     {
         results.push(val);
     }
-    results.sort();
+    results.sort_unstable();
 
     let expected: Vec<u64> = (0..n).map(|i| i * 2).collect();
     assert_eq!(results, expected);
@@ -191,7 +191,8 @@ async fn supervisor_restarts_crashed_worker() {
                     ExitReason::Abnormal("boom".into())
                 } else {
                     // Second start: signal that we restarted, then stay alive.
-                    if let Some(tx) = rtx.lock().await.take() {
+                    let tx = rtx.lock().await.take();
+                    if let Some(tx) = tx {
                         let _ = tx.send(());
                     }
                     tokio::time::sleep(Duration::from_secs(30)).await;
@@ -234,13 +235,13 @@ async fn supervisor_one_for_all_cascade() {
     let counters_check = counters.clone();
 
     let mut entries = Vec::new();
-    for i in 0..3usize {
-        let counter = Arc::clone(&counters[i]);
+    for (i, counter_arc) in counters.iter().enumerate() {
+        let counter = Arc::clone(counter_arc);
         let all_tx = Arc::clone(&all_restarted_tx);
         let counters_check = counters_check.clone();
 
         entries.push(ChildEntry::new(
-            ChildSpec::new(format!("child_{}", i))
+            ChildSpec::new(format!("child_{i}"))
                 .restart(RestartType::Permanent)
                 .shutdown(ShutdownStrategy::BrutalKill),
             move || {
@@ -257,7 +258,8 @@ async fn supervisor_one_for_all_cascade() {
                         let all_reached =
                             counters_check.iter().all(|c| c.load(Ordering::SeqCst) >= 2);
                         if all_reached {
-                            if let Some(tx) = all_tx.lock().await.take() {
+                            let tx = all_tx.lock().await.take();
+                            if let Some(tx) = tx {
                                 let _ = tx.send(());
                             }
                         }
@@ -279,11 +281,10 @@ async fn supervisor_one_for_all_cascade() {
 
     // Every child should have been started at least twice.
     for (i, c) in counters.iter().enumerate() {
+        let count = c.load(Ordering::SeqCst);
         assert!(
-            c.load(Ordering::SeqCst) >= 2,
-            "child {} started only {} time(s)",
-            i,
-            c.load(Ordering::SeqCst)
+            count >= 2,
+            "child {i} started only {count} time(s)",
         );
     }
 
@@ -386,7 +387,8 @@ async fn linked_process_dies_together() {
             async move {
                 let n = psc.fetch_add(1, Ordering::SeqCst) + 1;
                 if n >= 2 {
-                    if let Some(tx) = ptx.lock().await.take() {
+                    let tx = ptx.lock().await.take();
+                    if let Some(tx) = tx {
                         let _ = tx.send(());
                     }
                 }

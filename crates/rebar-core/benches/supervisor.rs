@@ -20,7 +20,7 @@ fn bench_supervisor_startup(c: &mut Criterion) {
     let mut group = c.benchmark_group("supervisor/startup");
 
     for n_children in [1, 5, 10, 50] {
-        group.throughput(Throughput::Elements(n_children as u64));
+        group.throughput(Throughput::Elements(u64::try_from(n_children).unwrap()));
         group.bench_with_input(
             BenchmarkId::from_parameter(n_children),
             &n_children,
@@ -33,7 +33,7 @@ fn bench_supervisor_startup(c: &mut Criterion) {
                         let children: Vec<ChildEntry> = (0..n_children)
                             .map(|i| {
                                 ChildEntry::new(
-                                    ChildSpec::new(format!("child-{}", i)),
+                                    ChildSpec::new(format!("child-{i}")),
                                     || async {
                                         tokio::time::sleep(Duration::from_secs(60)).await;
                                         ExitReason::Normal
@@ -55,12 +55,12 @@ fn bench_supervisor_startup(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: dynamic add_child on running supervisor (one at a time)
+/// Benchmark: dynamic `add_child` on running supervisor (one at a time)
 fn bench_add_child(c: &mut Criterion) {
     let mut group = c.benchmark_group("supervisor/add_child");
 
     for count in [1, 10, 50] {
-        group.throughput(Throughput::Elements(count as u64));
+        group.throughput(Throughput::Elements(u64::try_from(count).unwrap()));
         group.bench_with_input(
             BenchmarkId::from_parameter(count),
             &count,
@@ -74,7 +74,7 @@ fn bench_add_child(c: &mut Criterion) {
 
                         for i in 0..count {
                             let entry = ChildEntry::new(
-                                ChildSpec::new(format!("dynamic-{}", i)),
+                                ChildSpec::new(format!("dynamic-{i}")),
                                 || async {
                                     tokio::time::sleep(Duration::from_secs(60)).await;
                                     ExitReason::Normal
@@ -93,12 +93,12 @@ fn bench_add_child(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: batch add_children on running supervisor
+/// Benchmark: batch `add_children` on running supervisor
 fn bench_add_children_batch(c: &mut Criterion) {
     let mut group = c.benchmark_group("supervisor/add_children_batch");
 
     for count in [1, 10, 50] {
-        group.throughput(Throughput::Elements(count as u64));
+        group.throughput(Throughput::Elements(u64::try_from(count).unwrap()));
         group.bench_with_input(
             BenchmarkId::from_parameter(count),
             &count,
@@ -113,7 +113,7 @@ fn bench_add_children_batch(c: &mut Criterion) {
                         let entries: Vec<ChildEntry> = (0..count)
                             .map(|i| {
                                 ChildEntry::new(
-                                    ChildSpec::new(format!("batch-{}", i)),
+                                    ChildSpec::new(format!("batch-{i}")),
                                     || async {
                                         tokio::time::sleep(Duration::from_secs(60)).await;
                                         ExitReason::Normal
@@ -134,8 +134,10 @@ fn bench_add_children_batch(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark: restart latency (OneForOne — child crashes, measured until restart)
+/// Benchmark: restart latency (`OneForOne` -- child crashes, measured until restart)
 fn bench_restart_one_for_one(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     let tokio_rt = tokio_rt();
     c.bench_function("supervisor/restart_one_for_one", |b| {
         b.iter(|| {
@@ -145,7 +147,6 @@ fn bench_restart_one_for_one(c: &mut Criterion) {
                     .max_restarts(100)
                     .max_seconds(60);
 
-                use std::sync::atomic::{AtomicU32, Ordering};
                 let start_count = Arc::new(AtomicU32::new(0));
                 let sc = Arc::clone(&start_count);
                 let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -163,7 +164,8 @@ fn bench_restart_one_for_one(c: &mut Criterion) {
                                 ExitReason::Abnormal("crash".into())
                             } else {
                                 // Restarted: signal ready
-                                if let Some(tx) = ready_tx.lock().await.take() {
+                                let tx = ready_tx.lock().await.take();
+                                if let Some(tx) = tx {
                                     let _ = tx.send(());
                                 }
                                 tokio::time::sleep(Duration::from_secs(60)).await;

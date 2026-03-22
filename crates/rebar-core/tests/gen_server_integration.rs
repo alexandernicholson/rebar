@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rebar_core::gen_server::{spawn_gen_server, CallError, GenServer, GenServerContext, GenServerRef};
-use rebar_core::process::{ExitReason, Message, ProcessId, SendError};
+use rebar_core::gen_server::{spawn_gen_server, GenServer, GenServerContext};
+use rebar_core::process::{Message, ProcessId};
 use rebar_core::runtime::Runtime;
 
-/// A counter GenServer that tracks a count.
+/// A counter `GenServer` that tracks a count.
 struct Counter;
 
 #[async_trait::async_trait]
@@ -149,9 +149,8 @@ async fn counter_concurrent_calls() {
         }));
     }
 
-    let mut results = Vec::new();
     for h in handles {
-        results.push(h.await.unwrap());
+        let _ = h.await.unwrap();
     }
 
     // All calls should have been processed sequentially by the GenServer

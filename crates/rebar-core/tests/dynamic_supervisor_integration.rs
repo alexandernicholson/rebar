@@ -18,7 +18,7 @@ async fn dynamic_supervisor_manages_many_children() {
     // Start 10 children
     for i in 0..10 {
         let entry = ChildEntry::new(
-            ChildSpec::new(format!("worker-{}", i)),
+            ChildSpec::new(format!("worker-{i}")),
             || async {
                 loop {
                     tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -117,8 +117,7 @@ async fn transient_child_restarted_on_abnormal_exit() {
     let start_count = counter.load(Ordering::SeqCst);
     assert!(
         start_count >= 2,
-        "expected at least 2 starts (original + restart), got {}",
-        start_count
+        "expected at least 2 starts (original + restart), got {start_count}",
     );
 
     handle.shutdown();
@@ -151,8 +150,7 @@ async fn transient_child_not_restarted_on_normal_exit() {
     let start_count = counter.load(Ordering::SeqCst);
     assert_eq!(
         start_count, 1,
-        "transient child should NOT restart on normal exit, got {} starts",
-        start_count
+        "transient child should NOT restart on normal exit, got {start_count} starts",
     );
 
     handle.shutdown();

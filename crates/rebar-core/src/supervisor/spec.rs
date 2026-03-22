@@ -16,11 +16,12 @@ pub enum RestartType {
 }
 
 impl RestartType {
-    pub fn should_restart(&self, reason: &ExitReason) -> bool {
+    #[must_use]
+    pub const fn should_restart(&self, reason: &ExitReason) -> bool {
         match self {
-            RestartType::Permanent => true,
-            RestartType::Transient => !reason.is_normal(),
-            RestartType::Temporary => false,
+            Self::Permanent => true,
+            Self::Transient => !reason.is_normal(),
+            Self::Temporary => false,
         }
     }
 }
@@ -39,7 +40,8 @@ pub struct SupervisorSpec {
 }
 
 impl SupervisorSpec {
-    pub fn new(strategy: RestartStrategy) -> Self {
+    #[must_use]
+    pub const fn new(strategy: RestartStrategy) -> Self {
         Self {
             strategy,
             max_restarts: 3,
@@ -48,16 +50,19 @@ impl SupervisorSpec {
         }
     }
 
-    pub fn max_restarts(mut self, n: u32) -> Self {
+    #[must_use]
+    pub const fn max_restarts(mut self, n: u32) -> Self {
         self.max_restarts = n;
         self
     }
 
-    pub fn max_seconds(mut self, n: u32) -> Self {
+    #[must_use]
+    pub const fn max_seconds(mut self, n: u32) -> Self {
         self.max_seconds = n;
         self
     }
 
+    #[must_use]
     pub fn child(mut self, spec: ChildSpec) -> Self {
         self.children.push(spec);
         self
@@ -72,6 +77,7 @@ pub struct ChildSpec {
 }
 
 impl ChildSpec {
+    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -80,12 +86,14 @@ impl ChildSpec {
         }
     }
 
-    pub fn restart(mut self, restart: RestartType) -> Self {
+    #[must_use]
+    pub const fn restart(mut self, restart: RestartType) -> Self {
         self.restart = restart;
         self
     }
 
-    pub fn shutdown(mut self, strategy: ShutdownStrategy) -> Self {
+    #[must_use]
+    pub const fn shutdown(mut self, strategy: ShutdownStrategy) -> Self {
         self.shutdown = strategy;
         self
     }

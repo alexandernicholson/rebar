@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Distributed clustering, transport, and registry for the Rebar runtime"
 
+[lints]
+workspace = true
+
 [dependencies]
 rebar-core = { path = "../rebar-core" }
 tokio = { version = "1", features = ["full"] }

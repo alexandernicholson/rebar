@@ -1,7 +1,7 @@
 //! API contract regression tests for rebar-core.
 //!
 //! These tests guard against regressions introduced by forks (e.g. johnnyshields/rebar v5)
-//! that broke fundamental API contracts around ProcessId construction, Display format,
+//! that broke fundamental API contracts around `ProcessId` construction, Display format,
 //! trait bounds, async semantics, and panic isolation.
 
 use std::sync::Arc;
@@ -15,9 +15,9 @@ use rebar_core::runtime::Runtime;
 // Task 1: Compile-time contract tests
 // ============================================================================
 
-/// Guards that ProcessId::new takes exactly two arguments (node_id, local_id).
+/// Guards that `ProcessId::new` takes exactly two arguments (`node_id`, `local_id`).
 ///
-/// The johnnyshields/rebar v5 fork changed ProcessId to a 3-arg constructor
+/// The johnnyshields/rebar v5 fork changed `ProcessId` to a 3-arg constructor
 /// (node, thread, local). This test ensures our 2-arg contract is preserved.
 #[test]
 fn process_id_is_two_arg() {
@@ -30,7 +30,7 @@ fn process_id_is_two_arg() {
     assert_eq!(pid2.local_id(), 0);
 }
 
-/// Guards that ProcessId Display format is `<node.local>`.
+/// Guards that `ProcessId` Display format is `<node.local>`.
 ///
 /// The fork changed Display to `<node.thread.local>` (3-part format).
 /// This test ensures the canonical 2-part `<node.local>` format is preserved.
@@ -41,10 +41,10 @@ fn process_id_display_format_is_node_dot_local() {
     assert_eq!(format!("{}", ProcessId::new(99, 1000)), "<99.1000>");
 }
 
-/// Guards that ProcessId implements Copy, Send, and Sync.
+/// Guards that `ProcessId` implements Copy, Send, and Sync.
 ///
 /// The fork replaced Copy types with Rc-based types that are neither Send nor Sync.
-/// ProcessId must be freely copyable and safe to share across threads.
+/// `ProcessId` must be freely copyable and safe to share across threads.
 #[test]
 fn process_id_is_copy_send_sync() {
     fn assert_copy_send_sync<T: Copy + Send + Sync>() {}
@@ -56,7 +56,7 @@ fn process_id_is_copy_send_sync() {
     assert_eq!(a, b); // original still usable
 }
 
-/// Guards that SendError has exactly three variants: ProcessDead, MailboxFull, NodeUnreachable.
+/// Guards that `SendError` has exactly three variants: `ProcessDead`, `MailboxFull`, `NodeUnreachable`.
 ///
 /// The fork may add or remove error variants. This exhaustive match ensures all
 /// three canonical variants exist and no others have been introduced.
@@ -71,22 +71,16 @@ fn send_error_variants_exhaustive() {
     for err in &errors {
         // Exhaustive match -- if a variant is added or removed, this will not compile.
         match err {
-            SendError::ProcessDead(pid) => {
-                let _ = pid;
-            }
-            SendError::MailboxFull(pid) => {
-                let _ = pid;
-            }
-            SendError::NodeUnreachable(node) => {
-                let _ = node;
-            }
+            SendError::ProcessDead(_)
+            | SendError::MailboxFull(_)
+            | SendError::NodeUnreachable(_) => {}
         }
     }
 }
 
-/// Guards that LocalRouter implements MessageRouter + Send + Sync.
+/// Guards that `LocalRouter` implements `MessageRouter` + Send + Sync.
 ///
-/// The fork removed Send + Sync bounds from MessageRouter and its implementations,
+/// The fork removed Send + Sync bounds from `MessageRouter` and its implementations,
 /// replacing Arc with Rc throughout. This test ensures the trait hierarchy is intact.
 #[test]
 fn message_router_requires_send_sync() {
@@ -94,9 +88,9 @@ fn message_router_requires_send_sync() {
     assert_router_send_sync::<LocalRouter>();
 }
 
-/// Guards that LocalRouter implements Send + Sync.
+/// Guards that `LocalRouter` implements Send + Sync.
 ///
-/// LocalRouter must be shareable across threads (via Arc) for the runtime to work.
+/// `LocalRouter` must be shareable across threads (via Arc) for the runtime to work.
 /// The fork broke this by using Rc internally.
 #[test]
 fn local_router_is_send_sync() {
@@ -104,9 +98,9 @@ fn local_router_is_send_sync() {
     assert_send_sync::<LocalRouter>();
 }
 
-/// Guards that ProcessTable implements Send + Sync.
+/// Guards that `ProcessTable` implements Send + Sync.
 ///
-/// ProcessTable is shared across tokio tasks via Arc. If it loses Send + Sync
+/// `ProcessTable` is shared across tokio tasks via Arc. If it loses Send + Sync
 /// (e.g. by using Rc or Cell internally), the runtime cannot function.
 #[test]
 fn process_table_is_send_sync() {
@@ -124,7 +118,7 @@ fn runtime_is_send_sync() {
     assert_send_sync::<Runtime>();
 }
 
-/// Guards that Runtime::with_router accepts Arc parameters.
+/// Guards that `Runtime::with_router` accepts Arc parameters.
 ///
 /// The fork replaced Arc<ProcessTable> and Arc<dyn MessageRouter> with Rc equivalents.
 /// This test ensures the Arc-based API is preserved.
@@ -140,7 +134,7 @@ fn runtime_with_router_accepts_arc() {
 // Task 2: Async/runtime contract tests
 // ============================================================================
 
-/// Guards that Runtime::spawn is async and returns a Future.
+/// Guards that `Runtime::spawn` is async and returns a Future.
 ///
 /// The fork changed spawn from async to sync, breaking the ability to .await
 /// the PID. This test ensures spawn().await works and returns a valid PID.
@@ -167,8 +161,7 @@ async fn spawn_requires_send_handler() {
     rt.spawn(move |_ctx| async move {
         // Hold Arc across an .await point -- only valid if future is Send
         tokio::task::yield_now().await;
-        let mut val = shared_clone.lock().unwrap();
-        *val = 42;
+        *shared_clone.lock().unwrap() = 42;
         tx.send(()).unwrap();
     })
     .await;
@@ -180,7 +173,7 @@ async fn spawn_requires_send_handler() {
     assert_eq!(*shared.lock().unwrap(), 42);
 }
 
-/// Guards that Runtime::send is async.
+/// Guards that `Runtime::send` is async.
 ///
 /// The fork changed send from async to sync. This test ensures send().await
 /// compiles and works correctly.
@@ -210,7 +203,7 @@ async fn runtime_send_is_async() {
     assert_eq!(result, "async-send");
 }
 
-/// Guards that ProcessContext::send is async.
+/// Guards that `ProcessContext::send` is async.
 ///
 /// The fork changed context send from async to sync. This test ensures
 /// ctx.send().await compiles and works inside a spawned process.
@@ -276,7 +269,7 @@ async fn panicking_process_does_not_crash_runtime() {
 /// Guards that a panicked process is cleaned up from the process table.
 ///
 /// After a process panics, its PID must be removed from the table so that
-/// sending to it returns ProcessDead. The fork removed this cleanup.
+/// sending to it returns `ProcessDead`. The fork removed this cleanup.
 #[tokio::test]
 async fn panicking_process_is_cleaned_up() {
     let rt = Runtime::new(1);
@@ -293,8 +286,7 @@ async fn panicking_process_is_cleaned_up() {
     let result = rt.send(pid, rmpv::Value::Nil).await;
     assert!(
         matches!(result, Err(SendError::ProcessDead(_))),
-        "sending to a panicked PID must return ProcessDead, got: {:?}",
-        result
+        "sending to a panicked PID must return ProcessDead, got: {result:?}",
     );
 }
 
@@ -317,7 +309,7 @@ async fn concurrent_spawn_from_multiple_tasks() {
     let mut pids = std::collections::HashSet::new();
     for handle in handles {
         let pid = handle.await.unwrap();
-        assert!(pids.insert(pid), "duplicate PID detected: {}", pid);
+        assert!(pids.insert(pid), "duplicate PID detected: {pid}");
     }
 
     assert_eq!(pids.len(), 5, "expected 5 unique PIDs from concurrent spawns");
@@ -335,8 +327,8 @@ fn gen_server_context_is_send() {
 fn call_error_has_timeout_and_server_dead_variants() {
     let err = rebar_core::gen_server::CallError::Timeout;
     match err {
-        rebar_core::gen_server::CallError::Timeout => {}
-        rebar_core::gen_server::CallError::ServerDead => {}
+        rebar_core::gen_server::CallError::Timeout
+        | rebar_core::gen_server::CallError::ServerDead => {}
     }
 }
 

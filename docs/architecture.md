@@ -23,6 +23,16 @@ graph TD
         TBL["table<br>ProcessTable,<br>ProcessHandle"]
         MON["monitor<br>MonitorRef,<br>MonitorSet, LinkSet"]
         SUP["supervisor<br>SupervisorSpec,<br>ChildSpec, engine"]
+        GS["gen_server<br>GenServer, GenServerRef,<br>GenServerContext"]
+        STATEM["gen_statem<br>GenStatem, GenStatemRef,<br>TransitionResult"]
+        TASK["task<br>Task, async_task,<br>async_map, StreamOpts"]
+        AGENT["agent<br>AgentRef, start_agent,<br>BoxedGetFn / BoxedUpdateFn"]
+        TIMER["timer<br>TimerRef, send_after,<br>send_interval, apply_after"]
+        PG["pg<br>PgScope, PgEvent,<br>broadcast"]
+        SYS["sys<br>DebugOpts, ProcessStatus,<br>ProcessRunState"]
+        APP["application<br>Application, AppSpec,<br>ApplicationManager, AppEnv"]
+        PSUP["partition_supervisor<br>PartitionSupervisorSpec,<br>PartitionSupervisorHandle"]
+        GENSTAGE["gen_stage<br>GenStage, GenStageRef,<br>Dispatcher, SubscriptionTag"]
     end
 
     subgraph cluster["rebar-cluster"]
@@ -56,6 +66,26 @@ graph TD
     TBL --> PROC
     SUP --> RT
     SUP --> PROC
+
+    GS --> RT
+    GS --> PROC
+    GS --> SYS
+    GS --> TIMER
+    STATEM --> RT
+    STATEM --> PROC
+    TASK --> RT
+    TASK --> PROC
+    AGENT --> RT
+    AGENT --> PROC
+    TIMER --> PROC
+    PG --> PROC
+    APP --> RT
+    APP --> SUP
+    PSUP --> RT
+    PSUP --> SUP
+    PSUP --> PROC
+    GENSTAGE --> RT
+    GENSTAGE --> PROC
 ```
 
 ## 3. Process Model
@@ -281,7 +311,519 @@ The supervisor tracks restart timestamps in a `VecDeque<Instant>` sliding window
 - **Timeout(duration)** -- send a shutdown signal and wait up to `duration` for graceful exit (default: 5s)
 - **BrutalKill** -- terminate the child immediately without waiting
 
-## 6. SWIM Protocol
+## 6. OTP Behaviors and Patterns
+
+Rebar implements a suite of OTP-inspired behaviors and patterns as modules within `rebar-core`. Each behavior encapsulates a recurring concurrency pattern -- stateful servers, state machines, async tasks, timers, process groups -- into a reusable abstraction backed by a spawned process. All behaviors build on the core process model (Section 3) and benefit from the same panic isolation and supervision guarantees.
+
+### 6.1 GenServer
+
+`GenServer` is a typed stateful server behavior. Implementors define associated types for state, call/cast messages, and replies, then implement callbacks (`init`, `handle_call`, `handle_cast`, `handle_info`, `handle_continue`, `terminate`). The engine runs a biased `tokio::select!` event loop that processes messages in strict priority order.
+
+#### GenServer Event Loop
+
+```mermaid
+flowchart TD
+    START["spawn_gen_server()"] --> INIT["init(&ctx)<br>→ Result&lt;State, String&gt;"]
+    INIT -->|Ok| DRAIN_CONTINUE["Drain continue_rx<br>(try_recv loop)"]
+    INIT -->|Err| EXIT_EARLY["Return (cleanup)"]
+
+    DRAIN_CONTINUE --> DRAIN_SYS["Drain sys_rx<br>(try_recv loop)"]
+    DRAIN_SYS --> SUSPENDED{"suspended?"}
+
+    SUSPENDED -->|Yes| SYS_ONLY["Blocking recv on sys_rx only<br>(calls/casts/info frozen)"]
+    SYS_ONLY -->|Resume| DRAIN_CONTINUE
+    SYS_ONLY -->|Channel closed| TERM["terminate(Normal)"]
+
+    SUSPENDED -->|No| SELECT["biased tokio::select!"]
+
+    SELECT -->|"① sys_rx.recv()"| HANDLE_SYS["handle_sys_command()<br>get_state / suspend /<br>resume / get_status"]
+    SELECT -->|"② call_rx.recv()"| HANDLE_CALL["handle_call(msg, from, state)<br>→ Reply via oneshot"]
+    SELECT -->|"③ cast_rx.recv()"| HANDLE_CAST["handle_cast(msg, state)"]
+    SELECT -->|"④ mailbox_rx.recv()"| HANDLE_INFO["handle_info(msg, state)"]
+
+    HANDLE_SYS --> DRAIN_CONTINUE
+    HANDLE_CALL --> DRAIN_CONTINUE
+    HANDLE_CAST --> DRAIN_CONTINUE
+    HANDLE_INFO --> DRAIN_CONTINUE
+
+    HANDLE_CALL -->|"channel closed"| TERM
+    HANDLE_CAST -->|"channel closed"| TERM
+    HANDLE_INFO -->|"channel closed"| TERM
+
+    TERM --> CLEANUP["table.remove(&pid)"]
+
+    style EXIT_EARLY fill:#e74c3c,color:#fff
+    style TERM fill:#95a5a6,color:#fff
+    style CLEANUP fill:#95a5a6,color:#fff
+```
+
+The priority ordering is: **sys commands > continue > calls > casts > info**. Sys commands (suspend, resume, get_state, get_status) are always processed first. Continue messages (`ctx.continue_with(payload)`) are drained via `try_recv` before re-entering the select loop, matching Elixir's semantics where `handle_continue` runs before the next mailbox message. Calls have priority over casts because calls carry timeouts and callers are blocked waiting.
+
+Key types:
+- **`GenServer` trait** -- associated types `State`, `Call`, `Cast`, `Reply`; callbacks `init`, `handle_call`, `handle_cast`, `handle_info`, `handle_continue`, `terminate`
+- **`GenServerRef<S>`** -- typed handle with `call(msg, timeout)`, `cast(msg)`, and sys debug methods
+- **`GenServerContext`** -- provides `self_pid()`, `send(dest, payload)`, `continue_with(payload)`, `send_after()`, `send_interval()`
+- **`CallError`** -- `Timeout` or `ServerDead`
+
+### 6.2 GenStatem
+
+`GenStatem` is a state machine behavior modeled after Erlang's `gen_statem`. It uses a single `handle_event` callback dispatched with an `EventType` discriminant, supporting state transitions, enter callbacks, postponed events, and three independent timeout types.
+
+#### GenStatem Event Flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> Init : spawn_gen_statem()
+
+    Init --> EventLoop : init() → Ok((state, data))
+    Init --> Dead : init() → Err
+
+    state EventLoop {
+        [*] --> DrainInternal : check internal_queue
+        DrainInternal --> ProcessInternal : events pending
+        DrainInternal --> ExternalSelect : queue empty
+
+        ProcessInternal --> HandleEvent : dequeue event
+
+        ExternalSelect --> HandleEvent : call / cast / timeout fires
+
+        HandleEvent --> ApplyResult
+
+        ApplyResult --> NextState : TransitionResult::NextState
+        ApplyResult --> KeepState : KeepState / KeepStateAndData
+        ApplyResult --> Stop : TransitionResult::Stop
+
+        NextState --> CancelStateTimeout : state changed
+        CancelStateTimeout --> ReplayPostponed : prepend to internal_queue
+        ReplayPostponed --> FireEnter : if state_enter enabled
+        FireEnter --> DrainInternal
+
+        KeepState --> DrainInternal
+
+        NextState --> DrainInternal : state unchanged
+    }
+
+    Stop --> Terminate : terminate(reason, state, data)
+    Terminate --> Dead
+
+    Dead --> [*]
+```
+
+**Timeouts** -- three independent timeout types, each with different cancellation semantics:
+
+| Timeout | Set via | Cancelled when |
+|---------|---------|----------------|
+| **State timeout** | `Action::StateTimeout(duration, payload)` | State changes (any `NextState` with a different state value) |
+| **Event timeout** | `Action::EventTimeout(duration, payload)` | Any external event arrives (call, cast, or info) |
+| **Generic timeout** | `Action::GenericTimeout(name, duration, payload)` | Explicit `Action::CancelTimeout(TimeoutKind::Generic(name))` or same-name replacement |
+
+**Postponed events** -- returning `Action::Postpone` re-queues the current event. On a state change, all postponed events are prepended to the internal queue (FIFO) and replayed, with the `Enter` event inserted before them.
+
+Key types:
+- **`GenStatem` trait** -- associated types `State`, `Data`, `Call`, `Cast`, `Reply`; callbacks `callback_mode`, `init`, `handle_event`, `terminate`
+- **`EventType<Reply>`** -- `Call(oneshot::Sender)`, `Cast`, `Info`, `StateTimeout`, `EventTimeout`, `Timeout(String)`, `Internal`, `Enter { old_state_name }`
+- **`TransitionResult`** -- `NextState`, `KeepState`, `KeepStateAndData`, `Stop`, `StopAndReply`
+- **`Action`** -- `Reply`, `StateTimeout`, `EventTimeout`, `GenericTimeout`, `CancelTimeout`, `Postpone`, `NextEvent`, `Hibernate`
+- **`GenStatemRef<S>`** -- typed handle with `call(msg, timeout)` and `cast(msg)`
+
+### 6.3 Task
+
+`Task` provides lightweight async task spawning with result tracking, modeled after Elixir's `Task` module. Each task runs as a full process in the runtime (has a PID, appears in the process table) and communicates its result back via a `oneshot` channel.
+
+#### Task Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Runtime as Runtime
+    participant TaskProc as Task Process
+    participant Oneshot as oneshot channel
+
+    Caller->>Runtime: async_task(|| async { ... })
+    Runtime->>TaskProc: spawn(handler)
+    Runtime-->>Caller: Task { pid, result_rx }
+
+    TaskProc->>TaskProc: Execute closure
+    TaskProc->>Oneshot: result_tx.send(value)
+
+    Caller->>Oneshot: await_result(timeout)
+    Oneshot-->>Caller: Ok(value) / Timeout / ProcessDead
+```
+
+**`async_map`** processes a collection concurrently with bounded parallelism using a semaphore-based concurrency limiter:
+
+```mermaid
+flowchart LR
+    INPUT["Items\n[a, b, c, d, e]"] --> SEM["Semaphore\nmax_concurrency = 3"]
+
+    SEM --> T1["Task a"]
+    SEM --> T2["Task b"]
+    SEM --> T3["Task c"]
+    SEM -.->|"awaits permit"| T4["Task d"]
+    SEM -.->|"awaits permit"| T5["Task e"]
+
+    T1 --> COLLECT["Collect results\n(ordered by input index)"]
+    T2 --> COLLECT
+    T3 --> COLLECT
+    T4 --> COLLECT
+    T5 --> COLLECT
+
+    COLLECT --> OUTPUT["Vec&lt;Result&lt;T, TaskError&gt;&gt;"]
+```
+
+Each task acquires an `OwnedSemaphorePermit` before spawning; the permit is dropped when the task completes, allowing the next queued task to proceed. Results are sorted by input index when `opts.ordered` is true.
+
+Key types:
+- **`Task<T>`** -- handle with `await_result(timeout)`, `yield_result(timeout)`, `shutdown()`
+- **`StreamOpts`** -- `max_concurrency`, `ordered`, `timeout`
+- **`TaskError`** -- `Timeout` or `ProcessDead`
+- Functions: `async_task`, `async_task_ctx` (with `ProcessContext`), `start_task` (fire-and-forget), `async_map`
+
+### 6.4 Agent
+
+`Agent` is a simple state wrapper that avoids the need to define custom message types. It uses type erasure to hold arbitrary state as `Box<dyn Any + Send>` inside a process, and sends typed closures boxed into trait objects over an `mpsc` channel.
+
+#### Agent Type-Erasure Architecture
+
+```mermaid
+flowchart TD
+    subgraph caller["Caller (typed)"]
+        GET["agent.get(|s: &MyState| s.count)"]
+        UPD["agent.update(|s: &mut MyState| s.count += 1)"]
+        GAU["agent.get_and_update(|s: &mut MyState| { ... })"]
+        CAST["agent.cast(|s: &mut MyState| s.count += 1)"]
+    end
+
+    subgraph erase["Type Erasure Boundary"]
+        BOXGET["Box&lt;dyn FnOnce(&dyn Any) → Box&lt;dyn Any + Send&gt;&gt;"]
+        BOXUPD["Box&lt;dyn FnOnce(&mut dyn Any)&gt;"]
+    end
+
+    subgraph channel["mpsc channel"]
+        MSG["AgentMsg::Get / Update /<br>GetAndUpdate / Cast / Stop"]
+    end
+
+    subgraph process["Agent Process"]
+        STATE["state: Box&lt;dyn Any + Send&gt;<br>(initialized as Box&lt;MyState&gt;)"]
+        DOWNCAST["downcast_ref::&lt;MyState&gt;()<br>or downcast_mut::&lt;MyState&gt;()"]
+    end
+
+    GET --> BOXGET
+    UPD --> BOXUPD
+    GAU --> BOXGET
+    CAST --> BOXUPD
+
+    BOXGET --> MSG
+    BOXUPD --> MSG
+
+    MSG --> STATE
+    STATE --> DOWNCAST
+    DOWNCAST -->|"get"| REPLY["oneshot reply<br>Box&lt;dyn Any + Send&gt;"]
+    DOWNCAST -->|"update"| ACK["oneshot reply<br>()"]
+
+    REPLY --> UNBOX["downcast::&lt;T&gt;() at caller"]
+```
+
+The agent process runs a simple `recv` loop. Each operation sends a boxed closure that captures the typed function from the caller, downcasts the `dyn Any` state to the concrete type inside the process, and sends the result back through a `oneshot`. This avoids requiring the user to define message enums while maintaining type safety at the call site (panics on type mismatch, caught by process isolation).
+
+Key types:
+- **`AgentRef`** -- handle with `get(f, timeout)`, `update(f, timeout)`, `get_and_update(f, timeout)`, `cast(f)`, `stop(timeout)`
+- **`AgentError`** -- `Timeout` or `Dead`
+- Function: `start_agent(runtime, init_fn)`
+
+### 6.5 Timer
+
+`Timer` provides `send_after` and `send_interval` for delayed and periodic message delivery, plus `apply_after` and `apply_interval` for delayed function execution. Each timer spawns a `tokio::spawn` task and wraps its `AbortHandle` in a `TimerRef` for cancellation.
+
+#### Timer Cancellation via AbortHandle
+
+```mermaid
+flowchart LR
+    subgraph create["Creation"]
+        SA["send_after(router, from, dest, payload, delay)"]
+        SI["send_interval(router, from, dest, payload, interval)"]
+        AA["apply_after(delay, f)"]
+        AI["apply_interval(interval, f)"]
+    end
+
+    subgraph tokio["tokio runtime"]
+        TASK["tokio::spawn(async { sleep → route/execute })"]
+        ABORT["JoinHandle::abort_handle()"]
+    end
+
+    subgraph handle["TimerRef"]
+        WRAP["TimerRef { abort_handle }"]
+        CANCEL["cancel() → abort_handle.abort()"]
+        FINISHED["is_finished() → abort_handle.is_finished()"]
+    end
+
+    SA --> TASK
+    SI --> TASK
+    AA --> TASK
+    AI --> TASK
+    TASK --> ABORT
+    ABORT --> WRAP
+    WRAP --> CANCEL
+    WRAP --> FINISHED
+```
+
+`send_interval` skips the immediate first tick of `tokio::time::interval` and automatically stops if `router.route()` returns `Err` (destination process is dead). Cancellation via `TimerRef::cancel()` is idempotent -- calling it multiple times is safe. The `TimerRef` is `Clone`, and clones share the same underlying `AbortHandle`.
+
+`GenServerContext` integrates timers directly: `ctx.send_after(dest, payload, delay)` and `ctx.send_interval(dest, payload, interval)` create timers using the server's router, returning `Option<TimerRef>`.
+
+### 6.6 Process Groups (pg)
+
+`PgScope` implements named process groups, modeled after Erlang's `pg` module. Groups are organized into scopes to partition the namespace. The underlying data structure is a `DashMap<String, Vec<ProcessId>>`, providing lock-free concurrent access.
+
+#### Process Group Structure
+
+```mermaid
+flowchart TD
+    subgraph scope["PgScope"]
+        GROUPS["groups: DashMap&lt;String, Vec&lt;ProcessId&gt;&gt;"]
+
+        subgraph g1["&quot;workers&quot;"]
+            P1["&lt;1.1&gt;"]
+            P2["&lt;1.2&gt;"]
+            P3["&lt;2.1&gt;"]
+        end
+
+        subgraph g2["&quot;listeners&quot;"]
+            P4["&lt;1.3&gt;"]
+            P5["&lt;1.4&gt;"]
+        end
+    end
+
+    GROUPS --> g1
+    GROUPS --> g2
+
+    subgraph ops["Operations"]
+        JOIN["join(group, pid)"]
+        LEAVE["leave(group, pid)"]
+        MEMBERS["get_members(group)"]
+        LOCAL["get_local_members(group, node_id)"]
+        WHICH["which_groups()"]
+        BCAST["broadcast(group, from, payload, router)"]
+    end
+```
+
+**Broadcast fan-out** iterates over `get_members(group)` and calls `router.route(from, dest, payload)` for each member, returning a `Vec<Result<(), SendError>>` so the caller can see which sends succeeded.
+
+A process can join the same group multiple times (each join adds a separate entry). `leave` removes only one membership. `remove_pid(pid)` clears all memberships for a process across all groups (used on process death). `remove_node(node_id)` clears all memberships for an entire node (used on node disconnect). Empty groups are automatically cleaned up.
+
+### 6.7 Sys Debug
+
+The `sys` module provides GenServer introspection without stopping or restarting the process, modeled after Erlang's `:sys` module. Sys commands are injected into the GenServer event loop at the highest priority via a dedicated `mpsc` channel.
+
+#### Sys Command Priority
+
+```mermaid
+flowchart TD
+    subgraph external["External API (GenServerRef)"]
+        GST["sys_get_state(timeout)"]
+        SUSP["sys_suspend(timeout)"]
+        RES["sys_resume(timeout)"]
+        STAT["sys_get_status(timeout)"]
+    end
+
+    subgraph channel["sys_tx: mpsc::Sender&lt;SysCommand&gt;"]
+        CMD["SysCommand::<br>GetState(getter) |<br>Suspend(reply) |<br>Resume(reply) |<br>GetStatus(reply)"]
+    end
+
+    subgraph loop["GenServer event loop (biased select)"]
+        PRIO["① sys_rx.recv()  ← highest priority"]
+        CALL["② call_rx.recv()"]
+        CAST["③ cast_rx.recv()"]
+        INFO["④ mailbox_rx.recv()"]
+    end
+
+    external --> CMD --> PRIO
+
+    subgraph suspended["Suspended state"]
+        ONLY_SYS["Only sys commands processed<br>calls/casts/info frozen"]
+        RESUME_CMD["Resume → break out of<br>suspended loop"]
+    end
+
+    PRIO -->|"Suspend"| suspended
+    RESUME_CMD --> PRIO
+```
+
+`sys_get_state` uses a type-erased getter: the caller sends a `Box<dyn FnOnce(&S::State)>` closure that clones the state and sends it back via a `oneshot`. This avoids requiring `S::State: Any` -- only `Clone` is needed.
+
+Key types:
+- **`ProcessStatus`** -- `pid`, `status` (Running/Suspended), `debug` (DebugOpts), `state_description`
+- **`ProcessRunState`** -- `Running` or `Suspended`
+- **`DebugOpts`** -- `trace: bool`, `log: Option<usize>`, `statistics: bool`
+- **`SystemEvent`** -- `In`, `Out`, `StateChange`, `Noreply`
+
+### 6.8 Application
+
+`Application` is the top-level lifecycle management behavior, modeled after Elixir/OTP's `Application`. An application starts a supervision tree and manages its lifecycle through `start`, `prep_stop`, and `stop` callbacks. The `ApplicationManager` handles dependency ordering between applications using topological sort.
+
+#### Application Dependency Resolution
+
+```mermaid
+flowchart TD
+    subgraph registered["Registered Applications"]
+        A["AppSpec: 'top'<br>deps: [mid]"]
+        B["AppSpec: 'mid'<br>deps: [base]"]
+        C["AppSpec: 'base'<br>deps: []"]
+    end
+
+    subgraph topo["Topological Sort (iterative DFS)"]
+        DFS["ensure_all_started('top')"]
+        DFS --> VISIT_TOP["Visit 'top' → grey"]
+        VISIT_TOP --> VISIT_MID["Visit 'mid' → grey"]
+        VISIT_MID --> VISIT_BASE["Visit 'base' → grey"]
+        VISIT_BASE --> DONE_BASE["'base' → black<br>emit 'base'"]
+        DONE_BASE --> DONE_MID["'mid' → black<br>emit 'mid'"]
+        DONE_MID --> DONE_TOP["'top' → black<br>emit 'top'"]
+    end
+
+    subgraph start_order["Start Order"]
+        S1["1. start('base')"]
+        S2["2. start('mid')"]
+        S3["3. start('top')"]
+    end
+
+    DONE_TOP --> S1
+    S1 --> S2
+    S2 --> S3
+
+    subgraph lifecycle["Application Lifecycle"]
+        START["app.start(runtime, env)<br>→ SupervisorHandle"]
+        PREP["app.prep_stop(env)"]
+        SHUTDOWN["supervisor.shutdown()"]
+        STOP["app.stop(env)"]
+    end
+
+    S3 --> START
+    START -.->|"on stop()"| PREP
+    PREP --> SHUTDOWN
+    SHUTDOWN --> STOP
+```
+
+The topological sort uses iterative DFS with three-color marking (white/grey/black) to detect circular dependencies. Grey nodes in the DFS stack indicate a cycle, which returns `AppError::CircularDependency`. Diamond dependencies (where two apps depend on the same base) are handled correctly -- the base is started only once.
+
+`stop_all()` shuts down applications in reverse start order. Each application's `prep_stop` callback runs before the supervisor is shut down, allowing graceful cleanup (e.g., unregistering names, draining connections).
+
+**AppEnv** provides per-application configuration as a thread-safe key-value store backed by `DashMap<String, rmpv::Value>`. Initial values are loaded from `AppSpec::env` at start time.
+
+Key types:
+- **`Application` trait** -- callbacks `start(runtime, env)`, `prep_stop(env)`, `stop(env)`
+- **`AppSpec`** -- `name`, `dependencies: Vec<String>`, `env: Vec<(String, rmpv::Value)>`
+- **`ApplicationManager`** -- `register(spec, app)`, `start(name)`, `ensure_all_started(name)`, `stop(name)`, `stop_all()`
+- **`AppEnv`** -- `get(key)`, `put(key, value)`, `fetch(key)`, `delete(key)`, `all()`
+- **`AppError`** -- `NotFound`, `AlreadyStarted`, `DependencyNotRegistered`, `DependencyNotStarted`, `CircularDependency`, `StartFailed`, `EnvKeyNotFound`
+
+### 6.9 GenStage
+
+`GenStage` implements back-pressure-aware producer/consumer pipelines, modeled after Elixir's `GenStage`. Stages are connected via subscriptions; consumers pull events from producers by sending demand, and producers emit events only when downstream demand exists.
+
+#### GenStage Demand Flow
+
+```mermaid
+sequenceDiagram
+    participant Producer as Producer Stage
+    participant Dispatcher as Dispatcher<br>(DemandDispatcher /<br>BroadcastDispatcher)
+    participant Consumer as Consumer Stage
+
+    Note over Consumer: subscribe(producer, opts)
+    Consumer->>Producer: StageCommand::Subscribe
+    Producer->>Consumer: SubscriptionConfirmed
+
+    Note over Consumer: Automatic mode: send initial demand
+    Consumer->>Producer: AskDemand(tag, max_demand)
+
+    Note over Producer: handle_demand(demand, state) → events
+    Producer->>Dispatcher: dispatch(events, subscribers)
+    Dispatcher-->>Dispatcher: Split events by pending_demand
+    Dispatcher->>Consumer: StageCommand::Events(tag, batch)
+
+    Note over Consumer: handle_events(batch, tag, state)
+    Consumer->>Consumer: Process events
+
+    Note over Consumer: Automatic re-demand when pending ≥ min_demand
+    Consumer->>Producer: AskDemand(tag, processed_count)
+
+    Note over Producer: Cycle continues...
+```
+
+**Dispatcher strategies** determine how events are distributed across multiple consumers:
+
+| Dispatcher | Behavior |
+|-----------|----------|
+| `DemandDispatcher` | Sequential: each consumer receives events up to its pending demand, in subscription order. Excess events are buffered. |
+| `BroadcastDispatcher` | Fan-out: every subscriber receives a clone of the entire event batch. Pending demand is decremented per subscriber. |
+
+The `Dispatcher` trait is pluggable via `spawn_stage_with_dispatcher(runtime, stage, dispatcher)`.
+
+**Subscription lifecycle**: consumers subscribe via `GenStageRef::subscribe(producer, opts)`. The producer calls `handle_subscribe` on both sides. In `DemandMode::Automatic`, the consumer immediately sends `max_demand` to the producer and re-demands when `pending_events >= min_demand`. In `DemandMode::Manual`, the application controls demand via `GenStageRef::ask(tag, demand)`.
+
+**ProducerConsumer** stages receive events from upstream and emit transformed events downstream, acting as both consumer and producer in a pipeline chain.
+
+Key types:
+- **`GenStage` trait** -- associated type `State`; callbacks `init`, `handle_demand`, `handle_events`, `handle_subscribe`, `handle_cancel`, `handle_call`, `handle_cast`, `terminate`
+- **`StageType`** -- `Producer`, `ProducerConsumer`, `Consumer`
+- **`GenStageRef`** -- handle with `subscribe(producer, opts)`, `cancel(tag)`, `ask(tag, demand)`, `call(msg, timeout)`, `cast(msg)`
+- **`SubscriptionTag`** -- globally unique `u64` identifier for a subscription
+- **`SubscribeOpts`** -- `max_demand` (default 1000), `min_demand` (default 500)
+- **`DemandMode`** -- `Automatic` or `Manual`
+- **`Dispatcher` trait** -- `dispatch(events, subscribers) -> DispatchResult`
+
+### 6.10 PartitionSupervisor
+
+`PartitionSupervisor` manages a pool of identically-structured child processes, each assigned a partition index. Work is routed to a specific partition by key, distributing load across independent processes. Built on top of the regular supervisor.
+
+#### Partition Routing
+
+```mermaid
+flowchart LR
+    subgraph routing["Key Routing"]
+        KEY_INT["Integer key: 42"]
+        KEY_HASH["Hashable key: &quot;user:alice&quot;"]
+    end
+
+    subgraph resolve["Resolution"]
+        MOD["42 % 4 = 2"]
+        HASH["DefaultHasher::hash(&key)<br>hash % 4 = partition"]
+    end
+
+    subgraph partitions["PartitionSupervisor (4 partitions)"]
+        P0["Partition 0<br>&lt;1.5&gt;"]
+        P1["Partition 1<br>&lt;1.6&gt;"]
+        P2["Partition 2<br>&lt;1.7&gt;"]
+        P3["Partition 3<br>&lt;1.8&gt;"]
+    end
+
+    KEY_INT --> MOD --> P2
+    KEY_HASH --> HASH --> P1
+
+    subgraph supervisor["Underlying Supervisor"]
+        SUP["SupervisorHandle<br>strategy: OneForOne<br>max_restarts / max_seconds"]
+    end
+
+    partitions --> supervisor
+
+    style P2 fill:#27ae60,color:#fff
+    style P1 fill:#3498db,color:#fff
+```
+
+Each partition is created by a `PartitionFactory` -- an `Arc<dyn Fn(usize) -> Pin<Box<dyn Future<Output = ExitReason> + Send>>>` -- which receives the zero-based partition index. Partitions are added as children to an underlying regular supervisor, inheriting its restart strategy and restart limiting.
+
+`PartitionSupervisorHandle` provides two routing methods:
+- `which_partition(key: u64)` -- routes by `key % partitions` (deterministic modulo)
+- `which_partition_by_hash(key: &K)` -- hashes via `DefaultHasher` then applies modulo
+
+The partition count defaults to `std::thread::available_parallelism()` (number of CPU cores). Since each partition is a regular supervised child, a crashed partition is restarted independently (under `OneForOne` strategy) without affecting other partitions.
+
+Key types:
+- **`PartitionSupervisorSpec`** -- `partitions`, `strategy`, `max_restarts`, `max_seconds` (builder pattern)
+- **`PartitionSupervisorHandle`** -- `which_partition(key)`, `which_partition_by_hash(key)`, `partition_pid(index)`, `shutdown()`
+- **`PartitionFactory`** -- `Arc<dyn Fn(usize) -> Pin<Box<dyn Future<Output = ExitReason> + Send>>>`
+- Function: `start_partition_supervisor(runtime, spec, factory)`
+
+## 7. SWIM Protocol
 
 Rebar uses the SWIM (Scalable Weakly-consistent Infection-style process group Membership) protocol for cluster membership and failure detection. The implementation lives in the `rebar-cluster::swim` module.
 
@@ -317,7 +859,7 @@ The SWIM protocol operates on a configurable tick cycle (default: 1 second `prot
 
 6. **Gossip Piggybacking**: Membership state changes (Alive, Suspect, Dead, Leave) are queued in a `GossipQueue` and piggybacked on protocol messages, up to `max_gossip_per_tick` (default: 8) updates per tick. This provides epidemic-style dissemination of membership information without dedicated gossip rounds.
 
-## 7. Wire Protocol
+## 8. Wire Protocol
 
 The wire protocol uses a fixed 18-byte header followed by variable-length MessagePack-encoded header and payload sections.
 
@@ -357,7 +899,7 @@ Total frame size: `18 + header_len + payload_len` bytes.
 
 Both the `header` and `payload` fields use `rmpv::Value` (MessagePack dynamic value), allowing flexible structured data without a rigid schema. The header typically carries routing metadata (source/destination PIDs, monitor refs), while the payload carries application data.
 
-## 8. Global Registry (CRDT)
+## 9. Global Registry (CRDT)
 
 The global name registry uses an OR-Set (Observed-Remove Set) CRDT to provide eventually-consistent process name registration across all nodes in the cluster. Conflict resolution uses Last-Writer-Wins (LWW) semantics.
 
@@ -411,7 +953,7 @@ The OR-Set CRDT guarantees that when all deltas have been exchanged and applied,
 - **Idempotent merges**: Applying the same Add delta multiple times has no effect beyond the first application.
 - **Commutativity**: Deltas can be applied in any order and produce the same result.
 
-## 9. Connection Management
+## 10. Connection Management
 
 The `ConnectionManager` handles the lifecycle of connections to remote nodes, integrating with SWIM discovery and providing automatic reconnection with exponential backoff.
 
@@ -508,7 +1050,7 @@ stateDiagram-v2
 
 See [Node Drain Internals](internals/node-drain.md) for the full protocol specification.
 
-## 10. FFI Layer
+## 11. FFI Layer
 
 The `rebar-ffi` crate provides a C-ABI interface that enables embedding the Rebar runtime in any language with C FFI support. It exposes opaque handle types and a set of `extern "C"` functions following Rust's `#[unsafe(no_mangle)]` convention.
 

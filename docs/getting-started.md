@@ -12,6 +12,16 @@ This guide walks you through Rebar's core concepts with progressive, runnable ex
 6. [Process-per-Key Pattern](#6-process-per-key-pattern)
 7. [Monitoring and Linking](#7-monitoring-and-linking)
 8. [Distributed Messaging](#8-distributed-messaging)
+9. [GenServer (Typed Stateful Actor)](#9-genserver-typed-stateful-actor)
+10. [Task (Lightweight Async)](#10-task-lightweight-async)
+11. [Agent (Simple Shared State)](#11-agent-simple-shared-state)
+12. [Timer (Delayed Messages)](#12-timer-delayed-messages)
+13. [Process Groups (Pub/Sub)](#13-process-groups-pubsub)
+14. [Sys Debug (Runtime Introspection)](#14-sys-debug-runtime-introspection)
+15. [GenStatem (State Machine)](#15-genstatem-state-machine)
+16. [GenStage (Back-Pressure Pipeline)](#16-genstage-back-pressure-pipeline)
+17. [Application (Lifecycle)](#17-application-lifecycle)
+18. [PartitionSupervisor (Sharded Workers)](#18-partitionsupervisor-sharded-workers)
 
 ---
 
@@ -729,10 +739,1125 @@ Key points:
 
 ---
 
+## 9. GenServer (Typed Stateful Actor)
+
+A `GenServer` is a typed, stateful actor -- the Rebar equivalent of Erlang/OTP's `gen_server`. You define associated types for your state, call/cast messages, and reply, then implement a trait. The framework handles the mailbox loop, call timeouts, and process cleanup.
+
+```rust
+use rebar_core::gen_server::{spawn_gen_server, GenServer, GenServerContext};
+use rebar_core::process::ProcessId;
+use rebar_core::runtime::Runtime;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// A simple counter GenServer.
+struct Counter;
+
+#[async_trait::async_trait]
+impl GenServer for Counter {
+    type State = u64;
+    type Call = String;
+    type Cast = String;
+    type Reply = u64;
+
+    async fn init(&self, _ctx: &GenServerContext) -> Result<Self::State, String> {
+        Ok(0)
+    }
+
+    async fn handle_call(
+        &self,
+        msg: Self::Call,
+        _from: ProcessId,
+        state: &mut Self::State,
+        _ctx: &GenServerContext,
+    ) -> Self::Reply {
+        match msg.as_str() {
+            "get" => *state,
+            "increment_and_get" => {
+                *state += 1;
+                *state
+            }
+            _ => 0,
+        }
+    }
+
+    async fn handle_cast(
+        &self,
+        msg: Self::Cast,
+        state: &mut Self::State,
+        _ctx: &GenServerContext,
+    ) {
+        if msg == "increment" {
+            *state += 1;
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let rt = Arc::new(Runtime::new(1));
+
+    // Spawn the GenServer -- returns a typed handle.
+    let server = spawn_gen_server(Arc::clone(&rt), Counter).await;
+    println!("Counter started at PID: {}", server.pid());
+
+    // Cast (fire-and-forget): increment three times.
+    for _ in 0..3 {
+        server.cast("increment".to_string()).unwrap();
+    }
+
+    // Give casts a moment to process.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Call (synchronous): read the current count.
+    let count = server
+        .call("get".to_string(), Duration::from_secs(1))
+        .await
+        .unwrap();
+    println!("Count after 3 increments: {}", count);
+
+    // Call: increment and get atomically.
+    let count = server
+        .call("increment_and_get".to_string(), Duration::from_secs(1))
+        .await
+        .unwrap();
+    println!("Count after increment_and_get: {}", count);
+}
+```
+
+**Expected output:**
+
+```
+Counter started at PID: <1.1>
+Count after 3 increments: 3
+Count after increment_and_get: 4
+```
+
+Key points:
+- **`GenServer` trait** -- associated types (`State`, `Call`, `Cast`, `Reply`) define the message protocol at compile time.
+- **`spawn_gen_server(runtime, impl)`** -- spawns the server and returns a typed `GenServerRef<S>`.
+- **`call(msg, timeout)`** -- synchronous request that blocks until the server replies or the timeout expires.
+- **`cast(msg)`** -- asynchronous fire-and-forget message. Returns immediately.
+- **`handle_continue`** -- implement this callback and use `ctx.continue_with(payload)` in `init` or other callbacks to defer expensive initialization work without blocking callers.
+
+---
+
+## 10. Task (Lightweight Async)
+
+Tasks are lightweight one-shot async computations that run as processes. Use them when you need to run work concurrently and optionally collect the result. Rebar provides `async_task` for awaitable tasks, `start_task` for fire-and-forget, and `async_map` for bounded parallel processing.
+
+```rust
+use rebar_core::runtime::Runtime;
+use rebar_core::task::{async_task, start_task, async_map, StreamOpts};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() {
+    let rt = Arc::new(Runtime::new(1));
+
+    // --- async_task + await_result: spawn and wait for a result ---
+    let mut task = async_task(&rt, || async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        42_u64
+    })
+    .await;
+
+    let result = task.await_result(Duration::from_secs(1)).await.unwrap();
+    println!("Task result: {}", result);
+
+    // --- yield_result: non-blocking check ---
+    let mut slow_task = async_task(&rt, || async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        99_u64
+    })
+    .await;
+
+    match slow_task.yield_result(Duration::from_millis(10)).await {
+        Some(Ok(val)) => println!("Got value: {}", val),
+        Some(Err(e)) => println!("Task failed: {}", e),
+        None => println!("Task still running (yield returned None)"),
+    }
+
+    // --- start_task: fire-and-forget ---
+    let pid = start_task(&rt, || async {
+        println!("Fire-and-forget task executed!");
+    })
+    .await;
+    println!("Started fire-and-forget task at PID: {}", pid);
+
+    // --- async_map: bounded parallel processing ---
+    let results = async_map(
+        Arc::clone(&rt),
+        vec![1_u64, 2, 3, 4, 5],
+        |x| async move { x * x },
+        StreamOpts {
+            max_concurrency: 3,
+            ordered: true,
+            timeout: Duration::from_secs(5),
+        },
+    )
+    .await;
+
+    let squares: Vec<u64> = results.into_iter().map(|r| r.unwrap()).collect();
+    println!("Squares: {:?}", squares);
+
+    // Give fire-and-forget task time to print.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+```
+
+**Expected output:**
+
+```
+Task result: 42
+Task still running (yield returned None)
+Started fire-and-forget task at PID: <1.3>
+Fire-and-forget task executed!
+Squares: [1, 4, 9, 16, 25]
+```
+
+Key points:
+- **`async_task(runtime, closure)`** -- spawns a task as a process and returns a `Task<T>` handle with `await_result()` and `yield_result()`.
+- **`yield_result(timeout)`** -- returns `None` if the task is still running, without consuming the result receiver. Can be called repeatedly.
+- **`start_task(runtime, closure)`** -- fire-and-forget. Returns the PID but no result handle.
+- **`async_map(runtime, items, f, opts)`** -- processes a collection concurrently with bounded parallelism (`max_concurrency`). Returns results in input order when `ordered: true`.
+- Tasks are full processes with PIDs, so they appear in the process table and are cleaned up on completion.
+
+---
+
+## 11. Agent (Simple Shared State)
+
+An `Agent` is the simplest way to manage shared state in Rebar. Unlike `GenServer`, you do not need to define custom message types -- you pass closures directly. This is Rebar's equivalent of Elixir's `Agent` module.
+
+```rust
+use rebar_core::agent::start_agent;
+use rebar_core::runtime::Runtime;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() {
+    let rt = Arc::new(Runtime::new(1));
+
+    // Start an agent with a HashMap as its state.
+    let agent = start_agent(Arc::clone(&rt), HashMap::<String, u64>::new).await;
+    println!("Agent started at PID: {}", agent.pid());
+
+    // Update: insert some entries.
+    agent
+        .update(
+            |state: &mut HashMap<String, u64>| {
+                state.insert("apples".to_string(), 5);
+                state.insert("oranges".to_string(), 3);
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+
+    // Get: read a value.
+    let apples = agent
+        .get(
+            |state: &HashMap<String, u64>| state.get("apples").copied().unwrap_or(0),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    println!("Apples: {}", apples);
+
+    // Get and update: atomically read the old value and modify state.
+    let old_oranges = agent
+        .get_and_update(
+            |state: &mut HashMap<String, u64>| {
+                let old = state.get("oranges").copied().unwrap_or(0);
+                state.insert("oranges".to_string(), old + 10);
+                old
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    println!("Oranges before update: {}", old_oranges);
+
+    let new_oranges = agent
+        .get(
+            |state: &HashMap<String, u64>| state.get("oranges").copied().unwrap_or(0),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    println!("Oranges after update: {}", new_oranges);
+
+    // Cast: fire-and-forget update.
+    agent
+        .cast(|state: &mut HashMap<String, u64>| {
+            state.insert("bananas".to_string(), 7);
+        })
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let bananas = agent
+        .get(
+            |state: &HashMap<String, u64>| state.get("bananas").copied().unwrap_or(0),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    println!("Bananas: {}", bananas);
+}
+```
+
+**Expected output:**
+
+```
+Agent started at PID: <1.1>
+Apples: 5
+Oranges before update: 3
+Oranges after update: 13
+Bananas: 7
+```
+
+Key points:
+- **No custom message types** -- `get`, `update`, `get_and_update`, and `cast` all take closures. The Agent handles serialization internally.
+- **`get(f, timeout)`** -- reads state without modifying it. The closure receives `&S`.
+- **`update(f, timeout)`** -- modifies state. The closure receives `&mut S`. Waits for confirmation.
+- **`get_and_update(f, timeout)`** -- atomically reads and modifies. The closure receives `&mut S` and returns a value.
+- **`cast(f)`** -- fire-and-forget state mutation. Returns immediately without waiting.
+- Use `Agent` for simple state management. Switch to `GenServer` when you need typed messages, `handle_info`, or the `continue` pattern.
+
+---
+
+## 12. Timer (Delayed Messages)
+
+Timers let you send messages to processes after a delay or at regular intervals. They integrate with the message router, so messages arrive in the target's standard mailbox. Timers return a `TimerRef` that can be cancelled.
+
+```rust
+use rebar_core::gen_server::{spawn_gen_server, GenServer, GenServerContext};
+use rebar_core::process::{Message, ProcessId};
+use rebar_core::runtime::Runtime;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// A server that uses timers to send itself delayed messages.
+struct TimerDemo;
+
+#[async_trait::async_trait]
+impl GenServer for TimerDemo {
+    type State = Vec<String>;
+    type Call = String;
+    type Cast = ();
+    type Reply = Vec<String>;
+
+    async fn init(&self, ctx: &GenServerContext) -> Result<Self::State, String> {
+        // Schedule a message to ourselves after 50ms.
+        ctx.send_after_self(
+            rmpv::Value::String("delayed_hello".into()),
+            Duration::from_millis(50),
+        );
+
+        // Schedule a periodic tick every 30ms.
+        let _tick_ref = ctx.send_interval(
+            ctx.self_pid(),
+            rmpv::Value::String("tick".into()),
+            Duration::from_millis(30),
+        );
+
+        Ok(Vec::new())
+    }
+
+    async fn handle_call(
+        &self,
+        _msg: Self::Call,
+        _from: ProcessId,
+        state: &mut Self::State,
+        _ctx: &GenServerContext,
+    ) -> Self::Reply {
+        state.clone()
+    }
+
+    async fn handle_cast(
+        &self,
+        _msg: Self::Cast,
+        _state: &mut Self::State,
+        _ctx: &GenServerContext,
+    ) {}
+
+    async fn handle_info(
+        &self,
+        msg: Message,
+        state: &mut Self::State,
+        _ctx: &GenServerContext,
+    ) {
+        if let Some(text) = msg.payload().as_str() {
+            state.push(text.to_string());
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let rt = Arc::new(Runtime::new(1));
+
+    let server = spawn_gen_server(Arc::clone(&rt), TimerDemo).await;
+    println!("TimerDemo started at PID: {}", server.pid());
+
+    // Wait for timers to fire.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Read the collected messages.
+    let events = server
+        .call("get".to_string(), Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    println!("Received {} timer events:", events.len());
+    for event in &events {
+        println!("  - {}", event);
+    }
+
+    // Demonstrate cancel: schedule a timer then cancel it.
+    use rebar_core::timer;
+    let timer_ref = timer::apply_after(Duration::from_millis(100), || async {
+        println!("This should NOT print (timer was cancelled).");
+    });
+    timer_ref.cancel();
+    println!("Timer cancelled. is_finished: {}", timer_ref.is_finished());
+}
+```
+
+**Expected output:**
+
+```
+TimerDemo started at PID: <1.1>
+Received 5 timer events:
+  - tick
+  - delayed_hello
+  - tick
+  - tick
+  - tick
+Timer cancelled. is_finished: true
+```
+
+Key points:
+- **`ctx.send_after_self(payload, delay)`** -- sends a message to the current process after a delay. The message arrives in `handle_info`.
+- **`ctx.send_interval(dest, payload, interval)`** -- sends a message repeatedly at the given interval. The first message arrives after one interval (not immediately).
+- **`timer::apply_after(delay, f)`** -- executes a closure after a delay, outside of any process context.
+- **`TimerRef::cancel()`** -- cancels a pending timer. Idempotent (safe to call multiple times).
+- **`TimerRef::is_finished()`** -- returns `true` if the timer has fired or been cancelled.
+
+---
+
+## 13. Process Groups (Pub/Sub)
+
+Process groups provide a pub/sub mechanism where processes can join named groups and receive broadcast messages. This is Rebar's equivalent of Erlang's `pg` module. Groups are organized into scopes for namespace isolation.
+
+```rust
+use rebar_core::pg::PgScope;
+use rebar_core::process::ProcessId;
+use rebar_core::process::table::{ProcessHandle, ProcessTable};
+use rebar_core::process::mailbox::Mailbox;
+use rebar_core::router::LocalRouter;
+use std::sync::Arc;
+
+fn main() {
+    // Set up a process table and router so we can demonstrate broadcast.
+    let table = Arc::new(ProcessTable::new(1));
+    let router = LocalRouter::new(Arc::clone(&table));
+
+    // Create mailboxes for three worker processes.
+    let worker1 = table.allocate_pid();
+    let worker2 = table.allocate_pid();
+    let worker3 = table.allocate_pid();
+
+    let (tx1, mut rx1) = Mailbox::unbounded();
+    let (tx2, mut rx2) = Mailbox::unbounded();
+    let (tx3, mut rx3) = Mailbox::unbounded();
+
+    table.insert(worker1, ProcessHandle::new(tx1));
+    table.insert(worker2, ProcessHandle::new(tx2));
+    table.insert(worker3, ProcessHandle::new(tx3));
+
+    // Create a process group scope.
+    let scope = PgScope::new();
+
+    // Workers join the "notifications" group.
+    scope.join("notifications", worker1);
+    scope.join("notifications", worker2);
+
+    // Worker 3 joins a different group.
+    scope.join("logging", worker3);
+
+    println!("notification members: {:?}", scope.get_members("notifications"));
+    println!("logging members: {:?}", scope.get_members("logging"));
+    println!("all groups: {:?}", scope.which_groups());
+
+    // Broadcast a message to the "notifications" group.
+    let sender = ProcessId::new(1, 0);
+    let results = scope.broadcast(
+        "notifications",
+        sender,
+        &rmpv::Value::String("alert: server restarted".into()),
+        &router,
+    );
+    println!("Broadcast sent to {} members", results.len());
+
+    // Verify workers received the broadcast.
+    let msg1 = rx1.try_recv().unwrap();
+    let msg2 = rx2.try_recv().unwrap();
+    println!("Worker 1 got: {}", msg1.payload().as_str().unwrap());
+    println!("Worker 2 got: {}", msg2.payload().as_str().unwrap());
+
+    // Worker 3 should NOT have received anything (different group).
+    assert!(rx3.try_recv().is_err());
+    println!("Worker 3 (logging group): no message (correct)");
+
+    // Clean up: remove a process from all groups.
+    scope.remove_pid(worker1);
+    println!(
+        "After removing worker1, notification members: {:?}",
+        scope.get_members("notifications")
+    );
+}
+```
+
+**Expected output:**
+
+```
+notification members: [<1.1>, <1.2>]
+logging members: [<1.3>]
+all groups: ["logging", "notifications"]
+Broadcast sent to 2 members
+Worker 1 got: alert: server restarted
+Worker 2 got: alert: server restarted
+Worker 3 (logging group): no message (correct)
+After removing worker1, notification members: [<1.2>]
+```
+
+Key points:
+- **`PgScope::new()`** -- creates a new scope. Use multiple scopes to partition group namespaces.
+- **`scope.join(group, pid)`** -- adds a process to a named group. A process can join the same group multiple times.
+- **`scope.get_members(group)`** -- returns all PIDs in a group.
+- **`scope.broadcast(group, from, payload, router)`** -- sends a message to every member of the group.
+- **`scope.remove_pid(pid)`** -- removes a process from all groups it belongs to. Call this on process death.
+- Groups are local to the scope. For cross-node groups, use `scope.get_local_members(group, node_id)` to filter by node.
+
+---
+
+## 14. Sys Debug (Runtime Introspection)
+
+The sys debug interface lets you inspect and control running `GenServer` processes without stopping them. You can read server state, suspend message processing, and resume it -- all through the `GenServerRef` handle.
+
+```rust
+use rebar_core::gen_server::{spawn_gen_server, GenServer, GenServerContext};
+use rebar_core::process::ProcessId;
+use rebar_core::runtime::Runtime;
+use std::sync::Arc;
+use std::time::Duration;
+
+struct Counter;
+
+#[async_trait::async_trait]
+impl GenServer for Counter {
+    type State = u64;
+    type Call = String;
+    type Cast = String;
+    type Reply = u64;
+
+    async fn init(&self, _ctx: &GenServerContext) -> Result<Self::State, String> {
+        Ok(0)
+    }
+
+    async fn handle_call(
+        &self,
+        _msg: Self::Call,
+        _from: ProcessId,
+        state: &mut Self::State,
+        _ctx: &GenServerContext,
+    ) -> Self::Reply {
+        *state
+    }
+
+    async fn handle_cast(
+        &self,
+        msg: Self::Cast,
+        state: &mut Self::State,
+        _ctx: &GenServerContext,
+    ) {
+        if msg == "inc" {
+            *state += 1;
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let rt = Arc::new(Runtime::new(1));
+    let server = spawn_gen_server(Arc::clone(&rt), Counter).await;
+
+    // Increment a few times.
+    for _ in 0..5 {
+        server.cast("inc".to_string()).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Inspect state without stopping the server.
+    let state = server.sys_get_state(Duration::from_secs(1)).await.unwrap();
+    println!("Current state (via sys_get_state): {}", state);
+
+    // Suspend the server -- it stops processing calls/casts/info.
+    server.sys_suspend(Duration::from_secs(1)).await.unwrap();
+    println!("Server suspended.");
+
+    // Casts sent while suspended will queue but not be processed.
+    server.cast("inc".to_string()).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // State should still be 5 because the server is suspended.
+    let state = server.sys_get_state(Duration::from_secs(1)).await.unwrap();
+    println!("State while suspended: {}", state);
+
+    // Resume the server.
+    server.sys_resume(Duration::from_secs(1)).await.unwrap();
+    println!("Server resumed.");
+
+    // Give the queued cast time to process.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let state = server.sys_get_state(Duration::from_secs(1)).await.unwrap();
+    println!("State after resume: {}", state);
+}
+```
+
+**Expected output:**
+
+```
+Current state (via sys_get_state): 5
+Server suspended.
+State while suspended: 5
+Server resumed.
+State after resume: 6
+```
+
+Key points:
+- **`sys_get_state(timeout)`** -- reads the current server state without modifying it. Requires `State: Clone`.
+- **`sys_suspend(timeout)`** -- pauses processing of calls, casts, and info messages. Sys commands continue to work while suspended.
+- **`sys_resume(timeout)`** -- resumes a suspended server. Queued messages are processed in order.
+- These operations are equivalent to Erlang's `:sys.get_state/2`, `:sys.suspend/2`, and `:sys.resume/2`.
+- Suspension is useful for debugging, hot-code-reload preparation, or temporarily pausing a server under load.
+
+---
+
+## 15. GenStatem (State Machine)
+
+A `GenStatem` is a typed finite state machine, equivalent to Erlang/OTP's `gen_statem`. States are typically represented as an enum, and transitions can set state timeouts that automatically fire events after a delay.
+
+This example implements a traffic light that cycles Green -> Yellow -> Red -> Green using state timeouts.
+
+```rust
+use rebar_core::gen_statem::{
+    spawn_gen_statem, Action, CallbackMode, EventType, GenStatem, TransitionResult,
+};
+use rebar_core::process::ExitReason;
+use rebar_core::runtime::Runtime;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq)]
+enum Light {
+    Green,
+    Yellow,
+    Red,
+}
+
+struct TrafficLight {
+    transitions: Arc<AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl GenStatem for TrafficLight {
+    type State = Light;
+    type Data = ();
+    type Call = String;
+    type Cast = ();
+    type Reply = String;
+
+    fn callback_mode(&self) -> (CallbackMode, bool) {
+        (CallbackMode::HandleEventFunction, false)
+    }
+
+    async fn init(&self) -> Result<(Self::State, Self::Data), String> {
+        Ok((Light::Green, ()))
+    }
+
+    async fn handle_event(
+        &self,
+        event_type: EventType<Self::Reply>,
+        _event: rmpv::Value,
+        state: &Self::State,
+        data: &mut Self::Data,
+    ) -> TransitionResult<Self::State, Self::Data, Self::Reply> {
+        match event_type {
+            EventType::Call(reply_tx) => {
+                let color = format!("{:?}", state);
+                TransitionResult::KeepStateAndData {
+                    actions: vec![Action::Reply(reply_tx, color)],
+                }
+            }
+
+            EventType::StateTimeout => {
+                self.transitions.fetch_add(1, Ordering::SeqCst);
+                let (next_state, timeout_ms) = match state {
+                    Light::Green => (Light::Yellow, 50),
+                    Light::Yellow => (Light::Red, 50),
+                    Light::Red => (Light::Green, 50),
+                };
+                println!("{:?} -> {:?}", state, next_state);
+                TransitionResult::NextState {
+                    state: next_state,
+                    data: *data,
+                    actions: vec![Action::StateTimeout(
+                        Duration::from_millis(timeout_ms),
+                        rmpv::Value::Nil,
+                    )],
+                }
+            }
+
+            // Start the cycle on any cast.
+            EventType::Cast => TransitionResult::KeepStateAndData {
+                actions: vec![Action::StateTimeout(
+                    Duration::from_millis(50),
+                    rmpv::Value::Nil,
+                )],
+            },
+
+            _ => TransitionResult::KeepStateAndData { actions: vec![] },
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let rt = Arc::new(Runtime::new(1));
+    let transitions = Arc::new(AtomicU32::new(0));
+
+    let light = spawn_gen_statem(
+        Arc::clone(&rt),
+        TrafficLight {
+            transitions: Arc::clone(&transitions),
+        },
+    )
+    .await;
+
+    println!("Traffic light started at PID: {}", light.pid());
+
+    // Query current state.
+    let color = light.call("status".to_string(), Duration::from_secs(1)).await.unwrap();
+    println!("Initial state: {}", color);
+
+    // Kick off the cycle with a cast.
+    light.cast(()).unwrap();
+
+    // Let it cycle a few times.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let total = transitions.load(Ordering::SeqCst);
+    println!("Total transitions: {}", total);
+}
+```
+
+**Expected output:**
+
+```
+Traffic light started at PID: <1.1>
+Initial state: Green
+Green -> Yellow
+Yellow -> Red
+Red -> Green
+Green -> Yellow
+Yellow -> Red
+Red -> Green
+Total transitions: 6
+```
+
+Key points:
+- **`GenStatem` trait** -- associated types define `State` (enum), `Data` (mutable context), `Call`, `Cast`, and `Reply`.
+- **`callback_mode()`** -- returns `HandleEventFunction` (all events go through a single `handle_event` callback). The second element enables state-enter callbacks.
+- **`TransitionResult::NextState`** -- transitions to a new state with optional actions.
+- **`Action::StateTimeout(duration, payload)`** -- sets a timeout that fires `EventType::StateTimeout` if no state change occurs before it expires. The timeout is automatically cancelled on state change.
+- **`Action::Reply(tx, value)`** -- sends a reply to a caller within `handle_event` (since the reply channel is passed via `EventType::Call`).
+- State machines also support `EventTimeout` (cancelled on any external event), `GenericTimeout` (named, independent), and `Postpone` (re-queue on state change).
+
+---
+
+## 16. GenStage (Back-Pressure Pipeline)
+
+A `GenStage` implements a back-pressure-aware producer/consumer pipeline, inspired by Elixir's GenStage. Producers generate events on demand, consumers process them, and the framework manages flow control automatically.
+
+```rust
+use rebar_core::gen_stage::{
+    spawn_stage, GenStage, GenStageRef, StageType, SubscribeOpts,
+};
+use rebar_core::runtime::Runtime;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// A producer that generates sequential numbers on demand.
+struct NumberProducer {
+    counter: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl GenStage for NumberProducer {
+    type State = ();
+
+    async fn init(&self) -> Result<(StageType, Self::State), String> {
+        Ok((StageType::Producer, ()))
+    }
+
+    async fn handle_demand(
+        &self,
+        demand: usize,
+        _state: &mut Self::State,
+    ) -> Vec<rmpv::Value> {
+        let mut events = Vec::with_capacity(demand);
+        for _ in 0..demand {
+            let n = self.counter.fetch_add(1, Ordering::SeqCst);
+            events.push(rmpv::Value::Integer(rmpv::Integer::from(n)));
+        }
+        events
+    }
+}
+
+/// A consumer that counts how many events it has processed.
+struct NumberConsumer {
+    processed: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl GenStage for NumberConsumer {
+    type State = ();
+
+    async fn init(&self) -> Result<(StageType, Self::State), String> {
+        Ok((StageType::Consumer, ()))
+    }
+
+    async fn handle_events(
+        &self,
+        events: Vec<rmpv::Value>,
+        _from: rebar_core::gen_stage::SubscriptionTag,
+        _state: &mut Self::State,
+    ) -> Vec<rmpv::Value> {
+        self.processed
+            .fetch_add(events.len() as u64, Ordering::SeqCst);
+        vec![] // Consumers don't emit events downstream.
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let rt = Arc::new(Runtime::new(1));
+
+    let counter = Arc::new(AtomicU64::new(1));
+    let processed = Arc::new(AtomicU64::new(0));
+
+    // Spawn the producer and consumer stages.
+    let producer = spawn_stage(
+        Arc::clone(&rt),
+        NumberProducer {
+            counter: Arc::clone(&counter),
+        },
+    )
+    .await;
+    println!("Producer started at PID: {}", producer.pid());
+
+    let consumer = spawn_stage(
+        Arc::clone(&rt),
+        NumberConsumer {
+            processed: Arc::clone(&processed),
+        },
+    )
+    .await;
+    println!("Consumer started at PID: {}", consumer.pid());
+
+    // Subscribe the consumer to the producer.
+    // The consumer will automatically request demand.
+    let _tag = consumer
+        .subscribe(
+            &producer,
+            SubscribeOpts::new(10, 5), // max_demand=10, min_demand=5
+        )
+        .await
+        .unwrap();
+    println!("Consumer subscribed to producer.");
+
+    // Let the pipeline run and process events.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let total = processed.load(Ordering::SeqCst);
+    println!("Consumer processed {} events", total);
+    assert!(total > 0, "consumer should have processed events");
+}
+```
+
+**Expected output:**
+
+```
+Producer started at PID: <1.1>
+Consumer started at PID: <1.2>
+Consumer subscribed to producer.
+Consumer processed 10 events
+```
+
+Key points:
+- **`GenStage` trait** -- implement `init()` to declare the stage type (`Producer`, `Consumer`, or `ProducerConsumer`).
+- **`handle_demand(demand, state)`** -- called on producers when a consumer requests events. Return up to `demand` events.
+- **`handle_events(events, from, state)`** -- called on consumers with a batch of events from upstream.
+- **`consumer.subscribe(&producer, opts)`** -- establishes a subscription. The consumer automatically sends initial demand based on `max_demand`.
+- **`SubscribeOpts::new(max_demand, min_demand)`** -- `max_demand` is the initial batch size; `min_demand` is the threshold at which the consumer re-requests events.
+- Back-pressure is automatic: producers only generate events when consumers ask for them. Events that cannot be dispatched are buffered internally.
+
+---
+
+## 17. Application (Lifecycle)
+
+An `Application` is the top-level entry point for a Rebar system. It starts a supervision tree and manages its lifecycle. The `ApplicationManager` handles dependency ordering -- `ensure_all_started` performs a topological sort and starts dependencies first.
+
+```rust
+use rebar_core::application::{AppEnv, AppSpec, Application, ApplicationManager};
+use rebar_core::process::ExitReason;
+use rebar_core::runtime::Runtime;
+use rebar_core::supervisor::{
+    ChildEntry, ChildSpec, RestartStrategy, SupervisorSpec, start_supervisor,
+    SupervisorHandle,
+};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// A database application that starts a worker.
+struct DatabaseApp;
+
+#[async_trait::async_trait]
+impl Application for DatabaseApp {
+    async fn start(
+        &self,
+        runtime: Arc<Runtime>,
+        env: &AppEnv,
+    ) -> Result<SupervisorHandle, rebar_core::application::AppError> {
+        let db_url = env
+            .get_or("db_url", rmpv::Value::String("localhost:5432".into()));
+        println!(
+            "[database] Starting with url: {}",
+            db_url.as_str().unwrap_or("unknown")
+        );
+
+        let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
+        let entry = ChildEntry::new(ChildSpec::new("db-worker"), || async {
+            println!("[database] Worker running.");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            ExitReason::Normal
+        });
+
+        Ok(start_supervisor(runtime, spec, vec![entry]).await)
+    }
+
+    async fn prep_stop(&self, _env: &AppEnv) {
+        println!("[database] Preparing to stop...");
+    }
+
+    async fn stop(&self, _env: &AppEnv) {
+        println!("[database] Stopped.");
+    }
+}
+
+/// A web application that depends on the database.
+struct WebApp;
+
+#[async_trait::async_trait]
+impl Application for WebApp {
+    async fn start(
+        &self,
+        runtime: Arc<Runtime>,
+        env: &AppEnv,
+    ) -> Result<SupervisorHandle, rebar_core::application::AppError> {
+        let port = env
+            .get_or("port", rmpv::Value::Integer(8080.into()));
+        println!(
+            "[web] Starting on port: {}",
+            port.as_u64().unwrap_or(0)
+        );
+
+        let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
+        Ok(start_supervisor(runtime, spec, vec![]).await)
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let rt = Arc::new(Runtime::new(1));
+    let mgr = ApplicationManager::new(Arc::clone(&rt));
+
+    // Register applications with specs.
+    mgr.register(
+        AppSpec::new("database")
+            .env_val("db_url", rmpv::Value::String("postgres://prod:5432".into())),
+        DatabaseApp,
+    );
+
+    mgr.register(
+        AppSpec::new("web")
+            .dependency("database")
+            .env_val("port", rmpv::Value::Integer(3000.into())),
+        WebApp,
+    );
+
+    // Start "web" and all its dependencies in topological order.
+    let started = mgr.ensure_all_started("web").await.unwrap();
+    println!("Started applications: {:?}", started);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    println!("Running: {:?}", mgr.started_applications());
+
+    // Read environment at runtime.
+    let db_env = mgr.env("database").unwrap();
+    println!("Database URL: {}", db_env.get("db_url").unwrap().as_str().unwrap());
+
+    // Orderly shutdown in reverse start order.
+    mgr.stop_all().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    println!("All applications stopped.");
+}
+```
+
+**Expected output:**
+
+```
+[database] Starting with url: postgres://prod:5432
+[database] Worker running.
+[web] Starting on port: 3000
+Started applications: ["database", "web"]
+Running: ["database", "web"]
+Database URL: postgres://prod:5432
+[database] Preparing to stop...
+[database] Stopped.
+All applications stopped.
+```
+
+Key points:
+- **`Application` trait** -- implement `start(runtime, env)` to return a `SupervisorHandle`. Optional `prep_stop` and `stop` callbacks run during shutdown.
+- **`AppSpec::new(name)`** -- declares the application name, dependencies, and initial environment values.
+- **`AppSpec::dependency(name)`** -- declares that another application must be started first.
+- **`AppEnv`** -- thread-safe key-value store for configuration. Pre-populated from `AppSpec::env_val` entries.
+- **`ApplicationManager::ensure_all_started(name)`** -- resolves transitive dependencies, topologically sorts them, and starts each in order. Already-running applications are skipped.
+- **`stop_all()`** -- stops all running applications in reverse start order, calling `prep_stop` and `stop` callbacks.
+
+---
+
+## 18. PartitionSupervisor (Sharded Workers)
+
+A `PartitionSupervisor` starts N identical worker processes and routes work to them by key. This is useful for sharding load across independent processes while maintaining deterministic routing. Equivalent to Elixir's `PartitionSupervisor`.
+
+```rust
+use rebar_core::partition_supervisor::{
+    start_partition_supervisor, PartitionSupervisorSpec,
+};
+use rebar_core::process::ExitReason;
+use rebar_core::runtime::Runtime;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() {
+    let rt = Arc::new(Runtime::new(1));
+
+    // Start a PartitionSupervisor with 4 partitions.
+    let handle = start_partition_supervisor(
+        Arc::clone(&rt),
+        PartitionSupervisorSpec::new().partitions(4),
+        Arc::new(|partition_index| {
+            Box::pin(async move {
+                println!("[partition {}] Started.", partition_index);
+                // Each partition stays alive, processing work.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                ExitReason::Normal
+            })
+        }),
+    )
+    .await;
+
+    // Give partitions time to start.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    println!("PartitionSupervisor started with {} partitions", handle.partitions());
+
+    // Route by integer key: key % partitions.
+    let pid_for_user_42 = handle.which_partition(42);
+    let pid_for_user_43 = handle.which_partition(43);
+    println!("User 42 -> partition PID: {}", pid_for_user_42);
+    println!("User 43 -> partition PID: {}", pid_for_user_43);
+
+    // Same key always routes to the same partition.
+    assert_eq!(handle.which_partition(42), pid_for_user_42);
+
+    // Route by hashable key (strings, structs, etc.).
+    let pid_a = handle.which_partition_by_hash(&"session:abc");
+    let pid_b = handle.which_partition_by_hash(&"session:xyz");
+    println!("session:abc -> {}", pid_a);
+    println!("session:xyz -> {}", pid_b);
+
+    // Access a specific partition by index.
+    for i in 0..handle.partitions() {
+        let pid = handle.partition_pid(i).unwrap();
+        println!("Partition {} -> PID: {}", i, pid);
+    }
+
+    // Clean shutdown.
+    handle.shutdown();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    println!("PartitionSupervisor shut down.");
+}
+```
+
+**Expected output:**
+
+```
+[partition 0] Started.
+[partition 1] Started.
+[partition 2] Started.
+[partition 3] Started.
+PartitionSupervisor started with 4 partitions
+User 42 -> partition PID: <1.4>
+User 43 -> partition PID: <1.5>
+session:abc -> <1.3>
+session:xyz -> <1.4>
+Partition 0 -> PID: <1.3>
+Partition 1 -> PID: <1.4>
+Partition 2 -> PID: <1.5>
+Partition 3 -> PID: <1.6>
+PartitionSupervisor shut down.
+```
+
+Key points:
+- **`PartitionSupervisorSpec::new().partitions(n)`** -- configures the number of partitions. Defaults to the number of CPU cores.
+- **`start_partition_supervisor(runtime, spec, factory)`** -- the factory receives a zero-based partition index and returns a future. It is called once per partition at startup and again on restarts.
+- **`which_partition(key: u64)`** -- routes an integer key to a partition using `key % partitions`. Deterministic and consistent.
+- **`which_partition_by_hash(key)`** -- routes any `Hash` type by hashing the key first. Use this for string keys, composite keys, etc.
+- **`partition_pid(index)`** -- returns the PID of a specific partition by its zero-based index.
+- Partitions are supervised: if one crashes, only that partition is restarted (OneForOne by default). Other partitions continue unaffected.
+
+---
+
 ## Next Steps
 
 - Read the [Architecture Guide](architecture.md) for a deeper understanding of Rebar's internals.
 - See the [Extending Rebar](extending.md) guide for building custom supervision patterns, transports, and registry backends.
+- Explore the OTP-style abstractions: [GenServer](#9-genserver-typed-stateful-actor) for typed actors, [GenStatem](#15-genstatem-state-machine) for state machines, [GenStage](#16-genstage-back-pressure-pipeline) for data pipelines, and [Application](#17-application-lifecycle) for lifecycle management.
+- Use [Agent](#11-agent-simple-shared-state) for quick shared state, [Task](#10-task-lightweight-async) for one-off async work, and [PartitionSupervisor](#18-partitionsupervisor-sharded-workers) for sharded workloads.
 - Check the API Reference: [rebar-core](api/rebar-core.md) | [rebar-cluster](api/rebar-cluster.md) | [rebar-ffi](api/rebar-ffi.md) for complete type documentation.
 - Explore the internals: [Supervisor Engine](internals/supervisor-engine.md) | [Wire Protocol](internals/wire-protocol.md) | [SWIM Protocol](internals/swim-protocol.md) | [CRDT Registry](internals/crdt-registry.md).
 - Deep dives: [QUIC Transport](internals/quic-transport.md) | [Distribution Layer](internals/distribution-layer.md) | [Node Drain](internals/node-drain.md).

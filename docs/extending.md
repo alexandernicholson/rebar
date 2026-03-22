@@ -9,6 +9,10 @@ Rebar is designed to be extended. The runtime's layered crate architecture expos
 3. [FFI Bindings for New Languages](#3-ffi-bindings-for-new-languages)
 4. [Custom Message Serialization](#4-custom-message-serialization)
 5. [Custom Registry Backends](#5-custom-registry-backends)
+6. [Custom GenStage Dispatchers](#6-custom-genstage-dispatchers)
+7. [Custom GenStatem Patterns](#7-custom-genstatem-patterns)
+8. [Application Composition Patterns](#8-application-composition-patterns)
+9. [PartitionSupervisor for Load Distribution](#9-partitionsupervisor-for-load-distribution)
 
 ---
 
@@ -932,6 +936,181 @@ impl PersistentRegistry {
 - **Redis-backed registry** -- use Redis sorted sets with timestamp scores for natural LWW ordering, with pub/sub for delta propagation.
 - **Cache layer** -- wrap the in-memory OR-Set with an LRU cache for hot name lookups, falling through to the CRDT for cold names.
 - **Raft-based registry** -- trade availability for strong consistency by running name registration through a Raft consensus group instead of CRDT merge.
+
+---
+
+## 6. Custom GenStage Dispatchers
+
+The `GenStage` pipeline system supports pluggable dispatchers. Rebar ships with `DemandDispatcher` (round-robin by demand) and `BroadcastDispatcher` (all events to all consumers), but you can implement your own.
+
+### The Dispatcher Trait
+
+```rust
+use rebar_core::gen_stage::dispatcher::{Dispatcher, ConsumerDemand, DispatchResult};
+
+pub trait Dispatcher: Send + Sync + 'static {
+    fn dispatch(
+        &mut self,
+        events: Vec<rmpv::Value>,
+        consumers: &mut [ConsumerDemand],
+    ) -> DispatchResult;
+}
+```
+
+`ConsumerDemand` tracks each consumer's pending demand. `DispatchResult` contains per-consumer event batches and any leftover events (buffered for later).
+
+### Example: Priority Dispatcher
+
+A dispatcher that routes events to the consumer with the highest priority label:
+
+```rust
+struct PriorityDispatcher;
+
+impl Dispatcher for PriorityDispatcher {
+    fn dispatch(
+        &mut self,
+        events: Vec<rmpv::Value>,
+        consumers: &mut [ConsumerDemand],
+    ) -> DispatchResult {
+        // Find consumer with highest demand (priority = demand level)
+        let mut batches = vec![vec![]; consumers.len()];
+        let mut leftover = vec![];
+
+        for event in events {
+            // Find first consumer with demand > 0
+            if let Some((idx, consumer)) = consumers.iter_mut()
+                .enumerate()
+                .find(|(_, c)| c.demand > 0)
+            {
+                consumer.demand -= 1;
+                batches[idx].push(event);
+            } else {
+                leftover.push(event);
+            }
+        }
+
+        DispatchResult { batches, leftover }
+    }
+}
+```
+
+Use with `spawn_stage_with_dispatcher(runtime, stage, Box::new(PriorityDispatcher))`.
+
+---
+
+## 7. Custom GenStatem Patterns
+
+The `GenStatem` behavior is highly flexible. Here are common patterns for building custom state machines.
+
+### Connection Manager Pattern
+
+```rust
+#[derive(Clone, PartialEq, Debug)]
+enum State { Disconnected, Connecting, Connected, Backoff }
+
+// In handle_event:
+// - Disconnected + Cast("connect") → Connecting + StateTimeout(5s)
+// - Connecting + StateTimeout → Backoff + GenericTimeout("retry", exponential)
+// - Connecting + Info("connected") → Connected (cancel all timeouts)
+// - Connected + Info("error") → Disconnected
+// - Backoff + Timeout("retry") → Connecting + StateTimeout(5s)
+```
+
+### Protocol Negotiation with Postponement
+
+```rust
+// In handle_event:
+// State: Handshaking
+//   - Receive version message → transition to Authenticated
+//   - Receive data message → Postpone (will replay after handshake)
+// State: Authenticated
+//   - Postponed data messages replay automatically
+//   - New data messages processed normally
+```
+
+### Rate Limiter with Event Timeout
+
+```rust
+// State: Open (allows requests)
+// State: Throttled (rejects requests)
+//
+// Open + Call(request) → process, increment counter
+//   If counter >= limit → Throttled + StateTimeout(window)
+// Throttled + StateTimeout → Open (reset counter)
+// Throttled + Call(request) → Reply(RateLimited), KeepState
+```
+
+---
+
+## 8. Application Composition Patterns
+
+The `Application` module supports complex dependency graphs. Here are patterns for structuring multi-application systems.
+
+### Layered Applications
+
+```rust
+// Define application specs with dependencies
+let db_spec = AppSpec::new("database");
+let cache_spec = AppSpec::new("cache").dependency("database");
+let api_spec = AppSpec::new("api").dependency("cache").dependency("database");
+
+// Register all three
+manager.register(db_spec, DatabaseApp);
+manager.register(cache_spec, CacheApp);
+manager.register(api_spec, ApiApp);
+
+// Start API — automatically starts database, then cache, then API
+manager.ensure_all_started("api").await?;
+
+// Stop all in reverse order: API → cache → database
+manager.stop_all().await?;
+```
+
+### Environment-Driven Configuration
+
+```rust
+impl Application for MyApp {
+    async fn start(&self, runtime: Arc<Runtime>, env: &AppEnv) -> Result<SupervisorHandle, AppError> {
+        let port = env.get_or("port", rmpv::Value::from(8080));
+        let workers = env.get_or("workers", rmpv::Value::from(4));
+        // Build supervision tree based on config...
+    }
+}
+```
+
+---
+
+## 9. PartitionSupervisor for Load Distribution
+
+Use `PartitionSupervisor` to shard work across N identical workers, avoiding single-process bottlenecks.
+
+### Connection Pool
+
+```rust
+use rebar_core::partition_supervisor::*;
+
+let spec = PartitionSupervisorSpec::new().partitions(8);
+let handle = start_partition_supervisor(rt, spec, Arc::new(|partition| {
+    Box::pin(async move {
+        // Each partition manages its own connection
+        let conn = connect_to_database(partition).await;
+        serve_queries(conn).await;
+        ExitReason::Normal
+    })
+})).await;
+
+// Route queries by user ID → consistent partition
+let worker = handle.which_partition(user_id);
+runtime.send(worker, query).await?;
+```
+
+### Sharded Rate Limiter
+
+```rust
+// Each partition tracks its own rate limit counters
+// Key-based routing ensures the same key always hits the same partition
+let limiter = handle.which_partition_by_hash(&api_key);
+```
 
 ---
 

@@ -46,6 +46,8 @@ Idiomatic wrappers for embedding Rebar in Go, Python, and TypeScript application
 
 See [Client Libraries](clients/README.md) for build instructions.
 
+See the [documentation](#documentation) for guides, API reference, and architecture deep-dives.
+
 ## Architecture Overview
 
 ```mermaid
@@ -245,44 +247,45 @@ HTTP microservices mesh benchmark (3 services, 2 CPU / 512MB per container):
 
 See [Benchmarks](docs/benchmarks.md) for full methodology and results.
 
-## Project Status
-
-### Core
-- [x] Process spawning with mailbox messaging
-- [x] Supervisor trees (OneForOne/OneForAll/RestForOne)
-- [x] Dynamic supervisors
-- [x] Process monitoring and linking
-- [x] GenServer (typed stateful actors)
-- [x] GenStatem (state machine behavior)
-- [x] Task / Task.Supervisor (lightweight async)
-- [x] Agent (simple shared state)
-- [x] Timer (send_after, send_interval, apply_after)
-- [x] Process Groups (pg — named groups with pub/sub)
-- [x] Sys Debug (get_state, suspend/resume, tracing)
-- [x] Application (lifecycle, deps, config)
-- [x] PartitionSupervisor (key-partitioned children)
-- [x] handle_continue (deferred GenServer initialization)
-
-### Distribution
-- [x] SWIM gossip protocol for node discovery
-- [x] TCP transport with wire protocol
-- [x] QUIC transport (`quinn`-based, replacing TCP as production default)
-- [x] OR-Set CRDT global process registry
-- [x] Connection manager with exponential backoff
-- [x] Distribution layer integration (cluster <-> core, transparent remote `send()`)
-- [x] Graceful node drain (coordinated shutdown with state migration)
-
-### FFI
-- [x] C-ABI FFI bindings (Go, Python, TypeScript)
-
 ## Documentation
 
-- [Architecture](docs/architecture.md)
-- [Getting Started](docs/getting-started.md)
-- [Extending Rebar](docs/extending.md)
-- API Reference: [rebar-core](docs/api/rebar-core.md) | [rebar-cluster](docs/api/rebar-cluster.md) | [rebar-ffi](docs/api/rebar-ffi.md)
-- Internals: [Wire Protocol](docs/internals/wire-protocol.md) | [SWIM](docs/internals/swim-protocol.md) | [CRDT Registry](docs/internals/crdt-registry.md) | [Supervisors](docs/internals/supervisor-engine.md)
-- [Benchmarks](docs/benchmarks.md)
+### Getting Started
+- [Quick Start](docs/getting-started.md) — progressive examples from first process to distributed messaging
+
+### Guides
+- [Building Stateful Services with GenServer](docs/guides/gen-server.md)
+- [Parallel Work with Task](docs/guides/tasks.md)
+- [Shared State with Agent](docs/guides/agents.md)
+- [Delayed and Periodic Messages with Timer](docs/guides/timers.md)
+- [Pub/Sub with Process Groups](docs/guides/process-groups.md)
+- [State Machines with GenStatem](docs/guides/gen-statem.md)
+- [Back-Pressure Pipelines with GenStage](docs/guides/gen-stage.md)
+- [Application Lifecycle Management](docs/guides/applications.md)
+- [Sharding with PartitionSupervisor](docs/guides/partition-supervisor.md)
+- [Extending Rebar](docs/extending.md) — custom transports, dispatchers, registry backends
+
+### Polyglot FFI
+- [Go Actors](docs/guides/actors-go.md)
+- [Python Actors](docs/guides/actors-python.md)
+- [TypeScript Actors](docs/guides/actors-typescript.md)
+
+### API Reference
+- [rebar-core](docs/api/rebar-core.md) — processes, supervision, GenServer, GenStatem, Task, Agent, Timer, PG, Sys, GenStage, Application, PartitionSupervisor
+- [rebar-cluster](docs/api/rebar-cluster.md) — SWIM gossip, TCP/QUIC transport, CRDT registry, connection management
+- [rebar-ffi](docs/api/rebar-ffi.md) — C-ABI bindings for Go, Python, TypeScript
+
+### Architecture & Internals
+- [Architecture Overview](docs/architecture.md) — crate structure, process model, message flow
+- [Supervisor Engine](docs/internals/supervisor-engine.md)
+- [Wire Protocol](docs/internals/wire-protocol.md)
+- [SWIM Protocol](docs/internals/swim-protocol.md)
+- [CRDT Registry](docs/internals/crdt-registry.md)
+- [QUIC Transport](docs/internals/quic-transport.md)
+- [Distribution Layer](docs/internals/distribution-layer.md)
+- [Node Drain](docs/internals/node-drain.md)
+
+### Performance
+- [Benchmarks](docs/benchmarks.md) — HTTP mesh comparison vs Actix, Go, Elixir
 
 ## License
 

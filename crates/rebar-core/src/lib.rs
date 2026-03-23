@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod application;
+pub mod coordinator;
 pub mod gen_server;
 pub mod gen_stage;
 pub mod gen_statem;

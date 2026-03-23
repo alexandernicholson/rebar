@@ -134,68 +134,32 @@ impl GenStatem for OrderStatem {
             // -- Asynchronous casts: advance the order --
             EventType::Cast => {
                 let cmd = event.as_str().unwrap_or("");
+                let clone_data = |d: &OrderData| OrderData {
+                    order_id: d.order_id.clone(),
+                    customer: d.customer.clone(),
+                    amount_cents: d.amount_cents,
+                };
                 match (state, cmd) {
-                    // Payment received while pending: transition to Paid.
                     (OrderState::Pending, "pay") => TransitionResult::NextState {
-                        state: OrderState::Paid,
-                        data: OrderData {
-                            order_id: data.order_id.clone(),
-                            customer: data.customer.clone(),
-                            amount_cents: data.amount_cents,
-                        },
-                        actions: vec![],
+                        state: OrderState::Paid, data: clone_data(data), actions: vec![],
                     },
-
-                    // Ship command while paid: transition to Shipped.
                     (OrderState::Paid, "ship") => TransitionResult::NextState {
-                        state: OrderState::Shipped,
-                        data: OrderData {
-                            order_id: data.order_id.clone(),
-                            customer: data.customer.clone(),
-                            amount_cents: data.amount_cents,
-                        },
-                        actions: vec![],
+                        state: OrderState::Shipped, data: clone_data(data), actions: vec![],
                     },
-
-                    // Ship command while still pending: postpone.
-                    // The event will be replayed when the state changes.
-                    (OrderState::Pending, "ship") => {
-                        println!(
-                            "order {}: postponing 'ship' until payment",
-                            data.order_id
-                        );
-                        TransitionResult::KeepStateAndData {
-                            actions: vec![Action::Postpone],
-                        }
-                    }
-
-                    // Delivery confirmation.
+                    // Postpone "ship" until payment -- replayed on state change.
+                    (OrderState::Pending, "ship") => TransitionResult::KeepStateAndData {
+                        actions: vec![Action::Postpone],
+                    },
                     (OrderState::Shipped, "deliver") => TransitionResult::NextState {
-                        state: OrderState::Delivered,
-                        data: OrderData {
-                            order_id: data.order_id.clone(),
-                            customer: data.customer.clone(),
-                            amount_cents: data.amount_cents,
-                        },
-                        actions: vec![],
+                        state: OrderState::Delivered, data: clone_data(data), actions: vec![],
                     },
-
-                    // Final state: nothing more to do.
-                    (OrderState::Delivered, _) => TransitionResult::KeepStateAndData {
-                        actions: vec![],
-                    },
-
                     _ => TransitionResult::KeepStateAndData { actions: vec![] },
                 }
             }
 
             // -- State timeout: handle expiry --
             EventType::StateTimeout => {
-                let reason = event.as_str().unwrap_or("timeout");
-                println!(
-                    "order {}: state timeout in {:?}: {reason}",
-                    data.order_id, state
-                );
+                println!("order {}: timed out in {:?}", data.order_id, state);
                 TransitionResult::Stop {
                     reason: ExitReason::Normal,
                     data: OrderData {
@@ -206,21 +170,8 @@ impl GenStatem for OrderStatem {
                 }
             }
 
-            // Ignore other event types.
             _ => TransitionResult::KeepStateAndData { actions: vec![] },
         }
-    }
-
-    async fn terminate(
-        &self,
-        reason: ExitReason,
-        state: &Self::State,
-        data: &mut Self::Data,
-    ) {
-        println!(
-            "order {} terminated in state {:?}: {reason:?}",
-            data.order_id, state
-        );
     }
 }
 ```
@@ -230,51 +181,27 @@ impl GenStatem for OrderStatem {
 ```rust
 async fn order_example() {
     let rt = Arc::new(Runtime::new(1));
-
     let order: GenStatemRef<OrderStatem> =
         spawn_gen_statem(Arc::clone(&rt), OrderStatem).await;
 
     // Send "ship" before payment -- it will be postponed.
     let _ = order.cast("ship".to_string());
-
     // Now pay -- transitions Pending -> Paid.
-    // The postponed "ship" replays automatically, transitioning Paid -> Shipped.
+    // The postponed "ship" replays, transitioning Paid -> Shipped.
     let _ = order.cast("pay".to_string());
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Query the current status.
     let status = order.call("status".into(), Duration::from_secs(1)).await;
     println!("status: {status:?}");
-
-    // Mark as delivered.
     let _ = order.cast("deliver".to_string());
 }
 ```
 
-### Actions reference
+### Actions and transition results
 
-`TransitionResult` variants carry a `Vec<Action>`. Here are the available actions:
+Actions are returned in a `Vec` as part of `TransitionResult`. Key actions: `Reply(tx, value)` sends a call reply, `StateTimeout(duration, payload)` sets a timeout cancelled on state change, `EventTimeout` is cancelled by any external event, `GenericTimeout(name, ...)` is independent, `Postpone` re-queues the event until the next state change, and `NextEvent(payload)` inserts an internal event at the front of the queue.
 
-| Action | Effect |
-|---|---|
-| `Action::Reply(tx, value)` | Send a reply to a caller (must be used exactly once per `EventType::Call`). |
-| `Action::StateTimeout(duration, payload)` | Set a timeout that fires if the state does not change within `duration`. Automatically cancelled on state change. |
-| `Action::EventTimeout(duration, payload)` | Set a timeout that fires if no external event arrives within `duration`. Cancelled by any call, cast, or info. |
-| `Action::GenericTimeout(name, duration, payload)` | Set a named timeout. Independent of state changes and events. Multiple named timeouts can coexist. |
-| `Action::CancelTimeout(kind)` | Cancel a specific timeout: `TimeoutKind::State`, `TimeoutKind::Event`, or `TimeoutKind::Generic(name)`. |
-| `Action::Postpone` | Re-queue the current event. It will be replayed when the state changes. Only works for external events (casts, info). |
-| `Action::NextEvent(payload)` | Insert an internal event at the front of the queue. Processed before the next external event. |
-
-### TransitionResult variants
-
-| Variant | Meaning |
-|---|---|
-| `NextState { state, data, actions }` | Change state, replace data, execute actions. |
-| `KeepState { data, actions }` | Keep the current state, replace data, execute actions. |
-| `KeepStateAndData { actions }` | Keep both state and data, execute actions only. |
-| `Stop { reason, data }` | Stop the state machine. |
-| `StopAndReply { reason, data, replies }` | Send final replies, then stop. |
+Transition results: `NextState` changes state, `KeepState` keeps the current state with new data, `KeepStateAndData` keeps both, `Stop` terminates the machine, `StopAndReply` sends final replies then stops.
 
 ---
 

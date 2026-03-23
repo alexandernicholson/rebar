@@ -277,8 +277,14 @@ mod tests {
                 .await;
         });
 
-        // Give the submit time to dispatch
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Yield until the submit has dispatched
+        for _ in 0..1000 {
+            let workers = coord.list_workers().await.unwrap();
+            if workers.len() == 1 && workers[0].in_flight == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
 
         let workers = coord.list_workers().await.unwrap();
         assert_eq!(workers.len(), 1);
@@ -296,7 +302,10 @@ mod tests {
 
         // Spawn a worker that exits immediately
         let dead_worker = rt.spawn(|_ctx| async {}).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            if rt.table().get(&dead_worker).is_none() { break; }
+            tokio::task::yield_now().await;
+        }
 
         coord
             .register_worker(dead_worker, rmpv::Value::Nil)
@@ -330,7 +339,17 @@ mod tests {
         let rt = Arc::new(Runtime::new(1));
         let coord = start_coordinator(Arc::clone(&rt), CoordinatorSpec::default()).await;
         coord.shutdown();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Yield to let the shutdown propagate
+        for _ in 0..1000 {
+            let result = coord
+                .submit(rmpv::Value::from(1), Duration::from_millis(100))
+                .await;
+            if result.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
 
         let result = coord
             .submit(rmpv::Value::from(1), Duration::from_millis(100))

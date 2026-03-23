@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
 
 use rebar_core::process::ExitReason;
 use rebar_core::runtime::Runtime;
@@ -20,9 +19,7 @@ async fn dynamic_supervisor_manages_many_children() {
         let entry = ChildEntry::new(
             ChildSpec::new(format!("worker-{i}")),
             || async {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                }
+                std::future::pending::<()>().await;
                 #[allow(unreachable_code)]
                 ExitReason::Normal
             },
@@ -46,8 +43,7 @@ async fn dynamic_supervisor_manages_many_children() {
         handle.terminate_child(pid).await.unwrap();
     }
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
+    // count_children is a synchronous query on the supervisor
     let counts = handle.count_children().await.unwrap();
     assert_eq!(counts.active, 5);
 
@@ -72,9 +68,7 @@ async fn remove_running_child_returns_error() {
     let handle = start_dynamic_supervisor(rt, DynamicSupervisorSpec::new()).await;
 
     let entry = ChildEntry::new(ChildSpec::new("worker"), || async {
-        loop {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-        }
+        std::future::pending::<()>().await;
         #[allow(unreachable_code)]
         ExitReason::Normal
     });
@@ -111,8 +105,13 @@ async fn transient_child_restarted_on_abnormal_exit() {
 
     handle.start_child(entry).await.unwrap();
 
-    // Wait for restarts
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Poll until at least 2 starts (original + restart)
+    for _ in 0..200 {
+        if counter.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
 
     let start_count = counter.load(Ordering::SeqCst);
     assert!(
@@ -144,8 +143,10 @@ async fn transient_child_not_restarted_on_normal_exit() {
 
     handle.start_child(entry).await.unwrap();
 
-    // Wait to confirm no restart
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Yield several times to give the supervisor a chance to (incorrectly) restart
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
 
     let start_count = counter.load(Ordering::SeqCst);
     assert_eq!(

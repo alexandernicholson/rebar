@@ -159,8 +159,6 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::time::{Duration, sleep};
-
     /// Helper to create a runtime for tests.
     fn test_runtime() -> Arc<Runtime> {
         Arc::new(Runtime::new(1))
@@ -176,10 +174,7 @@ mod tests {
             Box::pin(async move {
                 started.lock().await.push(index);
                 // Stay alive until shutdown
-                loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                }
-                #[allow(unreachable_code)]
+                std::future::pending::<()>().await;
                 ExitReason::Normal
             })
         })
@@ -189,10 +184,7 @@ mod tests {
     fn long_running_factory() -> PartitionFactory {
         Arc::new(|_index| {
             Box::pin(async {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                }
-                #[allow(unreachable_code)]
+                std::future::pending::<()>().await;
                 ExitReason::Normal
             })
         })
@@ -210,7 +202,10 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(4);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if started.lock().await.len() == 4 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let mut indices = started.lock().await.clone();
         indices.sort_unstable();
@@ -242,7 +237,6 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(7);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(100)).await;
         assert_eq!(handle.partitions(), 7);
 
         handle.shutdown();
@@ -261,25 +255,25 @@ mod tests {
             let alive = Arc::clone(&alive_count_clone);
             Box::pin(async move {
                 alive.fetch_add(1, Ordering::SeqCst);
-                loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                }
-                #[allow(unreachable_code)]
-                {
-                    alive.fetch_sub(1, Ordering::SeqCst);
-                    ExitReason::Normal
-                }
+                std::future::pending::<()>().await;
+                alive.fetch_sub(1, Ordering::SeqCst);
+                ExitReason::Normal
             })
         });
 
         let spec = PartitionSupervisorSpec::new().partitions(3);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if alive_count.load(Ordering::SeqCst) == 3 { break; }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(alive_count.load(Ordering::SeqCst), 3);
 
         handle.shutdown();
-        sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
 
         // After shutdown the supervisor is gone; verify handle is still usable
         // (which_partition should still work since it uses cached PIDs)
@@ -295,8 +289,6 @@ mod tests {
         let factory = long_running_factory();
         let spec = PartitionSupervisorSpec::new().partitions(5);
         let handle = start_partition_supervisor(rt, spec, factory).await;
-
-        sleep(Duration::from_millis(100)).await;
 
         let mut pids = HashSet::new();
         for i in 0..5 {
@@ -318,8 +310,6 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(4);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(50)).await;
-
         // Same key always routes to the same partition
         let pid1 = handle.which_partition(42);
         let pid2 = handle.which_partition(42);
@@ -339,8 +329,6 @@ mod tests {
         let factory = long_running_factory();
         let spec = PartitionSupervisorSpec::new().partitions(4);
         let handle = start_partition_supervisor(rt, spec, factory).await;
-
-        sleep(Duration::from_millis(50)).await;
 
         let mut hit_pids = HashSet::new();
         // Keys 0..4 should each hit a different partition with 4 partitions
@@ -366,8 +354,6 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(4);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(50)).await;
-
         // Hash-based routing should be deterministic
         let pid1 = handle.which_partition_by_hash(&"user:alice");
         let pid2 = handle.which_partition_by_hash(&"user:alice");
@@ -391,8 +377,6 @@ mod tests {
         let factory = long_running_factory();
         let spec = PartitionSupervisorSpec::new().partitions(3);
         let handle = start_partition_supervisor(rt, spec, factory).await;
-
-        sleep(Duration::from_millis(50)).await;
 
         // key % 3 == 0 for key=0, key=3, key=6 ...
         let pid_0 = handle.which_partition(0);
@@ -429,8 +413,6 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(3);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(50)).await;
-
         // partition_pid(i) should match which_partition(i) for i < partitions
         for i in 0..3usize {
             let by_index = handle.partition_pid(i).unwrap();
@@ -463,10 +445,7 @@ mod tests {
                     // Crash immediately
                     ExitReason::Abnormal("partition crash".into())
                 } else {
-                    loop {
-                        tokio::time::sleep(Duration::from_secs(3600)).await;
-                    }
-                    #[allow(unreachable_code)]
+                    std::future::pending::<()>().await;
                     ExitReason::Normal
                 }
             })
@@ -479,7 +458,10 @@ mod tests {
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
         // Wait for some restarts
-        sleep(Duration::from_millis(500)).await;
+        for _ in 0..10000 {
+            if start_count.load(Ordering::SeqCst) >= 2 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let restarts = start_count.load(Ordering::SeqCst);
         assert!(
@@ -512,18 +494,12 @@ mod tests {
                     }
                     1 => {
                         p1.fetch_add(1, Ordering::SeqCst);
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(3600)).await;
-                        }
-                        #[allow(unreachable_code)]
+                        std::future::pending::<()>().await;
                         ExitReason::Normal
                     }
                     _ => {
                         p2.fetch_add(1, Ordering::SeqCst);
-                        loop {
-                            tokio::time::sleep(Duration::from_secs(3600)).await;
-                        }
-                        #[allow(unreachable_code)]
+                        std::future::pending::<()>().await;
                         ExitReason::Normal
                     }
                 }
@@ -536,7 +512,10 @@ mod tests {
             .max_seconds(5);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(300)).await;
+        for _ in 0..1000 {
+            if partition1_starts.load(Ordering::SeqCst) >= 1 && partition2_starts.load(Ordering::SeqCst) >= 1 { break; }
+            tokio::task::yield_now().await;
+        }
 
         // Partitions 1 and 2 should each have been started exactly once
         // (one_for_one means only the crashed partition restarts)
@@ -575,8 +554,6 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(4);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(50)).await;
-
         let mut hit_pids = HashSet::new();
         // Use enough keys to likely hit multiple partitions
         for i in 0..100 {
@@ -601,8 +578,6 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(1);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(50)).await;
-
         let pid = handle.partition_pid(0).unwrap();
         for key in 0..10u64 {
             assert_eq!(handle.which_partition(key), pid);
@@ -620,8 +595,6 @@ mod tests {
         let factory = long_running_factory();
         let spec = PartitionSupervisorSpec::new().partitions(2);
         let handle = start_partition_supervisor(rt, spec, factory).await;
-
-        sleep(Duration::from_millis(50)).await;
 
         let cloned = handle.clone();
         assert_eq!(handle.pid(), cloned.pid());
@@ -653,8 +626,6 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(2);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(50)).await;
-
         // Supervisor PID should be from node 1
         assert_eq!(handle.pid().node_id(), 1);
 
@@ -677,10 +648,7 @@ mod tests {
         let entries = vec![ChildEntry::new(
             ChildSpec::new("worker"),
             || async {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                }
-                #[allow(unreachable_code)]
+                std::future::pending::<()>().await;
                 ExitReason::Normal
             },
         )];
@@ -688,7 +656,6 @@ mod tests {
         let spec = SupervisorSpec::new(crate::supervisor::spec::RestartStrategy::OneForOne);
         let handle = start_supervisor(rt, spec, entries).await;
 
-        sleep(Duration::from_millis(50)).await;
         assert_eq!(handle.pid().node_id(), 1);
 
         handle.shutdown();
@@ -707,10 +674,7 @@ mod tests {
             let count = Arc::clone(&started_clone);
             Box::pin(async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                }
-                #[allow(unreachable_code)]
+                std::future::pending::<()>().await;
                 ExitReason::Normal
             })
         });
@@ -718,7 +682,10 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(20);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        sleep(Duration::from_millis(200)).await;
+        for _ in 0..1000 {
+            if started_count.load(Ordering::SeqCst) == 20 { break; }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(started_count.load(Ordering::SeqCst), 20);
         assert_eq!(handle.partitions(), 20);
 

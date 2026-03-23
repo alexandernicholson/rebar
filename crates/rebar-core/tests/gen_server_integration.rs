@@ -103,7 +103,9 @@ async fn counter_cast_increment_then_get() {
     server.cast(CounterCast::Increment).unwrap();
     server.cast(CounterCast::Increment).unwrap();
     server.cast(CounterCast::Increment).unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Yield to let the GenServer process casts before the call
+    // (biased select prioritizes calls over casts)
+    tokio::task::yield_now().await;
     let reply = server.call(CounterCall::Get, Duration::from_secs(1)).await.unwrap();
     assert_eq!(reply, CounterReply::Count(3));
 }
@@ -114,9 +116,9 @@ async fn counter_cast_reset() {
     let server = spawn_gen_server(rt, Counter).await;
     server.cast(CounterCast::Increment).unwrap();
     server.cast(CounterCast::Increment).unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
     server.cast(CounterCast::Reset).unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Yield to let the GenServer process casts before the call
+    tokio::task::yield_now().await;
     let reply = server.call(CounterCall::Get, Duration::from_secs(1)).await.unwrap();
     assert_eq!(reply, CounterReply::Count(0));
 }
@@ -129,7 +131,9 @@ async fn counter_handle_info_via_send() {
     rt.send(server.pid(), rmpv::Value::Integer(5u64.into()))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Yield to let the GenServer process the info message before the call
+    // (biased select prioritizes calls over info messages)
+    tokio::task::yield_now().await;
     let reply = server.call(CounterCall::Get, Duration::from_secs(1)).await.unwrap();
     assert_eq!(reply, CounterReply::Count(5));
 }
@@ -170,7 +174,8 @@ async fn gen_server_ref_clone_works() {
     assert_eq!(server.pid(), server2.pid());
 
     server.cast(CounterCast::Increment).unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    // Yield to let the GenServer process the cast before the call
+    tokio::task::yield_now().await;
     let reply = server2
         .call(CounterCall::Get, Duration::from_secs(1))
         .await
@@ -206,8 +211,7 @@ async fn gen_server_init_failure() {
 
     let rt = Arc::new(Runtime::new(1));
     let server = spawn_gen_server(rt, FailInit).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    // Server should be dead, call should fail
+    // Server should be dead due to init failure, call should fail (timeout or dead)
     let result = server.call((), Duration::from_millis(100)).await;
     assert!(result.is_err());
 }

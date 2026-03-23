@@ -65,9 +65,8 @@ async fn handle_continue_called_after_init() {
     let rt = Arc::new(Runtime::new(1));
     let server = spawn_gen_server(rt, ContinueServer).await;
 
-    // Give the continue time to process
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
+    // The call acts as a synchronization barrier; the continue from init
+    // is processed before the call since GenServer uses biased select
     let state = server
         .call("get".to_string(), Duration::from_secs(1))
         .await
@@ -80,18 +79,14 @@ async fn handle_continue_called_from_handle_call() {
     let rt = Arc::new(Runtime::new(1));
     let server = spawn_gen_server(rt, ContinueServer).await;
 
-    // Wait for init continue
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
     // Trigger another continue from handle_call
+    // The call acts as a synchronization barrier for the init continue
     server
         .call("trigger_continue".to_string(), Duration::from_secs(1))
         .await
         .unwrap();
 
-    // Wait for it to process
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
+    // The next call acts as a synchronization barrier for the continue
     let state = server
         .call("get".to_string(), Duration::from_secs(1))
         .await
@@ -259,7 +254,7 @@ async fn process_context_send_after_to_other() {
             Duration::from_millis(20),
         );
         // Keep alive while timer fires
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        std::future::pending::<()>().await;
     })
     .await;
 
@@ -383,7 +378,8 @@ async fn existing_gen_server_unchanged() {
     let server = spawn_gen_server(Arc::clone(&rt), Counter).await;
     server.cast("inc".to_string()).unwrap();
     server.cast("inc".to_string()).unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Yield to let the GenServer process casts before the call
+    tokio::task::yield_now().await;
     let reply = server
         .call("get".to_string(), Duration::from_secs(1))
         .await

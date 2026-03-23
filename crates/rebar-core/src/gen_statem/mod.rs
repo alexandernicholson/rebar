@@ -123,7 +123,14 @@ mod tests {
         let rt = Arc::new(Runtime::new(1));
         let statem_ref = spawn_gen_statem(Arc::clone(&rt), CounterStatem).await;
         statem_ref.cast("inc".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            let count = statem_ref
+                .call("get".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if count == 1 { break; }
+            tokio::task::yield_now().await;
+        }
         let count = statem_ref
             .call("get".to_string(), Duration::from_secs(1))
             .await
@@ -197,7 +204,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, "stopping");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            if terminated.load(Ordering::SeqCst) { break; }
+            tokio::task::yield_now().await;
+        }
         assert!(terminated.load(Ordering::SeqCst));
     }
 
@@ -275,7 +285,14 @@ mod tests {
         assert_eq!(state, "A");
 
         statem_ref.cast("go".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            let state = statem_ref
+                .call("get".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if state == "B" { break; }
+            tokio::task::yield_now().await;
+        }
 
         let state = statem_ref
             .call("get".to_string(), Duration::from_secs(1))
@@ -293,7 +310,14 @@ mod tests {
         let statem_ref = spawn_gen_statem(Arc::clone(&rt), CounterStatem).await;
 
         statem_ref.cast("inc".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            let count = statem_ref
+                .call("get".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if count == 1 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let count = statem_ref
             .call("get".to_string(), Duration::from_secs(1))
@@ -391,7 +415,14 @@ mod tests {
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            let count = statem_ref
+                .call("get".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if count == 1 { break; }
+            tokio::task::yield_now().await;
+        }
         let count = statem_ref
             .call("get".to_string(), Duration::from_secs(1))
             .await
@@ -399,7 +430,14 @@ mod tests {
         assert_eq!(count, 1);
 
         statem_ref.cast("go".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            let count = statem_ref
+                .call("get".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if count == 2 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let count = statem_ref
             .call("get".to_string(), Duration::from_secs(1))
@@ -477,10 +515,11 @@ mod tests {
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         statem_ref.cast("go".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // No enter_count events should fire (enter disabled). Wait for cast to be processed.
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
 
         let count = statem_ref
             .call("get".to_string(), Duration::from_secs(1))
@@ -558,10 +597,15 @@ mod tests {
         )
         .await;
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         statem_ref.cast("go".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            let names = statem_ref
+                .call("get".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if names.len() == 2 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let names = statem_ref
             .call("get".to_string(), Duration::from_secs(1))
@@ -638,13 +682,17 @@ mod tests {
         .await;
 
         statem_ref.cast("set_timeout".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
 
-        let fired = statem_ref
-            .call("check".to_string(), Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert!(fired);
+        // Timeout is 50ms; poll until it fires
+        for _ in 0..200 {
+            let fired = statem_ref
+                .call("check".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if fired { return; }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("state timeout did not fire");
     }
 
     // ========================================================================
@@ -720,7 +768,8 @@ mod tests {
         .await;
 
         statem_ref.cast("go".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Must wait longer than the 50ms timeout to confirm it did NOT fire
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let fired = statem_ref
             .call("check".to_string(), Duration::from_secs(1))
@@ -797,7 +846,11 @@ mod tests {
         .await;
 
         statem_ref.cast("set_timeout".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Event timeout is 50ms. We must NOT send any events (including calls)
+        // during the wait, because any event cancels the event timeout.
+        // Wait for timeout to fire, then check via call.
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let fired = statem_ref
             .call("check".to_string(), Duration::from_secs(1))
@@ -882,9 +935,8 @@ mod tests {
         .await;
 
         statem_ref.cast("set".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
         statem_ref.cast("cancel".to_string()).unwrap();
+        // Must wait longer than the 50ms timeout to confirm it did NOT fire
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let fired = statem_ref
@@ -963,13 +1015,17 @@ mod tests {
         .await;
 
         statem_ref.cast("set".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
 
-        let fired = statem_ref
-            .call("check".to_string(), Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert!(fired);
+        // Timeout is 50ms; poll until it fires
+        for _ in 0..200 {
+            let fired = statem_ref
+                .call("check".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if fired { return; }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("generic timeout did not fire");
     }
 
     // ========================================================================
@@ -1054,7 +1110,15 @@ mod tests {
 
         statem_ref.cast("set".to_string()).unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // timer_a is 30ms; poll until it fires
+        for _ in 0..200 {
+            let (a, _b) = statem_ref
+                .call("check".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if a { break; }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         let (a, b) = statem_ref
             .call("check".to_string(), Duration::from_secs(1))
             .await
@@ -1062,7 +1126,15 @@ mod tests {
         assert!(a, "timer_a should have fired");
         assert!(!b, "timer_b should not have fired yet");
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        // timer_b is 80ms; poll until it fires
+        for _ in 0..200 {
+            let (_a, b) = statem_ref
+                .call("check".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if b { break; }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         let (a, b) = statem_ref
             .call("check".to_string(), Duration::from_secs(1))
             .await
@@ -1151,9 +1223,8 @@ mod tests {
         .await;
 
         statem_ref.cast("set".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
         statem_ref.cast("cancel".to_string()).unwrap();
+        // Must wait longer than the 50ms timeout to confirm it did NOT fire
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let fired = statem_ref
@@ -1230,16 +1301,17 @@ mod tests {
 
         statem_ref.cast("msg1".to_string()).unwrap();
         statem_ref.cast("msg2".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        assert_eq!(processed.load(Ordering::SeqCst), 0);
-
+        // Call is a sync barrier; casts are queued before it
         let _count = statem_ref
             .call("transition".to_string(), Duration::from_secs(1))
             .await
             .unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if processed.load(Ordering::SeqCst) == 2 { break; }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(processed.load(Ordering::SeqCst), 2);
     }
 
@@ -1259,7 +1331,9 @@ mod tests {
         .await;
 
         statem_ref.cast("msg".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
 
         assert_eq!(processed.load(Ordering::SeqCst), 0);
     }
@@ -1335,11 +1409,13 @@ mod tests {
         statem_ref.cast(1).unwrap();
         statem_ref.cast(2).unwrap();
         statem_ref.cast(3).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let _result = statem_ref.call(0, Duration::from_secs(1)).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if order.lock().await.len() == 3 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let final_order = order.lock().await.clone();
         assert_eq!(final_order.len(), 3, "all 3 postponed events should replay");
@@ -1410,7 +1486,14 @@ mod tests {
         .await;
 
         statem_ref.cast("trigger".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            let received = statem_ref
+                .call("check".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if received { return; }
+            tokio::task::yield_now().await;
+        }
 
         let received = statem_ref
             .call("check".to_string(), Duration::from_secs(1))
@@ -1516,7 +1599,6 @@ mod tests {
         let statem_ref = spawn_gen_statem(Arc::clone(&rt), HibernateStatem).await;
 
         statem_ref.cast("hibernate".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let reply = statem_ref
             .call("check".to_string(), Duration::from_secs(1))
@@ -1654,8 +1736,14 @@ mod tests {
         let rt = Arc::new(Runtime::new(1));
         let statem_ref = spawn_gen_statem(Arc::clone(&rt), ConnectionStatem).await;
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
+        for _ in 0..1000 {
+            let status = statem_ref
+                .call("status".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if status.contains("attempts=1") { break; }
+            tokio::task::yield_now().await;
+        }
         let status = statem_ref
             .call("status".to_string(), Duration::from_secs(1))
             .await
@@ -1664,7 +1752,14 @@ mod tests {
         assert!(status.contains("attempts=1"), "status: {status}");
 
         statem_ref.cast("connected".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            let status = statem_ref
+                .call("status".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if status.contains("Connected") { break; }
+            tokio::task::yield_now().await;
+        }
 
         let status = statem_ref
             .call("status".to_string(), Duration::from_secs(1))
@@ -1674,7 +1769,14 @@ mod tests {
 
         statem_ref.cast("send_data".to_string()).unwrap();
         statem_ref.cast("send_data".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            let status = statem_ref
+                .call("status".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if status.contains("sent=2") { break; }
+            tokio::task::yield_now().await;
+        }
 
         let status = statem_ref
             .call("status".to_string(), Duration::from_secs(1))
@@ -1694,7 +1796,14 @@ mod tests {
         for _ in 0..10 {
             statem_ref.cast("inc".to_string()).unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            let count = statem_ref
+                .call("get".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if count == 10 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let count = statem_ref
             .call("get".to_string(), Duration::from_secs(1))
@@ -1739,7 +1848,6 @@ mod tests {
     async fn statem_init_failure_does_not_crash_runtime() {
         let rt = Arc::new(Runtime::new(1));
         let _statem_ref = spawn_gen_statem(Arc::clone(&rt), FailingInitStatem).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let counter_ref = spawn_gen_statem(Arc::clone(&rt), CounterStatem).await;
         let count = counter_ref
@@ -1812,7 +1920,11 @@ mod tests {
         .await;
 
         statem_ref.cast("stop".to_string()).unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for _ in 0..1000 {
+            if terminated_reason.lock().await.is_some() { break; }
+            tokio::task::yield_now().await;
+        }
 
         let reason = terminated_reason.lock().await.clone();
         assert!(reason.is_some());

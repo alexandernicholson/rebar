@@ -89,8 +89,9 @@ mod tests {
         let rt = Arc::new(Runtime::new(1));
         let server_ref = spawn_gen_server(Arc::clone(&rt), CounterServer).await;
         server_ref.cast("inc".to_string()).unwrap();
+        // Yield to let the GenServer process the cast before the call
+        // (biased select prioritizes calls over casts)
         tokio::task::yield_now().await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
         let reply = server_ref
             .call("get".to_string(), Duration::from_secs(1))
             .await
@@ -105,7 +106,9 @@ mod tests {
         for _ in 0..10 {
             server_ref.cast("inc".to_string()).unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Yield to let the GenServer process all casts before the call
+        // (biased select prioritizes calls over casts)
+        tokio::task::yield_now().await;
         let reply = server_ref
             .call("get".to_string(), Duration::from_secs(1))
             .await

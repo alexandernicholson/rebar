@@ -349,9 +349,7 @@ mod tests {
         let agent = start_agent(Arc::clone(&rt), || 0_u64).await;
 
         agent.cast(|s: &mut u64| *s += 1).unwrap();
-        // Give cast time to process
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
+        // The get call acts as a synchronization barrier
         let val = agent
             .get(|s: &u64| *s, Duration::from_secs(1))
             .await
@@ -376,8 +374,8 @@ mod tests {
         let rt = Arc::new(Runtime::new(1));
         let agent = start_agent(Arc::clone(&rt), || 42_u64).await;
         agent.stop(Duration::from_secs(1)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
 
+        // stop() already awaited the reply, so the agent loop has exited
         let result = agent.update(|s: &mut u64| *s += 1, Duration::from_secs(1)).await;
         assert!(matches!(result, Err(AgentError::Dead)));
     }
@@ -449,8 +447,14 @@ mod tests {
         let pid = agent.pid();
 
         agent.stop(Duration::from_secs(1)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
+        // Poll until the agent process is cleaned up from the table
+        for _ in 0..100 {
+            if rt.table().get(&pid).is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(rt.table().get(&pid).is_none());
     }
 

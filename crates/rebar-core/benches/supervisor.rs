@@ -35,7 +35,7 @@ fn bench_supervisor_startup(c: &mut Criterion) {
                                 ChildEntry::new(
                                     ChildSpec::new(format!("child-{i}")),
                                     || async {
-                                        tokio::time::sleep(Duration::from_secs(60)).await;
+                                        std::future::pending::<()>().await;
                                         ExitReason::Normal
                                     },
                                 )
@@ -76,7 +76,7 @@ fn bench_add_child(c: &mut Criterion) {
                             let entry = ChildEntry::new(
                                 ChildSpec::new(format!("dynamic-{i}")),
                                 || async {
-                                    tokio::time::sleep(Duration::from_secs(60)).await;
+                                    std::future::pending::<()>().await;
                                     ExitReason::Normal
                                 },
                             );
@@ -115,7 +115,7 @@ fn bench_add_children_batch(c: &mut Criterion) {
                                 ChildEntry::new(
                                     ChildSpec::new(format!("batch-{i}")),
                                     || async {
-                                        tokio::time::sleep(Duration::from_secs(60)).await;
+                                        std::future::pending::<()>().await;
                                         ExitReason::Normal
                                     },
                                 )
@@ -168,7 +168,7 @@ fn bench_restart_one_for_one(c: &mut Criterion) {
                                 if let Some(tx) = tx {
                                     let _ = tx.send(());
                                 }
-                                tokio::time::sleep(Duration::from_secs(60)).await;
+                                std::future::pending::<()>().await;
                                 ExitReason::Normal
                             }
                         }

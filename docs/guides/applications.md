@@ -201,65 +201,31 @@ async fn circular_example(mgr: &ApplicationManager) {
 
 ### Runtime configuration with AppEnv
 
-Each running application has an `AppEnv` that can be read and modified at runtime.
+Each running application has an `AppEnv` (thread-safe key-value store) accessible via `mgr.env("name")`. Key methods: `get(key)`, `get_or(key, default)`, `fetch(key)` (returns error if missing), `put(key, value)`, `delete(key)`, and `all()`.
 
 ```rust
 async fn runtime_config(mgr: &ApplicationManager) {
-    // Read the database host.
     if let Some(env) = mgr.env("database") {
         let host = env.get("host").unwrap();
         println!("database host: {}", host.as_str().unwrap_or("?"));
-
         // Update at runtime (e.g., after a failover).
         env.put("host", rmpv::Value::String("db-replica.internal".into()));
     }
 }
 ```
 
-`AppEnv` methods:
-
-| Method | Behavior |
-|---|---|
-| `get(key)` | Returns `Option<Value>`. `None` if missing. |
-| `get_or(key, default)` | Returns `Value`. Uses `default` if missing. |
-| `fetch(key)` | Returns `Result<Value, AppError>`. Error if missing. |
-| `put(key, value)` | Insert or overwrite a value. |
-| `delete(key)` | Remove a key. |
-| `all()` | Return all key-value pairs. |
-
 ### Graceful shutdown
 
-`stop_all` stops every running application in reverse start order. Each application's `prep_stop`, supervisor shutdown, and `stop` callbacks run in sequence.
+`stop_all` stops every running application in reverse start order. Each application's `prep_stop`, supervisor shutdown, and `stop` callbacks run in sequence. You can also stop individual applications with `stop("name")`.
 
 ```rust
 async fn shutdown(mgr: &ApplicationManager) {
-    // Stops in order: http, cache, database.
-    mgr.stop_all().await.unwrap();
-
+    mgr.stop_all().await.unwrap(); // stops: http, cache, database
     assert!(mgr.started_applications().is_empty());
 }
 ```
 
-You can also stop individual applications:
-
-```rust
-async fn stop_one(mgr: &ApplicationManager) {
-    mgr.stop("cache").await.unwrap();
-    // "database" and "http" are still running.
-}
-```
-
-### Querying running applications
-
-```rust
-async fn introspect(mgr: &ApplicationManager) {
-    let running = mgr.started_applications();
-    println!("running: {running:?}");
-
-    let db_env = mgr.env("database");
-    println!("database env: {db_env:?}");
-}
-```
+Use `started_applications()` to list running applications and `env("name")` to inspect configuration.
 
 ---
 

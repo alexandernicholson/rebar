@@ -168,61 +168,11 @@ fn inspect_partition(handle: &PartitionSupervisorHandle, index: usize) {
 
 ### Restart behavior
 
-Each partition is an independent child of the underlying supervisor. When a partition crashes, only that partition restarts (OneForOne strategy by default). Other partitions are unaffected.
+Each partition is an independent child. When a partition crashes, only that partition restarts (OneForOne by default). Other partitions are unaffected. The `max_restarts` and `max_seconds` settings control the restart limiter.
 
-```rust
-async fn restart_demo() {
-    let rt = Arc::new(Runtime::new(1));
+### Shutdown and builder
 
-    // A factory where partition 0 crashes, others stay alive.
-    let factory: PartitionFactory = Arc::new(|index| {
-        Box::pin(async move {
-            if index == 0 {
-                // Simulate a crash.
-                ExitReason::Abnormal("out of memory".into())
-            } else {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                }
-                #[allow(unreachable_code)]
-                ExitReason::Normal
-            }
-        })
-    });
-
-    let spec = PartitionSupervisorSpec::new()
-        .partitions(4)
-        .max_restarts(5)
-        .max_seconds(10);
-
-    let handle = start_partition_supervisor(rt, spec, factory).await;
-
-    // Partition 0 will restart up to 5 times in 10 seconds.
-    // Partitions 1, 2, 3 run undisturbed.
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // All 4 partitions still have valid PIDs for routing.
-    for i in 0..4 {
-        let pid = handle.partition_pid(i).unwrap();
-        println!("partition {i}: {pid:?}");
-    }
-
-    handle.shutdown();
-}
-```
-
-### Shutdown
-
-```rust
-async fn cleanup(handle: PartitionSupervisorHandle) {
-    // Shuts down all partitions and the underlying supervisor.
-    handle.shutdown();
-}
-```
-
-### Builder chain
-
-The spec supports a fluent builder pattern:
+Call `handle.shutdown()` to stop all partitions and the underlying supervisor. The spec supports a fluent builder:
 
 ```rust
 use rebar_core::supervisor::spec::RestartStrategy;

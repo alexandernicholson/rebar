@@ -355,7 +355,10 @@ mod tests {
         .await;
         // Drop the ref to close the channel
         drop(_stage_ref);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            if terminated.load(Ordering::Relaxed) > 0 { break; }
+            tokio::task::yield_now().await;
+        }
         assert!(terminated.load(Ordering::Relaxed) > 0);
     }
 
@@ -389,7 +392,10 @@ mod tests {
         let _tag = consumer.subscribe(&producer, opts).await.unwrap();
 
         // Wait for automatic demand to flow through
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if counter.load(Ordering::Relaxed) > 0 { break; }
+            tokio::task::yield_now().await;
+        }
 
         // The producer should have emitted events
         assert!(counter.load(Ordering::Relaxed) > 0);
@@ -424,7 +430,10 @@ mod tests {
         let opts = SubscribeOpts::new(5, 3);
         consumer.subscribe(&producer, opts).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if counter.load(Ordering::Relaxed) >= 5 { break; }
+            tokio::task::yield_now().await;
+        }
 
         // Producer should have generated exactly max_demand events initially
         let produced = counter.load(Ordering::Relaxed);
@@ -460,7 +469,10 @@ mod tests {
         let opts = SubscribeOpts::new(5, 3);
         consumer.subscribe(&producer, opts).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if !collected.lock().await.is_empty() { break; }
+            tokio::task::yield_now().await;
+        }
 
         let events = collected.lock().await;
         assert!(!events.is_empty(), "consumer should have received events");
@@ -498,7 +510,9 @@ mod tests {
         let tag = consumer.subscribe(&producer, opts).await.unwrap();
 
         // In manual mode, no automatic demand is sent
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             counter.load(Ordering::Relaxed),
             0,
@@ -507,7 +521,10 @@ mod tests {
 
         // Manually ask for 3 events
         consumer.ask(tag, 3).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if collected.lock().await.len() == 3 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let events = collected.lock().await;
         assert_eq!(events.len(), 3, "should receive exactly 3 events");
@@ -544,7 +561,10 @@ mod tests {
         consumer.subscribe(&producer, opts).await.unwrap();
 
         // Wait long enough for initial demand + at least one re-ask cycle
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..1000 {
+            if counter.load(Ordering::Relaxed) > 4 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let produced = counter.load(Ordering::Relaxed);
         // Should produce more than just the initial max_demand (4) due to re-asks
@@ -585,7 +605,10 @@ mod tests {
 
         // Ask for exactly max_demand
         consumer.ask(tag, 5).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if collected.lock().await.len() == 5 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let events = collected.lock().await;
         assert_eq!(events.len(), 5);
@@ -633,7 +656,10 @@ mod tests {
             .unwrap();
         consumer2.subscribe(&producer, opts).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..1000 {
+            if !collected1.lock().await.is_empty() || !collected2.lock().await.is_empty() { break; }
+            tokio::task::yield_now().await;
+        }
 
         let c1 = collected1.lock().await;
         let c2 = collected2.lock().await;
@@ -687,7 +713,10 @@ mod tests {
             .unwrap();
         consumer2.subscribe(&producer, opts).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..1000 {
+            if !collected1.lock().await.is_empty() && !collected2.lock().await.is_empty() { break; }
+            tokio::task::yield_now().await;
+        }
 
         let c1 = collected1.lock().await;
         let c2 = collected2.lock().await;
@@ -726,7 +755,9 @@ mod tests {
         let _tag = consumer.subscribe(&producer, opts).await.unwrap();
 
         // Don't send any demand — manual mode
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
 
         let events = collected.lock().await;
         assert!(events.is_empty(), "no events without demand");
@@ -750,7 +781,9 @@ mod tests {
         .await;
 
         // No consumer subscribed — no demand
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
             counter.load(Ordering::Relaxed),
             0,
@@ -770,7 +803,10 @@ mod tests {
         let opts = SubscribeOpts::new(5, 3);
         consumer.subscribe(&producer, opts).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if counter.load(Ordering::Relaxed) > 0 { break; }
+            tokio::task::yield_now().await;
+        }
         assert!(counter.load(Ordering::Relaxed) > 0);
     }
 
@@ -834,12 +870,13 @@ mod tests {
         let opts = SubscribeOpts::new(5, 3);
         let tag = consumer.subscribe(&producer, opts).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         // Cancel from the consumer side
         consumer.cancel(tag).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            if !cancelled.lock().await.is_empty() { break; }
+            tokio::task::yield_now().await;
+        }
 
         let cancels = cancelled.lock().await;
         assert!(
@@ -878,17 +915,25 @@ mod tests {
         let tag = consumer.subscribe(&producer, opts).await.unwrap();
 
         // Nothing produced yet (manual mode)
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(collected.lock().await.len(), 0);
 
         // Ask for 2
         consumer.ask(tag, 2).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if collected.lock().await.len() == 2 { break; }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(collected.lock().await.len(), 2);
 
         // Ask for 3 more
         consumer.ask(tag, 3).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            if collected.lock().await.len() == 5 { break; }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(collected.lock().await.len(), 5);
     }
 
@@ -921,7 +966,10 @@ mod tests {
         let opts = SubscribeOpts::new(10, 5);
         consumer.subscribe(&producer, opts).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..1000 {
+            if collected.lock().await.len() >= 10 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let events = collected.lock().await;
         assert!(events.len() >= 10, "should receive at least 10 events");
@@ -965,7 +1013,10 @@ mod tests {
             .unwrap();
         consumer.subscribe(&doubler, opts).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        for _ in 0..1000 {
+            if !collected.lock().await.is_empty() { break; }
+            tokio::task::yield_now().await;
+        }
 
         let events = collected.lock().await;
         assert!(
@@ -1011,7 +1062,12 @@ mod tests {
         consumer.subscribe(&producer, opts).await.unwrap();
 
         // Wait for the slow consumer to process some events
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        for _ in 0..1000 {
+            if collected.lock().await.len() > 0 { break; }
+            tokio::task::yield_now().await;
+        }
+        // Let a few more batches flow for a meaningful back-pressure check
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let produced = counter.load(Ordering::Relaxed);
         let consumed = collected.lock().await.len();
@@ -1045,7 +1101,9 @@ mod tests {
         let opts = SubscribeOpts::new(5, 3);
         consumer.subscribe(&producer, opts).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
 
         let events = collected.lock().await;
         assert!(events.is_empty(), "empty producer emits no events");
@@ -1090,7 +1148,6 @@ mod tests {
 
         // Cast -> state += 10
         stage_ref.cast(rmpv::Value::Nil).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let result = stage_ref
             .call(
@@ -1112,7 +1169,6 @@ mod tests {
         let stage_ref = spawn_stage(Arc::clone(&rt), FailInit).await;
 
         // The stage should be dead since init failed
-        tokio::time::sleep(Duration::from_millis(50)).await;
         let result = stage_ref
             .call(rmpv::Value::Nil, Duration::from_millis(100))
             .await;
@@ -1171,7 +1227,11 @@ mod tests {
             .unwrap();
         consumer2.subscribe(&producer, opts).await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..1000 {
+            let total = collected1.lock().await.len() + collected2.lock().await.len();
+            if total > 0 { break; }
+            tokio::task::yield_now().await;
+        }
 
         let total = collected1.lock().await.len() + collected2.lock().await.len();
         assert!(total > 0, "events should be distributed across consumers");

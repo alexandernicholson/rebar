@@ -195,7 +195,7 @@ async fn supervisor_restarts_crashed_worker() {
                     if let Some(tx) = tx {
                         let _ = tx.send(());
                     }
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    std::future::pending::<()>().await;
                     ExitReason::Normal
                 }
             }
@@ -214,7 +214,6 @@ async fn supervisor_restarts_crashed_worker() {
     assert!(start_count.load(Ordering::SeqCst) >= 2);
 
     handle.shutdown();
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +262,7 @@ async fn supervisor_one_for_all_cascade() {
                                 let _ = tx.send(());
                             }
                         }
-                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        std::future::pending::<()>().await;
                         ExitReason::Normal
                     }
                 }
@@ -289,7 +288,6 @@ async fn supervisor_one_for_all_cascade() {
     }
 
     handle.shutdown();
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,12 +316,12 @@ async fn process_monitor_receives_down() {
     // ProcessDead, confirming the target is gone.
     rt.spawn(move |ctx: ProcessContext| async move {
         let mut detected = false;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        for _ in 0..200 {
             if ctx.send(target, rmpv::Value::Nil).await.is_err() {
                 detected = true;
                 break;
             }
+            tokio::task::yield_now().await;
         }
         let _ = detected_tx.send(detected);
     })
@@ -367,7 +365,7 @@ async fn linked_process_dies_together() {
                 if n == 1 {
                     ExitReason::Abnormal("crash".into())
                 } else {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    std::future::pending::<()>().await;
                     ExitReason::Normal
                 }
             }
@@ -392,7 +390,7 @@ async fn linked_process_dies_together() {
                         let _ = tx.send(());
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                std::future::pending::<()>().await;
                 ExitReason::Normal
             }
         },
@@ -412,7 +410,6 @@ async fn linked_process_dies_together() {
     );
 
     handle.shutdown();
-    tokio::time::sleep(Duration::from_millis(50)).await;
 }
 
 // ---------------------------------------------------------------------------

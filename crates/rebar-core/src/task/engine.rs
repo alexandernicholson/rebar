@@ -295,11 +295,15 @@ mod tests {
         let rt = Runtime::new(1);
         let mut task = async_task(&rt, || async { 42_u64 }).await;
 
-        // Give task time to complete
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        let result = task.yield_result(Duration::from_secs(1)).await;
-        assert!(matches!(result, Some(Ok(42))));
+        // Yield until task completes
+        for _ in 0..1000 {
+            if let Some(result) = task.yield_result(Duration::from_millis(10)).await {
+                assert!(matches!(result, Ok(42)));
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("task did not complete in time");
     }
 
     #[tokio::test]
@@ -307,8 +311,10 @@ mod tests {
         let rt = Runtime::new(1);
         let task = async_task(&rt, || async { 42_u64 }).await;
 
-        // Give task time to complete
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Yield until task completes
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
 
         let result = task.shutdown().await;
         assert_eq!(result, Some(42));
@@ -326,7 +332,10 @@ mod tests {
         .await;
 
         assert!(pid.local_id() > 0);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        for _ in 0..1000 {
+            if counter.load(Ordering::SeqCst) == 1 { break; }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
@@ -338,7 +347,10 @@ mod tests {
 
         task.await_result(Duration::from_secs(1)).await.unwrap();
         // Process should be cleaned up
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..1000 {
+            if rt.table().get(&pid).is_none() { break; }
+            tokio::task::yield_now().await;
+        }
         assert!(rt.table().get(&pid).is_none());
     }
 

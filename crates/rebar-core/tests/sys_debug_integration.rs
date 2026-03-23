@@ -89,7 +89,9 @@ async fn sys_get_state_reflects_mutations() {
     server.cast(CounterCast::Increment).unwrap();
     server.cast(CounterCast::Increment).unwrap();
     server.cast(CounterCast::Increment).unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Yield to let the GenServer process casts before the sys command
+    // (biased select prioritizes sys commands over casts)
+    tokio::task::yield_now().await;
 
     let state = server.sys_get_state(T).await.unwrap();
     assert_eq!(state, 3);
@@ -130,14 +132,14 @@ async fn sys_suspend_stops_cast_processing() {
 
     // Set the state to a known value first
     server.cast(CounterCast::Set(10)).unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Yield to let the GenServer process the cast before suspend
+    tokio::task::yield_now().await;
 
     server.sys_suspend(T).await.unwrap();
 
     // Cast some increments while suspended
     server.cast(CounterCast::Increment).unwrap();
     server.cast(CounterCast::Increment).unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // State should still be 10 (casts not processed while suspended)
     let state = server.sys_get_state(T).await.unwrap();
@@ -173,9 +175,9 @@ async fn sys_resume_processes_queued_messages() {
     server.cast(CounterCast::Increment).unwrap();
     server.cast(CounterCast::Increment).unwrap();
 
-    // Resume and wait for queued messages to be processed
+    // Resume and yield to let the GenServer process the queued casts
     server.sys_resume(T).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
 
     let state = server.sys_get_state(T).await.unwrap();
     assert_eq!(state, 3);
@@ -192,8 +194,8 @@ async fn sys_get_state_works_while_suspended() {
 
     // Set up some state, then suspend
     server.cast(CounterCast::Set(42)).unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
+    // Yield to let the GenServer process the cast before suspend
+    tokio::task::yield_now().await;
     server.sys_suspend(T).await.unwrap();
 
     // get_state should still work
@@ -301,7 +303,8 @@ async fn existing_call_cast_behavior_unchanged() {
 
     // Casts work
     server.cast(CounterCast::Increment).unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Yield to let the GenServer process the cast before the call
+    tokio::task::yield_now().await;
 
     let reply = server.call(CounterCall::Get, T).await.unwrap();
     assert_eq!(reply, 1);
@@ -315,7 +318,8 @@ async fn existing_gen_server_ref_clone_still_works() {
 
     assert_eq!(server.pid(), clone.pid());
     server.cast(CounterCast::Increment).unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Yield to let the GenServer process the cast before the call
+    tokio::task::yield_now().await;
 
     let reply = clone.call(CounterCall::Get, T).await.unwrap();
     assert_eq!(reply, 1);
@@ -331,7 +335,8 @@ async fn concurrent_sys_get_state_calls() {
     let server = spawn_gen_server(Arc::clone(&rt), Counter).await;
 
     server.cast(CounterCast::Set(99)).unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Yield to let the GenServer process the cast before sys commands
+    tokio::task::yield_now().await;
 
     let mut handles = Vec::new();
     for _ in 0..10 {
@@ -360,7 +365,8 @@ async fn suspend_resume_cycle_preserves_state() {
     for _ in 0..5 {
         server.cast(CounterCast::Increment).unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Yield to let the GenServer process casts before suspend
+    tokio::task::yield_now().await;
 
     // Suspend
     server.sys_suspend(T).await.unwrap();

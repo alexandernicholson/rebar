@@ -473,11 +473,17 @@ mod tests {
     #[tokio::test]
     async fn process_panic_does_not_crash_runtime() {
         let rt = Runtime::new(1);
-        rt.spawn(|_ctx| async move {
-            panic!("intentional panic");
-        })
-        .await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let panic_pid = rt
+            .spawn(|_ctx| async move {
+                panic!("intentional panic");
+            })
+            .await;
+        for _ in 0..100 {
+            if rt.table().get(&panic_pid).is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         rt.spawn(move |_ctx| async move {
             done_tx.send(42u64).unwrap();
@@ -494,7 +500,12 @@ mod tests {
     async fn spawn_cleanup_after_normal_exit() {
         let rt = Runtime::new(1);
         let pid = rt.spawn(|_ctx| async {}).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..100 {
+            if rt.table().get(&pid).is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(rt.table().get(&pid).is_none());
     }
 
@@ -502,7 +513,12 @@ mod tests {
     async fn spawn_cleanup_after_panic() {
         let rt = Runtime::new(1);
         let pid = rt.spawn(|_ctx| async { panic!("test panic") }).await;
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..100 {
+            if rt.table().get(&pid).is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(rt.table().get(&pid).is_none());
     }
 

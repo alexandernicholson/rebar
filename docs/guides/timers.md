@@ -124,31 +124,27 @@ Each invocation waits for the previous one to complete before scheduling the nex
 
 ### ProcessContext timer methods
 
-Inside a spawned process, `ProcessContext` provides convenience methods that automatically use the process's own PID and router:
+Inside a spawned process, `ProcessContext` provides convenience methods that target the process's own mailbox:
 
 ```rust
 use rebar_core::runtime::Runtime;
 
 async fn heartbeat_process(rt: &Runtime) {
     rt.spawn(|mut ctx| async move {
-        // Send a "tick" to self every 5 seconds.
         let _interval = ctx.send_interval(
             rmpv::Value::String("tick".into()),
             Duration::from_secs(5),
         );
-
-        // Schedule a one-shot "startup_complete" to self after 1 second.
         let _startup = ctx.send_after(
             rmpv::Value::String("startup_complete".into()),
             Duration::from_secs(1),
         );
 
-        // Process messages as they arrive.
         while let Some(msg) = ctx.recv().await {
             match msg.payload().as_str() {
                 Some("tick") => println!("heartbeat tick"),
                 Some("startup_complete") => println!("startup finished"),
-                _ => println!("unknown message"),
+                _ => {}
             }
         }
     })
@@ -156,63 +152,24 @@ async fn heartbeat_process(rt: &Runtime) {
 }
 ```
 
-You can also send delayed messages to other processes:
-
-```rust
-async fn delayed_notification(
-    ctx: &rebar_core::runtime::ProcessContext,
-    target: ProcessId,
-) {
-    let timer = ctx.send_after_to(
-        target,
-        rmpv::Value::String("reminder".into()),
-        Duration::from_secs(30),
-    );
-    // Cancel if no longer needed.
-    // timer.cancel();
-}
-```
+Use `send_after_to` to target another process instead of self.
 
 ### GenServerContext timer methods
 
-Inside a GenServer, the context provides the same timer methods:
-
-```rust
-use rebar_core::gen_server::{GenServer, GenServerContext};
-
-// In init:
-async fn init_with_timers(ctx: &GenServerContext) {
-    // Periodic sweep every 60 seconds, delivered to self.
-    ctx.send_interval(
-        ctx.self_pid(),
-        rmpv::Value::String("sweep".into()),
-        Duration::from_secs(60),
-    );
-
-    // One-shot delayed self-message.
-    ctx.send_after_self(
-        rmpv::Value::String("deferred_init".into()),
-        Duration::from_millis(100),
-    );
-}
-```
-
-Timer messages arrive in `handle_info` as raw `Message` values.
+Inside a GenServer, the context provides `send_interval`, `send_after`, and `send_after_self`. Timer messages arrive in `handle_info` as raw `Message` values.
 
 ### Putting it together: a heartbeat monitor
+
+A GenServer that sends periodic pings and escalates on missed responses:
 
 ```rust
 use rebar_core::gen_server::*;
 use rebar_core::process::{Message, ProcessId};
 
-struct HeartbeatMonitor {
-    target: ProcessId,
-    max_missed: u32,
-}
+struct HeartbeatMonitor { target: ProcessId, max_missed: u32 }
 
 struct MonitorState {
     missed: u32,
-    ping_timer: Option<rebar_core::timer::TimerRef>,
     timeout_timer: Option<rebar_core::timer::TimerRef>,
 }
 
@@ -224,55 +181,34 @@ impl GenServer for HeartbeatMonitor {
     type Reply = String;
 
     async fn init(&self, ctx: &GenServerContext) -> Result<Self::State, String> {
-        // Start periodic pings every 10 seconds.
-        let ping_timer = ctx.send_interval(
+        ctx.send_interval(
             ctx.self_pid(),
             rmpv::Value::String("do_ping".into()),
             Duration::from_secs(10),
         );
-        Ok(MonitorState {
-            missed: 0,
-            ping_timer,
-            timeout_timer: None,
-        })
+        Ok(MonitorState { missed: 0, timeout_timer: None })
     }
 
     async fn handle_call(
-        &self,
-        _msg: String,
-        _from: ProcessId,
-        state: &mut MonitorState,
-        _ctx: &GenServerContext,
-    ) -> String {
-        format!("missed: {}", state.missed)
-    }
+        &self, _msg: String, _from: ProcessId,
+        state: &mut MonitorState, _ctx: &GenServerContext,
+    ) -> String { format!("missed: {}", state.missed) }
 
     async fn handle_cast(
-        &self,
-        msg: String,
-        state: &mut MonitorState,
-        _ctx: &GenServerContext,
+        &self, msg: String, state: &mut MonitorState, _ctx: &GenServerContext,
     ) {
         if msg == "pong" {
-            // Response received. Cancel timeout, reset counter.
-            if let Some(timer) = state.timeout_timer.take() {
-                timer.cancel();
-            }
+            if let Some(timer) = state.timeout_timer.take() { timer.cancel(); }
             state.missed = 0;
         }
     }
 
     async fn handle_info(
-        &self,
-        msg: Message,
-        state: &mut MonitorState,
-        ctx: &GenServerContext,
+        &self, msg: Message, state: &mut MonitorState, ctx: &GenServerContext,
     ) {
         match msg.payload().as_str() {
             Some("do_ping") => {
-                // Send ping to target.
                 let _ = ctx.send(self.target, rmpv::Value::String("ping".into()));
-                // Start a 5-second timeout for the response.
                 state.timeout_timer = ctx.send_after_self(
                     rmpv::Value::String("ping_timeout".into()),
                     Duration::from_secs(5),
@@ -281,7 +217,7 @@ impl GenServer for HeartbeatMonitor {
             Some("ping_timeout") => {
                 state.missed += 1;
                 if state.missed >= self.max_missed {
-                    println!("ALERT: {} consecutive missed heartbeats", state.missed);
+                    println!("ALERT: {} missed heartbeats", state.missed);
                 }
             }
             _ => {}

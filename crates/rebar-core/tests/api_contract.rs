@@ -245,13 +245,19 @@ async fn context_send_is_async() {
 async fn panicking_process_does_not_crash_runtime() {
     let rt = Runtime::new(1);
 
-    rt.spawn(|_ctx| async move {
-        panic!("intentional panic for contract test");
-    })
-    .await;
+    let panic_pid = rt
+        .spawn(|_ctx| async move {
+            panic!("intentional panic for contract test");
+        })
+        .await;
 
-    // Allow the panic to propagate and cleanup to occur
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Poll until the panicked process is cleaned up from the table
+    for _ in 0..100 {
+        if rt.table().get(&panic_pid).is_none() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     rt.spawn(move |_ctx| async move {
@@ -280,8 +286,13 @@ async fn panicking_process_is_cleaned_up() {
         })
         .await;
 
-    // Wait for panic propagation and table cleanup
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Poll until the panicked process is cleaned up from the table
+    for _ in 0..100 {
+        if rt.table().get(&pid).is_none() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
 
     let result = rt.send(pid, rmpv::Value::Nil).await;
     assert!(

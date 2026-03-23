@@ -120,32 +120,24 @@ impl GenStage for LogParser {
 
 ### The consumer: write records to the database
 
-A consumer implements `handle_events` but returns an empty `Vec` (nothing to emit downstream).
+A consumer implements `handle_events` and returns an empty `Vec` (nothing to emit).
 
 ```rust
 struct DbWriter;
 
 #[async_trait::async_trait]
 impl GenStage for DbWriter {
-    type State = Vec<rmpv::Value>; // accumulated batch
+    type State = Vec<rmpv::Value>;
 
     async fn init(&self) -> Result<(StageType, Self::State), String> {
         Ok((StageType::Consumer, Vec::new()))
     }
 
     async fn handle_events(
-        &self,
-        events: Vec<rmpv::Value>,
-        _from: SubscriptionTag,
-        state: &mut Self::State,
+        &self, events: Vec<rmpv::Value>, _from: SubscriptionTag, state: &mut Self::State,
     ) -> Vec<rmpv::Value> {
-        // Simulate writing to a database.
-        for event in &events {
-            state.push(event.clone());
-        }
+        for event in &events { state.push(event.clone()); }
         println!("wrote {} records (total: {})", events.len(), state.len());
-
-        // Consumer returns empty vec -- nothing to emit.
         vec![]
     }
 }
@@ -153,158 +145,70 @@ impl GenStage for DbWriter {
 
 ### Wiring the pipeline
 
-Connect stages by subscribing consumers to producers. The subscription carries demand configuration.
+Connect stages by subscribing consumers to producers. `SubscribeOpts` controls batch size.
 
 ```rust
 async fn build_pipeline() {
     let rt = Arc::new(Runtime::new(1));
-
-    // Spawn stages.
-    let producer = spawn_stage(
-        Arc::clone(&rt),
-        LogProducer {
-            lines: (0..1000)
-                .map(|i| format!("2024-01-15 10:00:{i:02} INFO request completed"))
-                .collect(),
-        },
-    )
-    .await;
-
+    let producer = spawn_stage(Arc::clone(&rt), LogProducer {
+        lines: (0..1000).map(|i| format!("log line {i}")).collect(),
+    }).await;
     let parser = spawn_stage(Arc::clone(&rt), LogParser).await;
     let writer = spawn_stage(Arc::clone(&rt), DbWriter).await;
 
-    // Subscribe parser to producer.
-    let _tag1 = parser
-        .subscribe(
-            &producer,
-            SubscribeOpts {
-                max_demand: 100, // request 100 events at a time
-                min_demand: 50,  // re-request when 50 have been processed
-            },
-        )
-        .await
-        .unwrap();
+    parser.subscribe(&producer, SubscribeOpts::new(100, 50)).await.unwrap();
+    writer.subscribe(&parser, SubscribeOpts::new(50, 25)).await.unwrap();
 
-    // Subscribe writer to parser.
-    let _tag2 = writer
-        .subscribe(
-            &parser,
-            SubscribeOpts {
-                max_demand: 50,
-                min_demand: 25,
-            },
-        )
-        .await
-        .unwrap();
-
-    // The pipeline is now running. Events flow:
-    //   producer -> parser -> writer
-    // governed by demand from downstream.
-
+    // Pipeline runs: producer -> parser -> writer, governed by demand.
     tokio::time::sleep(Duration::from_secs(2)).await;
 }
 ```
 
 ### Fan-out with BroadcastDispatcher
 
-By default, a producer uses `DemandDispatcher`, which distributes events sequentially to consumers based on their pending demand. When you need every consumer to receive every event, use `BroadcastDispatcher`.
+By default, `DemandDispatcher` distributes events sequentially by demand. For fan-out (every consumer sees every event), use `BroadcastDispatcher`:
 
 ```rust
 async fn fan_out_to_multiple_consumers() {
     let rt = Arc::new(Runtime::new(1));
 
-    // Spawn a producer with BroadcastDispatcher.
     let producer = spawn_stage_with_dispatcher(
         Arc::clone(&rt),
-        LogProducer {
-            lines: (0..100)
-                .map(|i| format!("line {i}"))
-                .collect(),
-        },
+        LogProducer { lines: (0..100).map(|i| format!("line {i}")).collect() },
         BroadcastDispatcher::new(),
-    )
-    .await;
+    ).await;
 
-    // Both consumers see every event.
     let writer_a = spawn_stage(Arc::clone(&rt), DbWriter).await;
     let writer_b = spawn_stage(Arc::clone(&rt), DbWriter).await;
 
-    writer_a
-        .subscribe(&producer, SubscribeOpts::default())
-        .await
-        .unwrap();
-    writer_b
-        .subscribe(&producer, SubscribeOpts::default())
-        .await
-        .unwrap();
-
+    writer_a.subscribe(&producer, SubscribeOpts::default()).await.unwrap();
+    writer_b.subscribe(&producer, SubscribeOpts::default()).await.unwrap();
     tokio::time::sleep(Duration::from_secs(1)).await;
-}
-```
-
-### Calls and casts on stages
-
-Stages also support synchronous calls and asynchronous casts, useful for querying pipeline state or injecting events.
-
-```rust
-async fn query_stage(stage: &GenStageRef) {
-    // Synchronous call with timeout.
-    let reply = stage
-        .call(
-            rmpv::Value::String("get_stats".into()),
-            Duration::from_secs(1),
-        )
-        .await;
-    println!("stats: {reply:?}");
-
-    // Asynchronous cast.
-    let _ = stage.cast(rmpv::Value::String("flush".into()));
 }
 ```
 
 ### Manual demand control
 
-By default, consumers automatically re-request demand after processing events. For advanced cases, override `handle_subscribe` to return `DemandMode::Manual` and call `ask` explicitly:
+By default, consumers automatically re-request demand. For explicit control, return `DemandMode::Manual` from `handle_subscribe` and call `ask` to request events:
 
 ```rust
-use rebar_core::gen_stage::{DemandMode, StageType};
+use rebar_core::gen_stage::DemandMode;
 
-struct ManualConsumer;
-
-#[async_trait::async_trait]
-impl GenStage for ManualConsumer {
-    type State = ();
-
-    async fn init(&self) -> Result<(StageType, Self::State), String> {
-        Ok((StageType::Consumer, ()))
-    }
-
-    async fn handle_subscribe(
-        &self,
-        _role: StageType,
-        _opts: &SubscribeOpts,
-        _from: SubscriptionTag,
-        _state: &mut Self::State,
-    ) -> DemandMode {
-        DemandMode::Manual
-    }
-
-    async fn handle_events(
-        &self,
-        events: Vec<rmpv::Value>,
-        _from: SubscriptionTag,
-        _state: &mut Self::State,
-    ) -> Vec<rmpv::Value> {
-        println!("manual consumer got {} events", events.len());
-        vec![]
-    }
+// In your GenStage impl:
+async fn handle_subscribe(
+    &self, _role: StageType, _opts: &SubscribeOpts,
+    _from: SubscriptionTag, _state: &mut Self::State,
+) -> DemandMode {
+    DemandMode::Manual
 }
 
-async fn manual_demand(consumer: &GenStageRef, tag: SubscriptionTag) {
-    // Manually request 10 events.
+// Then pull events explicitly:
+async fn pull_events(consumer: &GenStageRef, tag: SubscriptionTag) {
     consumer.ask(tag, 10).await.unwrap();
 }
 ```
+
+Stages also support `call` (synchronous query) and `cast` (fire-and-forget) for injecting events or querying state.
 
 ---
 

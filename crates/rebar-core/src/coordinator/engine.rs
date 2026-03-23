@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -28,9 +28,6 @@ enum CoordMsg {
         reply: oneshot::Sender<Result<rmpv::Value, CoordinatorError>>,
         timeout: Duration,
     },
-    TaskComplete {
-        worker_pid: ProcessId,
-    },
     ListWorkers {
         reply: oneshot::Sender<Vec<WorkerInfo>>,
     },
@@ -38,6 +35,13 @@ enum CoordMsg {
         reply: oneshot::Sender<usize>,
     },
     Shutdown,
+}
+
+/// Completion notification — separate channel so the coordinator can
+/// prioritize processing completions over new submits.
+struct TaskComplete {
+    worker_pid: ProcessId,
+    elapsed_us: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -67,6 +71,8 @@ impl CoordState {
             pid,
             metadata,
             in_flight: 0,
+            avg_response_us: 0,
+            completed: 0,
         });
         Ok(id)
     }
@@ -81,20 +87,45 @@ impl CoordState {
         Ok(())
     }
 
-    /// Pick the worker with the fewest in-flight tasks (least-loaded).
+    /// Pick the worker with the lowest estimated load.
+    ///
+    /// Load score = `(in_flight + 1) * max(avg_response_us, 1)`. The `+1`
+    /// accounts for the task we're about to send, so even idle workers are
+    /// scored by their historical response time. A worker averaging 200ms
+    /// scores 40x higher than one averaging 5ms at the same in-flight count.
+    ///
+    /// Workers with no history (`completed == 0`) score lowest (1), ensuring
+    /// they're explored first.
     fn pick_worker(&mut self) -> Option<ProcessId> {
         let (idx, _) = self
             .workers
             .iter()
             .enumerate()
-            .min_by_key(|(_, w)| w.in_flight)?;
+            .min_by_key(|(_, w)| {
+                let load = (w.in_flight + 1) * w.avg_response_us.max(1);
+                // Tie-break: prefer workers with fewer completed tasks.
+                (load, w.completed)
+            })?;
         self.workers[idx].in_flight += 1;
         Some(self.workers[idx].pid)
     }
 
-    fn complete_task(&mut self, worker_pid: ProcessId) {
+    /// Record task completion: decrement in-flight, update response time EMA.
+    ///
+    /// Uses exponential moving average with alpha = 0.3 (recent tasks weighted
+    /// more heavily, but not so volatile that one outlier dominates).
+    fn complete_task(&mut self, worker_pid: ProcessId, elapsed_us: u64) {
         if let Some(w) = self.workers.iter_mut().find(|w| w.pid == worker_pid) {
             w.in_flight = w.in_flight.saturating_sub(1);
+            w.completed += 1;
+            if w.completed == 1 {
+                // First task: seed the average
+                w.avg_response_us = elapsed_us;
+            } else {
+                // EMA: new_avg = alpha * sample + (1 - alpha) * old_avg
+                // Using integer math: (3 * sample + 7 * old) / 10
+                w.avg_response_us = (3 * elapsed_us + 7 * w.avg_response_us) / 10;
+            }
         }
     }
 
@@ -272,12 +303,12 @@ pub async fn start_coordinator(
     spec: CoordinatorSpec,
 ) -> CoordinatorHandle {
     let (tx, mut rx) = mpsc::channel::<CoordMsg>(256);
+    let (complete_tx, mut complete_rx) = mpsc::unbounded_channel::<TaskComplete>();
 
     let router: Arc<dyn MessageRouter> =
         Arc::new(crate::router::LocalRouter::new(Arc::clone(runtime.table())));
 
     let table_for_spawn = Arc::clone(runtime.table());
-    let coord_tx = tx.clone();
 
     let pid = runtime
         .spawn(move |_ctx| async move {
@@ -289,117 +320,149 @@ pub async fn start_coordinator(
                 router,
             };
 
-            while let Some(msg) = rx.recv().await {
-                match msg {
-                    CoordMsg::Register {
-                        pid,
-                        metadata,
-                        reply,
-                    } => {
-                        let _ = reply.send(state.register(pid, metadata));
-                    }
-                    CoordMsg::Unregister { id, reply } => {
-                        let _ = reply.send(state.unregister(id));
-                    }
-                    CoordMsg::WorkerCount { reply } => {
-                        let _ = reply.send(state.workers.len());
-                    }
-                    CoordMsg::ListWorkers { reply } => {
-                        let _ = reply.send(state.workers.clone());
-                    }
-                    CoordMsg::TaskComplete { worker_pid } => {
-                        state.complete_task(worker_pid);
-                    }
-                    CoordMsg::Submit {
-                        task,
-                        reply,
-                        timeout,
-                    } => {
-                        let mut attempts = state.workers.len();
-                        let mut reply_opt = Some(reply);
+            loop {
+                // Drain ALL pending completions first — this ensures the
+                // scheduler has up-to-date in_flight counts and response
+                // times before dispatching the next task.
+                while let Ok(tc) = complete_rx.try_recv() {
+                    state.complete_task(tc.worker_pid, tc.elapsed_us);
+                }
 
-                        while attempts > 0 {
-                            let Some(worker_pid) = state.pick_worker() else {
-                                break;
-                            };
+                tokio::select! {
+                    biased;
 
-                            // Create an ephemeral reply collector
-                            let (result_tx, result_rx) = oneshot::channel();
-                            let reply_pid = runtime_table.allocate_pid();
-                            let (mb_tx, mut mb_rx) =
-                                crate::process::mailbox::Mailbox::unbounded();
-                            runtime_table.insert(
-                                reply_pid,
-                                crate::process::table::ProcessHandle::new(mb_tx),
-                            );
+                    // Prioritize completions over commands
+                    Some(tc) = complete_rx.recv() => {
+                        state.complete_task(tc.worker_pid, tc.elapsed_us);
+                    }
 
-                            // Build the task message
-                            let task_msg = rmpv::Value::Map(vec![
-                                (rmpv::Value::from("task"), task.clone()),
-                                (
-                                    rmpv::Value::from("reply_to_node"),
-                                    rmpv::Value::from(reply_pid.node_id()),
-                                ),
-                                (
-                                    rmpv::Value::from("reply_to_local"),
-                                    rmpv::Value::from(reply_pid.local_id()),
-                                ),
-                            ]);
-
-                            // Try to send to the worker
-                            if state
-                                .router
-                                .route(ProcessId::new(0, 0), worker_pid, task_msg)
-                                .is_err()
-                            {
-                                // Worker is dead — undo in_flight bump, remove, try next
-                                state.complete_task(worker_pid);
-                                state.remove_worker_by_pid(worker_pid);
-                                runtime_table.remove(&reply_pid);
-                                attempts -= 1;
-                                continue;
+                    Some(msg) = rx.recv() => {
+                        match msg {
+                            CoordMsg::Register { pid, metadata, reply } => {
+                                let _ = reply.send(state.register(pid, metadata));
                             }
-
-                            // Spawn collector: wait for result, then notify coordinator
-                            let rt_table = Arc::clone(&runtime_table);
-                            let complete_tx = coord_tx.clone();
-                            tokio::spawn(async move {
-                                let result =
-                                    match tokio::time::timeout(timeout, mb_rx.recv()).await {
-                                        Ok(Some(msg)) => Ok(msg.payload().clone()),
-                                        Ok(None) => Err(CoordinatorError::WorkerDied),
-                                        Err(_) => Err(CoordinatorError::Timeout),
-                                    };
-                                rt_table.remove(&reply_pid);
-                                // Decrement in-flight count
-                                let _ = complete_tx
-                                    .send(CoordMsg::TaskComplete { worker_pid })
-                                    .await;
-                                let _ = result_tx.send(result);
-                            });
-
-                            // Forward the result to the caller
-                            if let Some(reply) = reply_opt.take() {
-                                tokio::spawn(async move {
-                                    let result = result_rx
-                                        .await
-                                        .unwrap_or(Err(CoordinatorError::Shutdown));
-                                    let _ = reply.send(result);
-                                });
+                            CoordMsg::Unregister { id, reply } => {
+                                let _ = reply.send(state.unregister(id));
                             }
-
-                            break;
-                        }
-
-                        if let Some(reply) = reply_opt {
-                            let _ = reply.send(Err(CoordinatorError::NoWorkers));
+                            CoordMsg::WorkerCount { reply } => {
+                                let _ = reply.send(state.workers.len());
+                            }
+                            CoordMsg::ListWorkers { reply } => {
+                                let _ = reply.send(state.workers.clone());
+                            }
+                            CoordMsg::Submit { task, reply, timeout } => {
+                                dispatch_task(
+                                    &mut state,
+                                    &runtime_table,
+                                    &complete_tx,
+                                    &task,
+                                    reply,
+                                    timeout,
+                                );
+                                // Yield after dispatch so collector tasks can run
+                                // and report completions before the next Submit is
+                                // processed. This is cooperative scheduling, not a
+                                // sleep — it costs ~0 time.
+                                tokio::task::yield_now().await;
+                            }
+                            CoordMsg::Shutdown => break,
                         }
                     }
-                    CoordMsg::Shutdown => break,
+
+                    else => break,
                 }
             }
         })
         .await;
 
     CoordinatorHandle { pid, tx }
+}
+
+fn dispatch_task(
+    state: &mut CoordState,
+    runtime_table: &Arc<crate::process::table::ProcessTable>,
+    complete_tx: &mpsc::UnboundedSender<TaskComplete>,
+    task: &rmpv::Value,
+    reply: oneshot::Sender<Result<rmpv::Value, CoordinatorError>>,
+    timeout: Duration,
+) {
+    let mut attempts = state.workers.len();
+    let mut reply_opt = Some(reply);
+
+    while attempts > 0 {
+        let Some(worker_pid) = state.pick_worker() else {
+            break;
+        };
+
+        // Create an ephemeral reply collector
+        let (result_tx, result_rx) = oneshot::channel();
+        let reply_pid = runtime_table.allocate_pid();
+        let (mb_tx, mut mb_rx) = crate::process::mailbox::Mailbox::unbounded();
+        runtime_table.insert(
+            reply_pid,
+            crate::process::table::ProcessHandle::new(mb_tx),
+        );
+
+        // Build the task message
+        let task_msg = rmpv::Value::Map(vec![
+            (rmpv::Value::from("task"), task.clone()),
+            (
+                rmpv::Value::from("reply_to_node"),
+                rmpv::Value::from(reply_pid.node_id()),
+            ),
+            (
+                rmpv::Value::from("reply_to_local"),
+                rmpv::Value::from(reply_pid.local_id()),
+            ),
+        ]);
+
+        // Try to send to the worker
+        if state
+            .router
+            .route(ProcessId::new(0, 0), worker_pid, task_msg)
+            .is_err()
+        {
+            state.complete_task(worker_pid, 0);
+            state.remove_worker_by_pid(worker_pid);
+            runtime_table.remove(&reply_pid);
+            attempts -= 1;
+            continue;
+        }
+
+        // Spawn collector: wait for result, measure time, notify coordinator
+        let rt_table = Arc::clone(runtime_table);
+        let ctx = complete_tx.clone();
+        let dispatch_time = Instant::now();
+        tokio::spawn(async move {
+            let result = match tokio::time::timeout(timeout, mb_rx.recv()).await {
+                Ok(Some(msg)) => Ok(msg.payload().clone()),
+                Ok(None) => Err(CoordinatorError::WorkerDied),
+                Err(_) => Err(CoordinatorError::Timeout),
+            };
+            let elapsed_us =
+                u64::try_from(dispatch_time.elapsed().as_micros()).unwrap_or(u64::MAX);
+            rt_table.remove(&reply_pid);
+            let _ = ctx.send(TaskComplete {
+                worker_pid,
+                elapsed_us,
+            });
+            let _ = result_tx.send(result);
+        });
+
+        // Forward the result to the caller
+        if let Some(reply) = reply_opt.take() {
+            tokio::spawn(async move {
+                let result = result_rx
+                    .await
+                    .unwrap_or(Err(CoordinatorError::Shutdown));
+                let _ = reply.send(result);
+            });
+        }
+
+        break;
+    }
+
+    if let Some(reply) = reply_opt {
+        let _ = reply.send(Err(CoordinatorError::NoWorkers));
+    }
 }

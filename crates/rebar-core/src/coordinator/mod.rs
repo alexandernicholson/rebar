@@ -158,10 +158,10 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Least-loaded scheduling
+    // Least-loaded scheduling (concurrent load)
     // ---------------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn least_loaded_prefers_idle_worker() {
         let rt = Arc::new(Runtime::new(1));
         let coord = start_coordinator(Arc::clone(&rt), CoordinatorSpec::default()).await;
@@ -169,12 +169,13 @@ mod tests {
         let counter_fast = Arc::new(AtomicU64::new(0));
         let counter_slow = Arc::new(AtomicU64::new(0));
 
-        // Fast worker: replies immediately
+        // Fast worker: replies in 1ms
         let cf = counter_fast.clone();
         let fast = rt
             .spawn(move |mut ctx| async move {
                 while let Some(msg) = ctx.recv().await {
                     cf.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                     if let rmpv::Value::Map(entries) = msg.payload().clone() {
                         let mut rn: u64 = 0;
                         let mut rl: u64 = 0;
@@ -191,13 +192,13 @@ mod tests {
             })
             .await;
 
-        // Slow worker: takes 200ms per task
+        // Slow worker: takes 500ms per task
         let cs = counter_slow.clone();
         let slow = rt
             .spawn(move |mut ctx| async move {
                 while let Some(msg) = ctx.recv().await {
                     cs.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     if let rmpv::Value::Map(entries) = msg.payload().clone() {
                         let mut rn: u64 = 0;
                         let mut rl: u64 = 0;
@@ -217,19 +218,23 @@ mod tests {
         coord.register_worker(fast, rmpv::Value::Nil).await.unwrap();
         coord.register_worker(slow, rmpv::Value::Nil).await.unwrap();
 
-        // Submit 6 tasks sequentially — fast worker should handle more
-        // because its in-flight count drops back to 0 quickly
-        for i in 0..6 {
-            coord
-                .submit(rmpv::Value::from(i), Duration::from_secs(2))
-                .await
-                .unwrap();
-        }
+        // Phase 1: Calibration — submit 2 tasks sequentially so both workers
+        // get a response time sample. The completed-count tie-breaker ensures
+        // the first goes to one worker and the second to the other.
+        coord.submit(rmpv::Value::from(0), Duration::from_secs(5)).await.unwrap();
+        coord.submit(rmpv::Value::from(0), Duration::from_secs(5)).await.unwrap();
+
+        // Phase 2: Now the scheduler knows fast ≈ 1ms and slow ≈ 500ms.
+        // Score formula (in_flight + 1) * avg_response means the scheduler
+        // heavily prefers the fast worker even when both are idle.
+        let tasks: Vec<rmpv::Value> = (0..18).map(|i| rmpv::Value::from(i)).collect();
+        let results = coord.submit_many(tasks, Duration::from_secs(15)).await;
+        assert_eq!(results.len(), 18);
+        assert!(results.iter().all(Result::is_ok));
 
         let fast_count = counter_fast.load(Ordering::SeqCst);
         let slow_count = counter_slow.load(Ordering::SeqCst);
-        assert_eq!(fast_count + slow_count, 6);
-        // The fast worker should have handled more tasks than the slow one
+        assert_eq!(fast_count + slow_count, 20);
         assert!(
             fast_count > slow_count,
             "fast worker ({fast_count}) should handle more than slow ({slow_count})"
@@ -358,5 +363,109 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(val, 42);
+    }
+
+    // ---------------------------------------------------------------
+    // Mixed workload: response-time-weighted scheduling
+    // ---------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_workload_avoids_piling_behind_slow_worker() {
+        let rt = Arc::new(Runtime::new(1));
+        let coord = start_coordinator(Arc::clone(&rt), CoordinatorSpec::default()).await;
+
+        let counter_fast = Arc::new(AtomicU64::new(0));
+        let counter_slow = Arc::new(AtomicU64::new(0));
+
+        // Fast worker: 5ms per task
+        let cf = counter_fast.clone();
+        let fast = rt
+            .spawn(move |mut ctx| async move {
+                while let Some(msg) = ctx.recv().await {
+                    cf.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    if let rmpv::Value::Map(entries) = msg.payload().clone() {
+                        let mut rn: u64 = 0;
+                        let mut rl: u64 = 0;
+                        for (k, v) in &entries {
+                            match k.as_str().unwrap_or("") {
+                                "reply_to_node" => rn = v.as_u64().unwrap_or(0),
+                                "reply_to_local" => rl = v.as_u64().unwrap_or(0),
+                                _ => {}
+                            }
+                        }
+                        let _ = ctx.send(ProcessId::new(rn, rl), rmpv::Value::from(1)).await;
+                    }
+                }
+            })
+            .await;
+
+        // Slow worker: 200ms per task (simulates big tasks)
+        let cs = counter_slow.clone();
+        let slow = rt
+            .spawn(move |mut ctx| async move {
+                while let Some(msg) = ctx.recv().await {
+                    cs.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    if let rmpv::Value::Map(entries) = msg.payload().clone() {
+                        let mut rn: u64 = 0;
+                        let mut rl: u64 = 0;
+                        for (k, v) in &entries {
+                            match k.as_str().unwrap_or("") {
+                                "reply_to_node" => rn = v.as_u64().unwrap_or(0),
+                                "reply_to_local" => rl = v.as_u64().unwrap_or(0),
+                                _ => {}
+                            }
+                        }
+                        let _ = ctx.send(ProcessId::new(rn, rl), rmpv::Value::from(1)).await;
+                    }
+                }
+            })
+            .await;
+
+        coord.register_worker(fast, rmpv::Value::Nil).await.unwrap();
+        coord.register_worker(slow, rmpv::Value::Nil).await.unwrap();
+
+        // Calibration: seed response times (fast ≈ 5ms, slow ≈ 200ms)
+        coord.submit(rmpv::Value::from(0), Duration::from_secs(5)).await.unwrap();
+        coord.submit(rmpv::Value::from(0), Duration::from_secs(5)).await.unwrap();
+
+        // Weighted batch: score = (in_flight + 1) * avg_response routes
+        // most tasks to the fast worker
+        let tasks: Vec<rmpv::Value> = (0..18).map(|i| rmpv::Value::from(i)).collect();
+        let results = coord.submit_many(tasks, Duration::from_secs(5)).await;
+        assert_eq!(results.len(), 18);
+        assert!(results.iter().all(Result::is_ok));
+
+        let fast_count = counter_fast.load(Ordering::SeqCst);
+        let slow_count = counter_slow.load(Ordering::SeqCst);
+        // 2 calibration + 18 batch = 20 total
+        assert_eq!(fast_count + slow_count, 20);
+        assert!(
+            fast_count > slow_count,
+            "fast worker ({fast_count}) should handle more than slow ({slow_count}) in mixed workload"
+        );
+
+        // list_workers goes through the coordinator's channel, so by the time
+        // it returns, all prior TaskComplete messages have been processed.
+        // This acts as a synchronization barrier — no sleep needed.
+        let workers = coord.list_workers().await.unwrap();
+        for w in &workers {
+            if w.pid == fast {
+                // Fast worker (5ms delay) should have lower avg than slow (200ms)
+                assert!(
+                    w.avg_response_us < w.avg_response_us + 1, // always true; real check below
+                );
+            }
+        }
+        // The key invariant: fast worker's avg response is lower than slow's
+        let fast_info = workers.iter().find(|w| w.pid == fast).unwrap();
+        let slow_info = workers.iter().find(|w| w.pid == slow).unwrap();
+        assert!(
+            fast_info.avg_response_us < slow_info.avg_response_us,
+            "fast avg ({}us) should be less than slow avg ({}us)",
+            fast_info.avg_response_us,
+            slow_info.avg_response_us,
+        );
     }
 }

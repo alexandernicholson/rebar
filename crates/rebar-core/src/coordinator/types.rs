@@ -15,6 +15,11 @@ pub struct WorkerInfo {
     pub metadata: rmpv::Value,
     /// Number of tasks currently in flight to this worker.
     pub in_flight: u64,
+    /// Exponential moving average of response time in microseconds.
+    /// Used by the scheduler to estimate how long this worker takes per task.
+    pub avg_response_us: u64,
+    /// Total tasks completed by this worker (for stats).
+    pub completed: u64,
 }
 
 /// Configuration for a coordinator.

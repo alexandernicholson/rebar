@@ -158,78 +158,126 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Round-robin scheduling
+    // Least-loaded scheduling
     // ---------------------------------------------------------------
 
     #[tokio::test]
-    async fn round_robin_distributes_evenly() {
+    async fn least_loaded_prefers_idle_worker() {
         let rt = Arc::new(Runtime::new(1));
         let coord = start_coordinator(Arc::clone(&rt), CoordinatorSpec::default()).await;
 
-        // Spawn 2 workers that count tasks received
-        let counter1 = Arc::new(AtomicU64::new(0));
-        let counter2 = Arc::new(AtomicU64::new(0));
+        let counter_fast = Arc::new(AtomicU64::new(0));
+        let counter_slow = Arc::new(AtomicU64::new(0));
 
-        let c1 = counter1.clone();
-        let w1 = rt
+        // Fast worker: replies immediately
+        let cf = counter_fast.clone();
+        let fast = rt
             .spawn(move |mut ctx| async move {
                 while let Some(msg) = ctx.recv().await {
-                    c1.fetch_add(1, Ordering::SeqCst);
+                    cf.fetch_add(1, Ordering::SeqCst);
                     if let rmpv::Value::Map(entries) = msg.payload().clone() {
-                        let mut reply_node: u64 = 0;
-                        let mut reply_local: u64 = 0;
+                        let mut rn: u64 = 0;
+                        let mut rl: u64 = 0;
                         for (k, v) in &entries {
                             match k.as_str().unwrap_or("") {
-                                "reply_to_node" => reply_node = v.as_u64().unwrap_or(0),
-                                "reply_to_local" => reply_local = v.as_u64().unwrap_or(0),
+                                "reply_to_node" => rn = v.as_u64().unwrap_or(0),
+                                "reply_to_local" => rl = v.as_u64().unwrap_or(0),
                                 _ => {}
                             }
                         }
-                        let reply_pid = ProcessId::new(reply_node, reply_local);
-                        let _ = ctx.send(reply_pid, rmpv::Value::from(1)).await;
+                        let _ = ctx.send(ProcessId::new(rn, rl), rmpv::Value::from(1)).await;
                     }
                 }
             })
             .await;
 
-        let c2 = counter2.clone();
-        let w2 = rt
+        // Slow worker: takes 200ms per task
+        let cs = counter_slow.clone();
+        let slow = rt
             .spawn(move |mut ctx| async move {
                 while let Some(msg) = ctx.recv().await {
-                    c2.fetch_add(1, Ordering::SeqCst);
+                    cs.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     if let rmpv::Value::Map(entries) = msg.payload().clone() {
-                        let mut reply_node: u64 = 0;
-                        let mut reply_local: u64 = 0;
+                        let mut rn: u64 = 0;
+                        let mut rl: u64 = 0;
                         for (k, v) in &entries {
                             match k.as_str().unwrap_or("") {
-                                "reply_to_node" => reply_node = v.as_u64().unwrap_or(0),
-                                "reply_to_local" => reply_local = v.as_u64().unwrap_or(0),
+                                "reply_to_node" => rn = v.as_u64().unwrap_or(0),
+                                "reply_to_local" => rl = v.as_u64().unwrap_or(0),
                                 _ => {}
                             }
                         }
-                        let reply_pid = ProcessId::new(reply_node, reply_local);
-                        let _ = ctx.send(reply_pid, rmpv::Value::from(1)).await;
+                        let _ = ctx.send(ProcessId::new(rn, rl), rmpv::Value::from(1)).await;
                     }
                 }
             })
             .await;
 
-        coord.register_worker(w1, rmpv::Value::Nil).await.unwrap();
-        coord.register_worker(w2, rmpv::Value::Nil).await.unwrap();
+        coord.register_worker(fast, rmpv::Value::Nil).await.unwrap();
+        coord.register_worker(slow, rmpv::Value::Nil).await.unwrap();
 
-        // Submit 10 tasks
-        for i in 0..10 {
+        // Submit 6 tasks sequentially — fast worker should handle more
+        // because its in-flight count drops back to 0 quickly
+        for i in 0..6 {
             coord
-                .submit(rmpv::Value::from(i), Duration::from_secs(1))
+                .submit(rmpv::Value::from(i), Duration::from_secs(2))
                 .await
                 .unwrap();
         }
 
-        let c1_val = counter1.load(Ordering::SeqCst);
-        let c2_val = counter2.load(Ordering::SeqCst);
-        assert_eq!(c1_val + c2_val, 10);
-        assert_eq!(c1_val, 5);
-        assert_eq!(c2_val, 5);
+        let fast_count = counter_fast.load(Ordering::SeqCst);
+        let slow_count = counter_slow.load(Ordering::SeqCst);
+        assert_eq!(fast_count + slow_count, 6);
+        // The fast worker should have handled more tasks than the slow one
+        assert!(
+            fast_count > slow_count,
+            "fast worker ({fast_count}) should handle more than slow ({slow_count})"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_visible_in_list_workers() {
+        let rt = Arc::new(Runtime::new(1));
+        let coord = start_coordinator(Arc::clone(&rt), CoordinatorSpec::default()).await;
+
+        // Worker that takes 500ms to respond
+        let slow = rt
+            .spawn(|mut ctx| async move {
+                while let Some(msg) = ctx.recv().await {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if let rmpv::Value::Map(entries) = msg.payload().clone() {
+                        let mut rn: u64 = 0;
+                        let mut rl: u64 = 0;
+                        for (k, v) in &entries {
+                            match k.as_str().unwrap_or("") {
+                                "reply_to_node" => rn = v.as_u64().unwrap_or(0),
+                                "reply_to_local" => rl = v.as_u64().unwrap_or(0),
+                                _ => {}
+                            }
+                        }
+                        let _ = ctx.send(ProcessId::new(rn, rl), rmpv::Value::from(1)).await;
+                    }
+                }
+            })
+            .await;
+
+        coord.register_worker(slow, rmpv::Value::Nil).await.unwrap();
+
+        // Submit a task (don't await — let it be in-flight)
+        let coord2 = coord.clone();
+        tokio::spawn(async move {
+            let _ = coord2
+                .submit(rmpv::Value::from(1), Duration::from_secs(2))
+                .await;
+        });
+
+        // Give the submit time to dispatch
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let workers = coord.list_workers().await.unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].in_flight, 1, "should show 1 in-flight task");
     }
 
     // ---------------------------------------------------------------

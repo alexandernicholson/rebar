@@ -13,6 +13,8 @@ pub struct WorkerInfo {
     pub pid: ProcessId,
     /// Arbitrary metadata attached at registration.
     pub metadata: rmpv::Value,
+    /// Number of tasks currently in flight to this worker.
+    pub in_flight: u64,
 }
 
 /// Configuration for a coordinator.

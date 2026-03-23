@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +28,9 @@ enum CoordMsg {
         reply: oneshot::Sender<Result<rmpv::Value, CoordinatorError>>,
         timeout: Duration,
     },
+    TaskComplete {
+        worker_pid: ProcessId,
+    },
     ListWorkers {
         reply: oneshot::Sender<Vec<WorkerInfo>>,
     },
@@ -45,7 +47,6 @@ enum CoordMsg {
 struct CoordState {
     workers: Vec<WorkerInfo>,
     next_id: u64,
-    round_robin_idx: usize,
     max_workers: usize,
     router: Arc<dyn MessageRouter>,
 }
@@ -61,7 +62,12 @@ impl CoordState {
         }
         self.next_id += 1;
         let id = WorkerId(self.next_id);
-        self.workers.push(WorkerInfo { id, pid, metadata });
+        self.workers.push(WorkerInfo {
+            id,
+            pid,
+            metadata,
+            in_flight: 0,
+        });
         Ok(id)
     }
 
@@ -72,31 +78,28 @@ impl CoordState {
             .position(|w| w.id == id)
             .ok_or(CoordinatorError::WorkerNotFound(id))?;
         self.workers.swap_remove(pos);
-        // Reset round-robin if needed
-        if self.workers.is_empty() {
-            self.round_robin_idx = 0;
-        } else {
-            self.round_robin_idx %= self.workers.len();
-        }
         Ok(())
     }
 
+    /// Pick the worker with the fewest in-flight tasks (least-loaded).
     fn pick_worker(&mut self) -> Option<ProcessId> {
-        if self.workers.is_empty() {
-            return None;
-        }
-        let idx = self.round_robin_idx % self.workers.len();
-        self.round_robin_idx = idx + 1;
+        let (idx, _) = self
+            .workers
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, w)| w.in_flight)?;
+        self.workers[idx].in_flight += 1;
         Some(self.workers[idx].pid)
+    }
+
+    fn complete_task(&mut self, worker_pid: ProcessId) {
+        if let Some(w) = self.workers.iter_mut().find(|w| w.pid == worker_pid) {
+            w.in_flight = w.in_flight.saturating_sub(1);
+        }
     }
 
     fn remove_worker_by_pid(&mut self, pid: ProcessId) {
         self.workers.retain(|w| w.pid != pid);
-        if self.workers.is_empty() {
-            self.round_robin_idx = 0;
-        } else {
-            self.round_robin_idx %= self.workers.len();
-        }
     }
 }
 
@@ -164,8 +167,9 @@ impl CoordinatorHandle {
 
     /// Submit a task to be executed by a worker.
     ///
-    /// The coordinator picks a worker via round-robin, sends the task, and waits
-    /// for the result. If the selected worker is dead, it is removed and the next
+    /// The coordinator picks the worker with the fewest in-flight tasks
+    /// (least-loaded scheduling), sends the task, and waits for the result.
+    /// If the selected worker is dead, it is removed and the next-least-loaded
     /// worker is tried.
     ///
     /// # Errors
@@ -228,7 +232,7 @@ impl CoordinatorHandle {
         reply_rx.await.map_err(|_| CoordinatorError::Shutdown)
     }
 
-    /// List all registered workers.
+    /// List all registered workers with their in-flight task counts.
     ///
     /// # Errors
     ///
@@ -255,7 +259,9 @@ impl CoordinatorHandle {
 /// Start a coordinator process.
 ///
 /// The coordinator manages a pool of registered worker processes and distributes
-/// submitted tasks among them via round-robin scheduling.
+/// submitted tasks using **least-loaded scheduling** — each task goes to the
+/// worker with the fewest in-flight tasks, naturally balancing load across
+/// workers with different speeds or task durations.
 ///
 /// Workers are NOT automatically discovered — they must be explicitly registered
 /// via [`CoordinatorHandle::register_worker`]. Rebar's SWIM gossip protocol can
@@ -271,6 +277,7 @@ pub async fn start_coordinator(
         Arc::new(crate::router::LocalRouter::new(Arc::clone(runtime.table())));
 
     let table_for_spawn = Arc::clone(runtime.table());
+    let coord_tx = tx.clone();
 
     let pid = runtime
         .spawn(move |_ctx| async move {
@@ -278,14 +285,9 @@ pub async fn start_coordinator(
             let mut state = CoordState {
                 workers: Vec::new(),
                 next_id: 0,
-                round_robin_idx: 0,
                 max_workers: spec.max_workers,
                 router,
             };
-
-            // Reserved for future use: tracking in-flight tasks
-            let pending: HashMap<ProcessId, oneshot::Sender<Result<rmpv::Value, CoordinatorError>>> =
-                HashMap::new();
 
             while let Some(msg) = rx.recv().await {
                 match msg {
@@ -305,12 +307,14 @@ pub async fn start_coordinator(
                     CoordMsg::ListWorkers { reply } => {
                         let _ = reply.send(state.workers.clone());
                     }
+                    CoordMsg::TaskComplete { worker_pid } => {
+                        state.complete_task(worker_pid);
+                    }
                     CoordMsg::Submit {
                         task,
                         reply,
                         timeout,
                     } => {
-                        // Try to find a live worker (skip dead ones)
                         let mut attempts = state.workers.len();
                         let mut reply_opt = Some(reply);
 
@@ -319,7 +323,7 @@ pub async fn start_coordinator(
                                 break;
                             };
 
-                            // Create an ephemeral reply collector process
+                            // Create an ephemeral reply collector
                             let (result_tx, result_rx) = oneshot::channel();
                             let reply_pid = runtime_table.allocate_pid();
                             let (mb_tx, mut mb_rx) =
@@ -329,7 +333,7 @@ pub async fn start_coordinator(
                                 crate::process::table::ProcessHandle::new(mb_tx),
                             );
 
-                            // Build the task message for the worker
+                            // Build the task message
                             let task_msg = rmpv::Value::Map(vec![
                                 (rmpv::Value::from("task"), task.clone()),
                                 (
@@ -348,15 +352,17 @@ pub async fn start_coordinator(
                                 .route(ProcessId::new(0, 0), worker_pid, task_msg)
                                 .is_err()
                             {
-                                // Worker is dead — remove it and try next
+                                // Worker is dead — undo in_flight bump, remove, try next
+                                state.complete_task(worker_pid);
                                 state.remove_worker_by_pid(worker_pid);
                                 runtime_table.remove(&reply_pid);
                                 attempts -= 1;
                                 continue;
                             }
 
-                            // Spawn a task to collect the result with timeout
+                            // Spawn collector: wait for result, then notify coordinator
                             let rt_table = Arc::clone(&runtime_table);
+                            let complete_tx = coord_tx.clone();
                             tokio::spawn(async move {
                                 let result =
                                     match tokio::time::timeout(timeout, mb_rx.recv()).await {
@@ -365,6 +371,10 @@ pub async fn start_coordinator(
                                         Err(_) => Err(CoordinatorError::Timeout),
                                     };
                                 rt_table.remove(&reply_pid);
+                                // Decrement in-flight count
+                                let _ = complete_tx
+                                    .send(CoordMsg::TaskComplete { worker_pid })
+                                    .await;
                                 let _ = result_tx.send(result);
                             });
 
@@ -381,7 +391,6 @@ pub async fn start_coordinator(
                             break;
                         }
 
-                        // If we never dispatched, reply with NoWorkers
                         if let Some(reply) = reply_opt {
                             let _ = reply.send(Err(CoordinatorError::NoWorkers));
                         }
@@ -389,9 +398,6 @@ pub async fn start_coordinator(
                     CoordMsg::Shutdown => break,
                 }
             }
-
-            // Cleanup
-            drop(pending);
         })
         .await;
 

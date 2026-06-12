@@ -8,23 +8,35 @@ use super::member::{MembershipList, NodeState};
 
 /// Tracks suspect timers and drives the SWIM failure-detection state machine.
 pub struct FailureDetector {
-    /// When each node was first suspected. Key = node_id.
+    /// When each node was first suspected. Key = `node_id`.
     suspect_timers: HashMap<u64, Instant>,
-    /// When each dead node was declared dead. Key = node_id.
+    /// When each dead node was declared dead. Key = `node_id`.
     dead_timers: HashMap<u64, Instant>,
+    /// Number of consecutive failed probe attempts (direct + indirect) per
+    /// target since the last successful ack. Key = `node_id`.
+    failed_probes: HashMap<u64, usize>,
+}
+
+impl Default for FailureDetector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FailureDetector {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             suspect_timers: HashMap::new(),
             dead_timers: HashMap::new(),
+            failed_probes: HashMap::new(),
         }
     }
 
     /// Select a random alive/suspect member to probe.
     /// Returns `None` if no targets are available.
     /// `self_id` is the local node's id and is excluded from selection.
+    #[must_use]
     pub fn tick(&self, members: &MembershipList, self_id: u64) -> Option<u64> {
         let mut rng = rand::rng();
         members
@@ -35,30 +47,55 @@ impl FailureDetector {
     }
 
     /// A node responded to a ping (or indirect ping).
-    /// If it was suspected, move it back to Alive and remove the suspect timer.
+    ///
+    /// This clears the failed-probe counter and the suspect timer. It does NOT
+    /// mutate the remote member's incarnation: in SWIM only the node itself
+    /// bumps its own incarnation, and a healthy node refutes suspicion by
+    /// gossiping its own higher-incarnation `Alive` (see
+    /// `MembershipList::refute_about_self`). The local prober simply stops
+    /// suspecting; the authoritative recovery comes from that gossiped Alive.
     pub fn record_ack(&mut self, members: &mut MembershipList, node_id: u64) {
-        if let Some(member) = members.get_mut(node_id) {
-            if member.state == NodeState::Suspect {
-                member.state = NodeState::Alive;
-                member.incarnation += 1;
-            }
-        }
+        self.failed_probes.remove(&node_id);
         self.suspect_timers.remove(&node_id);
-    }
-
-    /// A node did not respond to a direct ping.
-    /// Mark it suspect and start a timer (if not already suspected).
-    pub fn record_nack(&mut self, members: &mut MembershipList, node_id: u64, now: Instant) {
-        if let Some(member) = members.get_mut(node_id) {
-            if member.state == NodeState::Alive {
-                member.suspect(member.incarnation);
-                self.suspect_timers.entry(node_id).or_insert(now);
-            }
+        // If we had locally suspected the node (and no fresher gossip has
+        // arrived), optimistically restore it to Alive at its current
+        // incarnation without inventing a new one.
+        if let Some(member) = members.get_mut(node_id)
+            && member.state == NodeState::Suspect
+        {
+            member.state = NodeState::Alive;
         }
     }
 
-    /// Check all suspect timers against the config's suspect_timeout.
-    /// Returns the list of node_ids that have been newly declared dead.
+    /// A probe to a node failed (direct or indirect).
+    ///
+    /// The Alive -> Suspect transition is gated on indirect probes having also
+    /// failed: a single missed direct ping is not enough. We only mark Suspect
+    /// after the direct probe plus `indirect_probe_count` indirect probes have
+    /// all failed (i.e. `1 + indirect_probe_count` total failures).
+    pub fn record_nack(
+        &mut self,
+        members: &mut MembershipList,
+        node_id: u64,
+        config: &SwimConfig,
+        now: Instant,
+    ) {
+        let attempts = self.failed_probes.entry(node_id).or_insert(0);
+        *attempts = attempts.saturating_add(1);
+        let required = 1 + config.indirect_probe_count;
+        if *attempts < required {
+            return;
+        }
+        if let Some(member) = members.get_mut(node_id)
+            && member.state == NodeState::Alive
+        {
+            member.suspect(member.incarnation);
+            self.suspect_timers.entry(node_id).or_insert(now);
+        }
+    }
+
+    /// Check all suspect timers against the config's `suspect_timeout`.
+    /// Returns the list of `node_ids` that have been newly declared dead.
     pub fn check_suspect_timeouts(
         &mut self,
         members: &mut MembershipList,
@@ -78,7 +115,11 @@ impl FailureDetector {
 
         for node_id in expired {
             self.suspect_timers.remove(&node_id);
-            members.mark_dead(node_id);
+            self.failed_probes.remove(&node_id);
+            // Declare dead at the incarnation we suspected, respecting
+            // incarnation rules so a refuting higher-incarnation Alive wins.
+            let incarnation = members.get(node_id).map_or(0, |m| m.incarnation);
+            members.mark_dead(node_id, incarnation);
             self.dead_timers.insert(node_id, now);
             newly_dead.push(node_id);
         }
@@ -87,7 +128,7 @@ impl FailureDetector {
     }
 
     /// Remove dead nodes whose removal delay has elapsed.
-    /// Returns the list of removed node_ids.
+    /// Returns the list of removed `node_ids`.
     pub fn remove_expired_dead(
         &mut self,
         members: &mut MembershipList,
@@ -106,10 +147,10 @@ impl FailureDetector {
         for node_id in expired {
             self.dead_timers.remove(&node_id);
             // Remove only this specific node from the membership list.
-            if let Some(m) = members.get(node_id) {
-                if m.state == NodeState::Dead {
-                    removed.push(node_id);
-                }
+            if let Some(m) = members.get(node_id)
+                && m.state == NodeState::Dead
+            {
+                removed.push(node_id);
             }
         }
 
@@ -122,7 +163,8 @@ impl FailureDetector {
     }
 
     /// Returns suspect timer map (for testing / diagnostics).
-    pub fn suspect_timers(&self) -> &HashMap<u64, Instant> {
+    #[must_use]
+    pub const fn suspect_timers(&self) -> &HashMap<u64, Instant> {
         &self.suspect_timers
     }
 }
@@ -134,11 +176,30 @@ mod tests {
     use std::time::Duration;
 
     fn addr(port: u16) -> std::net::SocketAddr {
-        format!("127.0.0.1:{}", port).parse().unwrap()
+        format!("127.0.0.1:{port}").parse().unwrap()
     }
 
     fn default_config() -> SwimConfig {
         SwimConfig::default()
+    }
+
+    /// A config with no indirect probes, so a single direct failure suspects.
+    fn no_indirect_config() -> SwimConfig {
+        SwimConfig::builder().indirect_probe_count(0).build()
+    }
+
+    /// Drive a node to Suspect under the given config by exhausting all
+    /// direct + indirect probe attempts.
+    fn suspect_now(
+        detector: &mut FailureDetector,
+        members: &mut MembershipList,
+        node_id: u64,
+        config: &SwimConfig,
+        now: Instant,
+    ) {
+        for _ in 0..=config.indirect_probe_count {
+            detector.record_nack(members, node_id, config, now);
+        }
     }
 
     #[test]
@@ -160,11 +221,54 @@ mod tests {
         members.add(Member::new(1, addr(4001)));
         let mut detector = FailureDetector::new();
         let now = Instant::now();
+        let config = no_indirect_config();
 
-        detector.record_nack(&mut members, 1, now);
+        detector.record_nack(&mut members, 1, &config, now);
 
         assert_eq!(members.get(1).unwrap().state, NodeState::Suspect);
         assert!(detector.suspect_timers().contains_key(&1));
+    }
+
+    #[test]
+    fn single_missed_direct_ping_does_not_suspect() {
+        let mut members = MembershipList::new();
+        members.add(Member::new(1, addr(4001)));
+        let mut detector = FailureDetector::new();
+        let now = Instant::now();
+        let config = default_config(); // indirect_probe_count = 3
+
+        // One direct miss must NOT mark suspect; indirect probes still pending.
+        detector.record_nack(&mut members, 1, &config, now);
+        assert_eq!(members.get(1).unwrap().state, NodeState::Alive);
+        assert!(detector.suspect_timers().is_empty());
+
+        // Two more misses (still short of 1 + 3 = 4 required).
+        detector.record_nack(&mut members, 1, &config, now);
+        detector.record_nack(&mut members, 1, &config, now);
+        assert_eq!(members.get(1).unwrap().state, NodeState::Alive);
+
+        // Fourth failure (direct + 3 indirect) crosses the threshold.
+        detector.record_nack(&mut members, 1, &config, now);
+        assert_eq!(members.get(1).unwrap().state, NodeState::Suspect);
+        assert!(detector.suspect_timers().contains_key(&1));
+    }
+
+    #[test]
+    fn ack_before_indirect_threshold_keeps_alive() {
+        let mut members = MembershipList::new();
+        members.add(Member::new(1, addr(4001)));
+        let mut detector = FailureDetector::new();
+        let now = Instant::now();
+        let config = default_config();
+
+        // Direct miss, then an indirect probe succeeds.
+        detector.record_nack(&mut members, 1, &config, now);
+        detector.record_ack(&mut members, 1);
+        assert_eq!(members.get(1).unwrap().state, NodeState::Alive);
+
+        // Counter reset: a fresh single miss still doesn't suspect.
+        detector.record_nack(&mut members, 1, &config, now);
+        assert_eq!(members.get(1).unwrap().state, NodeState::Alive);
     }
 
     #[test]
@@ -175,7 +279,7 @@ mod tests {
         let config = default_config(); // suspect_timeout = 5s
 
         let t0 = Instant::now();
-        detector.record_nack(&mut members, 1, t0);
+        suspect_now(&mut detector, &mut members, 1, &config, t0);
         assert_eq!(members.get(1).unwrap().state, NodeState::Suspect);
 
         // Check before timeout -- still suspect
@@ -197,9 +301,10 @@ mod tests {
         members.add(Member::new(1, addr(4001)));
         let mut detector = FailureDetector::new();
         let now = Instant::now();
+        let config = no_indirect_config();
 
         // Miss a ping -> suspect
-        detector.record_nack(&mut members, 1, now);
+        detector.record_nack(&mut members, 1, &config, now);
         assert_eq!(members.get(1).unwrap().state, NodeState::Suspect);
 
         // Node responds (refutes suspicion)
@@ -214,9 +319,10 @@ mod tests {
         members.add(Member::new(1, addr(4001)));
         let mut detector = FailureDetector::new();
         let now = Instant::now();
+        let config = no_indirect_config();
 
         // Direct probe fails
-        detector.record_nack(&mut members, 1, now);
+        detector.record_nack(&mut members, 1, &config, now);
         assert_eq!(members.get(1).unwrap().state, NodeState::Suspect);
 
         // Indirect probe succeeds -> ack
@@ -233,7 +339,7 @@ mod tests {
         let config = default_config();
 
         let t0 = Instant::now();
-        detector.record_nack(&mut members, 1, t0);
+        suspect_now(&mut detector, &mut members, 1, &config, t0);
 
         let t1 = t0 + Duration::from_secs(6);
         let newly_dead = detector.check_suspect_timeouts(&mut members, &config, t1);
@@ -253,8 +359,8 @@ mod tests {
         let config = default_config();
 
         let t0 = Instant::now();
-        detector.record_nack(&mut members, 1, t0);
-        detector.record_nack(&mut members, 2, t0);
+        suspect_now(&mut detector, &mut members, 1, &config, t0);
+        suspect_now(&mut detector, &mut members, 2, &config, t0);
 
         assert_eq!(detector.suspect_timers().len(), 2);
         assert_eq!(members.get(1).unwrap().state, NodeState::Suspect);
@@ -279,10 +385,11 @@ mod tests {
         let config = SwimConfig::builder()
             .suspect_timeout(Duration::from_secs(1))
             .dead_removal_delay(Duration::from_secs(10))
+            .indirect_probe_count(0)
             .build();
 
         let t0 = Instant::now();
-        detector.record_nack(&mut members, 1, t0);
+        detector.record_nack(&mut members, 1, &config, t0);
 
         // Expire suspect -> dead
         let t1 = t0 + Duration::from_secs(2);

@@ -28,7 +28,7 @@ pub type PartitionFactory =
 pub struct PartitionSupervisorHandle {
     pid: ProcessId,
     partitions: usize,
-    partition_pids: Arc<Vec<ProcessId>>,
+    runtime: Arc<Runtime>,
     supervisor: SupervisorHandle,
 }
 
@@ -45,46 +45,81 @@ impl PartitionSupervisorHandle {
         self.partitions
     }
 
-    /// Route an integer key to a partition and return that partition's `ProcessId`.
-    ///
-    /// Uses `key % partitions` for deterministic routing.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `partitions` is zero (which cannot happen when the handle is
-    /// obtained from `start_partition_supervisor`).
+    /// The registered name of the partition at `index`.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn which_partition(&self, key: u64) -> ProcessId {
-        let index = (key as usize) % self.partitions;
-        self.partition_pids[index]
+    fn partition_name(index: usize) -> String {
+        format!("partition_{index}")
     }
 
-    /// Route a hashable key to a partition and return that partition's `ProcessId`.
+    /// Map an integer key to a partition index using `u64` math so the result
+    /// is identical on 32- and 64-bit targets.
+    #[must_use]
+    fn index_for_key(&self, key: u64) -> usize {
+        // `self.partitions` is non-zero (enforced at startup) and fits in u64.
+        usize::try_from(key % self.partitions as u64).unwrap_or(0)
+    }
+
+    /// Route an integer key to a partition index.
+    ///
+    /// Uses `key % partitions` for deterministic routing.
+    #[must_use]
+    pub fn partition_index(&self, key: u64) -> usize {
+        self.index_for_key(key)
+    }
+
+    /// Route an integer key to a partition and return that partition's CURRENT
+    /// `ProcessId`, resolved through the name registry at call time.
+    ///
+    /// Returns `None` only if the partition is momentarily between
+    /// incarnations (no name currently registered).
+    #[must_use]
+    pub fn which_partition(&self, key: u64) -> Option<ProcessId> {
+        let index = self.index_for_key(key);
+        self.runtime.whereis(&Self::partition_name(index))
+    }
+
+    /// Route a hashable key to a partition and return that partition's CURRENT
+    /// `ProcessId`, resolved through the name registry at call time.
     ///
     /// Uses `std::hash::DefaultHasher` to hash the key, then applies
     /// `hash % partitions` for routing.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `partitions` is zero (which cannot happen when the handle is
-    /// obtained from `start_partition_supervisor`).
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn which_partition_by_hash<K: Hash>(&self, key: &K) -> ProcessId {
+    pub fn which_partition_by_hash<K: Hash>(&self, key: &K) -> Option<ProcessId> {
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        let hash = hasher.finish();
-        let index = (hash as usize) % self.partitions;
-        self.partition_pids[index]
+        let index = self.index_for_key(hasher.finish());
+        self.runtime.whereis(&Self::partition_name(index))
     }
 
-    /// Return the `ProcessId` of a specific partition by its zero-based index.
+    /// Return the CURRENT `ProcessId` of a specific partition by its zero-based
+    /// index, resolved through the name registry.
     ///
-    /// Returns `None` if `index >= partitions`.
+    /// Returns `None` if `index >= partitions` or the partition is between
+    /// incarnations.
     #[must_use]
     pub fn partition_pid(&self, index: usize) -> Option<ProcessId> {
-        self.partition_pids.get(index).copied()
+        if index >= self.partitions {
+            return None;
+        }
+        self.runtime.whereis(&Self::partition_name(index))
+    }
+
+    /// Send a message to the partition responsible for `key`, resolving the
+    /// current partition PID by name at send time so it follows restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SendError`](crate::process::SendError) if the partition is
+    /// not currently registered or the send itself fails.
+    pub async fn send_to_partition(
+        &self,
+        key: u64,
+        payload: rmpv::Value,
+    ) -> Result<(), crate::process::SendError> {
+        let index = self.index_for_key(key);
+        self.runtime
+            .send_named(&Self::partition_name(index), payload)
+            .await
     }
 
     /// Shut down the partition supervisor and all its partitions.
@@ -107,7 +142,9 @@ impl PartitionSupervisorHandle {
 ///
 /// # Panics
 ///
-/// Panics if `spec.partitions` is zero.
+/// Panics if `spec.partitions` is zero, or if the underlying supervisor fails
+/// to start a partition child (which only happens if the supervisor process
+/// has already gone away).
 pub async fn start_partition_supervisor(
     runtime: Arc<Runtime>,
     spec: PartitionSupervisorSpec,
@@ -118,21 +155,21 @@ pub async fn start_partition_supervisor(
     let partition_count = spec.partitions;
 
     // Start the underlying supervisor with no initial children.
-    // We add children dynamically via `add_children` so that we get
-    // their `ProcessId` values back for routing.
     let sup_spec = SupervisorSpec::new(spec.strategy)
         .max_restarts(spec.max_restarts)
         .max_seconds(spec.max_seconds);
 
-    let sup_handle = start_supervisor(runtime, sup_spec, Vec::new()).await;
+    let sup_handle = start_supervisor(Arc::clone(&runtime), sup_spec, Vec::new()).await;
     let pid = sup_handle.pid();
 
-    // Build one `ChildEntry` per partition, each capturing its index
+    // Build one `ChildEntry` per partition, each capturing its index and
+    // registered under a stable name ("partition_{i}") so routing resolves to
+    // the CURRENT incarnation's PID after any crash + restart.
     let mut entries = Vec::with_capacity(partition_count);
     for i in 0..partition_count {
         let factory = Arc::clone(&factory);
         entries.push(ChildEntry::new(
-            ChildSpec::new(format!("partition_{i}")),
+            ChildSpec::new(format!("partition_{i}")).registered(),
             move || {
                 let factory = Arc::clone(&factory);
                 async move { factory(i).await }
@@ -141,15 +178,17 @@ pub async fn start_partition_supervisor(
     }
 
     let results = sup_handle.add_children(entries).await;
-    let partition_pids: Vec<ProcessId> = results
-        .into_iter()
-        .map(|r| r.expect("failed to start partition child"))
-        .collect();
+    for result in results {
+        assert!(
+            result.is_ok(),
+            "failed to start partition child: supervisor unavailable",
+        );
+    }
 
     PartitionSupervisorHandle {
         pid,
         partitions: partition_count,
-        partition_pids: Arc::new(partition_pids),
+        runtime,
         supervisor: sup_handle,
     }
 }
@@ -275,9 +314,23 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        // After shutdown the supervisor is gone; verify handle is still usable
-        // (which_partition should still work since it uses cached PIDs)
+        // After shutdown the partitions are gone; routing resolves by name and
+        // should report no current incarnation rather than a stale PID.
         let _ = handle.which_partition(0);
+    }
+
+    /// Wait until partition `index` has registered its name, returning its PID.
+    async fn wait_for_partition(
+        handle: &PartitionSupervisorHandle,
+        index: usize,
+    ) -> ProcessId {
+        for _ in 0..100_000 {
+            if let Some(pid) = handle.partition_pid(index) {
+                return pid;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("partition {index} never registered");
     }
 
     // -----------------------------------------------------------------------
@@ -292,7 +345,7 @@ mod tests {
 
         let mut pids = HashSet::new();
         for i in 0..5 {
-            let pid = handle.partition_pid(i).unwrap();
+            let pid = wait_for_partition(&handle, i).await;
             pids.insert(pid);
         }
         assert_eq!(pids.len(), 5, "all partition PIDs must be unique");
@@ -311,9 +364,11 @@ mod tests {
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
         // Same key always routes to the same partition
+        let _ = wait_for_partition(&handle, handle.partition_index(42)).await;
         let pid1 = handle.which_partition(42);
         let pid2 = handle.which_partition(42);
         let pid3 = handle.which_partition(42);
+        assert!(pid1.is_some());
         assert_eq!(pid1, pid2);
         assert_eq!(pid2, pid3);
 
@@ -330,10 +385,13 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(4);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
+        for i in 0..4 {
+            let _ = wait_for_partition(&handle, i).await;
+        }
         let mut hit_pids = HashSet::new();
         // Keys 0..4 should each hit a different partition with 4 partitions
         for key in 0..4u64 {
-            hit_pids.insert(handle.which_partition(key));
+            hit_pids.insert(handle.which_partition(key).unwrap());
         }
         assert_eq!(
             hit_pids.len(),
@@ -354,9 +412,13 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(4);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
+        for i in 0..4 {
+            let _ = wait_for_partition(&handle, i).await;
+        }
         // Hash-based routing should be deterministic
         let pid1 = handle.which_partition_by_hash(&"user:alice");
         let pid2 = handle.which_partition_by_hash(&"user:alice");
+        assert!(pid1.is_some());
         assert_eq!(pid1, pid2);
 
         // Different keys may hit different partitions
@@ -378,21 +440,24 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(3);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
+        for i in 0..3 {
+            let _ = wait_for_partition(&handle, i).await;
+        }
         // key % 3 == 0 for key=0, key=3, key=6 ...
-        let pid_0 = handle.which_partition(0);
-        let pid_3 = handle.which_partition(3);
-        let pid_6 = handle.which_partition(6);
+        let pid_0 = handle.which_partition(0).unwrap();
+        let pid_3 = handle.which_partition(3).unwrap();
+        let pid_6 = handle.which_partition(6).unwrap();
         assert_eq!(pid_0, pid_3);
         assert_eq!(pid_3, pid_6);
 
         // key % 3 == 1 for key=1, key=4
-        let pid_1 = handle.which_partition(1);
-        let pid_4 = handle.which_partition(4);
+        let pid_1 = handle.which_partition(1).unwrap();
+        let pid_4 = handle.which_partition(4).unwrap();
         assert_eq!(pid_1, pid_4);
 
         // key % 3 == 2 for key=2, key=5
-        let pid_2 = handle.which_partition(2);
-        let pid_5 = handle.which_partition(5);
+        let pid_2 = handle.which_partition(2).unwrap();
+        let pid_5 = handle.which_partition(5).unwrap();
         assert_eq!(pid_2, pid_5);
 
         // Partition 0, 1, 2 should be different
@@ -415,8 +480,8 @@ mod tests {
 
         // partition_pid(i) should match which_partition(i) for i < partitions
         for i in 0..3usize {
-            let by_index = handle.partition_pid(i).unwrap();
-            let by_route = handle.which_partition(i as u64);
+            let by_index = wait_for_partition(&handle, i).await;
+            let by_route = handle.which_partition(i as u64).unwrap();
             assert_eq!(by_index, by_route);
         }
 
@@ -578,9 +643,9 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(1);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
-        let pid = handle.partition_pid(0).unwrap();
+        let pid = wait_for_partition(&handle, 0).await;
         for key in 0..10u64 {
-            assert_eq!(handle.which_partition(key), pid);
+            assert_eq!(handle.which_partition(key), Some(pid));
         }
 
         handle.shutdown();
@@ -596,6 +661,9 @@ mod tests {
         let spec = PartitionSupervisorSpec::new().partitions(2);
         let handle = start_partition_supervisor(rt, spec, factory).await;
 
+        for i in 0..2 {
+            let _ = wait_for_partition(&handle, i).await;
+        }
         let cloned = handle.clone();
         assert_eq!(handle.pid(), cloned.pid());
         assert_eq!(handle.partitions(), cloned.partitions());
@@ -631,7 +699,7 @@ mod tests {
 
         // Supervisor PID should differ from all partition PIDs
         for i in 0..2 {
-            let p = handle.partition_pid(i).unwrap();
+            let p = wait_for_partition(&handle, i).await;
             assert_ne!(handle.pid(), p);
         }
 
@@ -692,9 +760,79 @@ mod tests {
         // All PIDs should be unique
         let mut pids = HashSet::new();
         for i in 0..20 {
-            pids.insert(handle.partition_pid(i).unwrap());
+            pids.insert(wait_for_partition(&handle, i).await);
         }
         assert_eq!(pids.len(), 20);
+
+        handle.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: a registered partition child is reachable by name after a
+    // crash + restart — routing resolves to the NEW pid, not a stale one.
+    //
+    // Before the fix, partition routing cached the first-incarnation PIDs, so
+    // after partition 0 crashed and restarted, `which_partition` returned a
+    // dead PID forever, black-holing 1/N of the keyspace.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn route_resolves_to_new_pid_after_partition_restart() {
+        let rt = test_runtime();
+        // The test flips this to make partition 0's first incarnation crash
+        // only AFTER we've observed its initial PID, so we can prove the route
+        // follows the restart to a new PID.
+        let should_crash = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let crashed_once = Arc::new(AtomicUsize::new(0));
+        let sc = Arc::clone(&should_crash);
+        let co = Arc::clone(&crashed_once);
+
+        let factory: PartitionFactory = Arc::new(move |index| {
+            let sc = Arc::clone(&sc);
+            let co = Arc::clone(&co);
+            Box::pin(async move {
+                if index == 0 && co.load(Ordering::SeqCst) == 0 {
+                    // First incarnation: wait for the crash signal, then crash.
+                    while !sc.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
+                    }
+                    co.fetch_add(1, Ordering::SeqCst);
+                    ExitReason::Abnormal("partition crash".into())
+                } else {
+                    std::future::pending::<()>().await;
+                    ExitReason::Normal
+                }
+            })
+        });
+
+        let spec = PartitionSupervisorSpec::new()
+            .partitions(3)
+            .max_restarts(10)
+            .max_seconds(5);
+        let handle = start_partition_supervisor(rt, spec, factory).await;
+
+        // Capture the first incarnation's PID for partition 0, THEN trigger
+        // the crash.
+        let first_pid = wait_for_partition(&handle, 0).await;
+        should_crash.store(true, Ordering::SeqCst);
+
+        // Wait until partition 0 has crashed and been restarted under a NEW pid
+        // while keeping its registered name.
+        let mut new_pid = first_pid;
+        for _ in 0..1_000_000 {
+            if let Some(pid) = handle.which_partition(0).filter(|p| *p != first_pid) {
+                new_pid = pid;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_ne!(
+            new_pid, first_pid,
+            "routing must resolve to the restarted partition's NEW pid"
+        );
+        // And both routing paths agree on the live pid.
+        assert_eq!(handle.which_partition(0), Some(new_pid));
+        assert_eq!(handle.partition_pid(0), Some(new_pid));
 
         handle.shutdown();
     }

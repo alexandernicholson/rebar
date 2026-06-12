@@ -3,14 +3,38 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::process::ProcessId;
+use crate::process::table::ProcessTable;
 use crate::router::MessageRouter;
 
 use super::TimerRef;
+
+/// Hard ceiling for any timer duration. `tokio::time::sleep`/`interval`
+/// panic on durations beyond ~2^63 ns; clamp well below that so a bogus
+/// caller value can never crash the timer task.
+const MAX_TIMER: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 30); // ~30 years
+
+/// Clamp a delay/interval into a safe, non-panicking range.
+///
+/// `tokio::time::interval` panics on a zero period, and both APIs panic on
+/// absurdly large durations. We treat zero as 1ns (effectively "as fast as
+/// possible" without panicking) and cap the upper bound.
+fn clamp_duration(d: Duration) -> Duration {
+    if d.is_zero() {
+        Duration::from_nanos(1)
+    } else if d > MAX_TIMER {
+        MAX_TIMER
+    } else {
+        d
+    }
+}
 
 /// Send a message to `dest` after `delay`.
 ///
 /// Equivalent to Erlang's `:timer.send_after/3`.
 /// Returns a [`TimerRef`] that can be used to cancel the timer.
+///
+/// A zero delay is treated as "essentially immediate" and an
+/// absurdly large delay is capped; neither panics the timer task.
 #[must_use]
 pub fn send_after(
     router: Arc<dyn MessageRouter>,
@@ -19,6 +43,7 @@ pub fn send_after(
     payload: rmpv::Value,
     delay: Duration,
 ) -> TimerRef {
+    let delay = clamp_duration(delay);
     let handle = tokio::spawn(async move {
         tokio::time::sleep(delay).await;
         let _ = router.route(from, dest, payload);
@@ -32,7 +57,17 @@ pub fn send_after(
 /// Equivalent to Erlang's `:timer.send_interval/3`.
 /// Returns a [`TimerRef`] that can be used to cancel the interval.
 ///
-/// The interval automatically stops if the destination process is dead.
+/// The interval stops automatically once the **destination** process is
+/// dead (the next `route` fails). For a self-interval (`from == dest`, the
+/// common case via [`ProcessContext::send_interval`]) this correctly stops
+/// when the owning process dies.
+///
+/// Caveat for third-party intervals (`from != dest`): this variant is tied to
+/// the *destination's* lifetime, not the owner's, so it can outlive the owner.
+/// Use [`send_interval_owned`] to bind the timer to the owner's death.
+///
+/// A zero interval is clamped to a minimal non-zero period and an absurdly
+/// large interval is capped, so neither panics the timer task.
 #[must_use]
 pub fn send_interval(
     router: Arc<dyn MessageRouter>,
@@ -41,6 +76,7 @@ pub fn send_interval(
     payload: rmpv::Value,
     interval: Duration,
 ) -> TimerRef {
+    let interval = clamp_duration(interval);
     let handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         tick.tick().await; // skip the immediate first tick
@@ -54,16 +90,63 @@ pub fn send_interval(
     TimerRef::new(handle.abort_handle())
 }
 
+/// Like [`send_interval`], but the timer's lifetime is tied to the owner.
+///
+/// When the owner (`from`) dies, the table's exit hook aborts the interval,
+/// even if the destination is a still-live third party. This closes the
+/// "third-party interval survives owner death" leak by registering an
+/// [`AbortHandle`](tokio::task::AbortHandle) cancelled from the owner's death
+/// cleanup.
+///
+/// A zero interval is clamped to a minimal non-zero period and an absurdly
+/// large interval is capped.
+#[must_use]
+pub fn send_interval_owned(
+    table: &Arc<ProcessTable>,
+    router: Arc<dyn MessageRouter>,
+    from: ProcessId,
+    dest: ProcessId,
+    payload: rmpv::Value,
+    interval: Duration,
+) -> TimerRef {
+    let interval = clamp_duration(interval);
+    let handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.tick().await; // skip the immediate first tick
+        loop {
+            tick.tick().await;
+            if router.route(from, dest, payload.clone()).is_err() {
+                break;
+            }
+        }
+    });
+    let abort = handle.abort_handle();
+    // Abort when the owner dies. `cleanup_process` runs every exit hook, so a
+    // dead owner cancels its interval rather than leaking a task that keeps
+    // firing stale messages at the third party forever.
+    let owner = from;
+    table.add_exit_hook(move |pid| {
+        if pid == owner {
+            abort.abort();
+        }
+    });
+    TimerRef::new(handle.abort_handle())
+}
+
 /// Execute a function after `delay`.
 ///
 /// The function runs in a freshly spawned task.
 /// Equivalent to Erlang's `:timer.apply_after/2`.
+///
+/// A zero delay is treated as essentially immediate and an absurdly large
+/// delay is capped; neither panics the timer task.
 #[must_use]
 pub fn apply_after<F, Fut>(delay: Duration, f: F) -> TimerRef
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let delay = clamp_duration(delay);
     let handle = tokio::spawn(async move {
         tokio::time::sleep(delay).await;
         f().await;
@@ -75,18 +158,29 @@ where
 ///
 /// Each invocation waits for the previous one to complete before scheduling
 /// the next. Equivalent to Erlang's `:timer.apply_repeatedly/2`.
+///
+/// A panic in one invocation is isolated: the offending tick is dropped and
+/// the interval keeps ticking, rather than silently dying on the first panic.
+/// A zero interval is clamped to a minimal non-zero period and an absurdly
+/// large interval is capped.
 #[must_use]
 pub fn apply_interval<F, Fut>(interval_dur: Duration, f: F) -> TimerRef
 where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    let interval_dur = clamp_duration(interval_dur);
     let handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval_dur);
         tick.tick().await; // skip immediate first tick
         loop {
             tick.tick().await;
-            f().await;
+            // Run each invocation in its own task so a panic is contained:
+            // a `JoinError` (panicked tick) is observed and ignored, and the
+            // interval continues firing instead of dying silently.
+            let fut = f();
+            let inv = tokio::spawn(fut);
+            let _ = inv.await;
         }
     });
     TimerRef::new(handle.abort_handle())
@@ -329,6 +423,108 @@ mod tests {
             count_after <= count_at_cancel + 1,
             "should stop after cancel"
         );
+    }
+
+    #[tokio::test]
+    async fn send_interval_owned_stops_when_owner_dies() {
+        // Owner (third party) and a separate live destination.
+        let table = Arc::new(ProcessTable::new(1));
+        let owner_pid = table.allocate_pid();
+        let (owner_tx, _owner_rx) = Mailbox::unbounded();
+        table.insert(owner_pid, ProcessHandle::new(owner_tx));
+
+        let dest_pid = table.allocate_pid();
+        let (dest_tx, mut dest_rx) = Mailbox::unbounded();
+        table.insert(dest_pid, ProcessHandle::new(dest_tx));
+
+        let router: Arc<dyn MessageRouter> = Arc::new(LocalRouter::new(Arc::clone(&table)));
+
+        let timer = send_interval_owned(
+            &table,
+            router,
+            owner_pid,
+            dest_pid,
+            rmpv::Value::String("tick".into()),
+            Duration::from_millis(20),
+        );
+
+        // Confirm at least one tick is delivered.
+        tokio::time::timeout(Duration::from_secs(1), dest_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Owner dies — the exit hook must abort the interval even though the
+        // destination is still alive.
+        table.cleanup_process(owner_pid);
+
+        // Allow the abort to propagate, then drain.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        while dest_rx.try_recv().is_some() {}
+
+        let result = tokio::time::timeout(Duration::from_millis(150), dest_rx.recv()).await;
+        assert!(result.is_err(), "interval should stop after owner death");
+        assert!(timer.is_finished());
+    }
+
+    #[tokio::test]
+    async fn zero_and_huge_durations_do_not_panic() {
+        let (router, from, dest, mut rx, _table) = setup_router_and_receiver();
+
+        // Zero delay: clamped, still delivers without panicking.
+        let _t = send_after(
+            router.clone(),
+            from,
+            dest,
+            rmpv::Value::Nil,
+            Duration::ZERO,
+        );
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Huge interval: clamped to MAX_TIMER, spawning must not panic.
+        let t = send_interval(
+            router,
+            from,
+            dest,
+            rmpv::Value::Nil,
+            Duration::from_secs(u64::MAX),
+        );
+        // It simply won't fire soon; just confirm it didn't panic on spawn.
+        assert!(!t.is_finished());
+        t.cancel();
+    }
+
+    #[tokio::test]
+    async fn apply_interval_survives_callback_panic() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = counter.clone();
+
+        let timer = apply_interval(Duration::from_millis(20), move || {
+            let c = c.clone();
+            async move {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                // Panic on the first invocation only.
+                assert!(n != 0, "intentional panic on first tick");
+            }
+        });
+
+        // Despite the first tick panicking, later ticks must keep running.
+        for _ in 0..200 {
+            if counter.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            counter.load(Ordering::SeqCst) >= 3,
+            "interval should keep firing after a callback panic"
+        );
+        timer.cancel();
     }
 
     // --- multiple timers ---

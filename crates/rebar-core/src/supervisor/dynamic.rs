@@ -1,10 +1,7 @@
 use std::collections::HashSet;
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
@@ -12,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::process::{ExitReason, ProcessId};
 use crate::runtime::Runtime;
 use crate::supervisor::spec::{ChildSpec, RestartType};
-use crate::supervisor::engine::ChildEntry;
+use crate::supervisor::engine::{ChildEntry, ChildFactory};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -191,19 +188,19 @@ enum DynSupervisorMsg {
     Shutdown,
 }
 
-/// Per-child state tracked by the supervisor.
+/// Per-child state tracked by the supervisor, keyed by a stable id so a
+/// restarted child (new PID) is still addressable.
 struct DynChildState {
     id: String,
     spec: ChildSpec,
     factory: ChildFactory,
     pid: ProcessId,
     active: bool,
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Abort handle for the inner child task (force-kill on terminate/shutdown).
+    abort: Option<tokio::task::AbortHandle>,
+    /// Fires when the child task has fully terminated.
+    done_rx: Option<oneshot::Receiver<()>>,
 }
-
-/// Factory type matching the one in engine.rs but re-used here.
-type ChildFactory =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ExitReason> + Send>> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -216,10 +213,11 @@ pub async fn start_dynamic_supervisor(
 ) -> DynamicSupervisorHandle {
     let (msg_tx, msg_rx) = mpsc::unbounded_channel();
     let msg_tx_clone = msg_tx.clone();
+    let runtime_clone = Arc::clone(&runtime);
 
     let pid = runtime
         .spawn(move |_ctx| async move {
-            dynamic_supervisor_loop(spec, msg_rx, msg_tx_clone).await;
+            dynamic_supervisor_loop(runtime_clone, spec, msg_rx, msg_tx_clone).await;
         })
         .await;
 
@@ -230,14 +228,38 @@ pub async fn start_dynamic_supervisor(
 // Supervisor event loop
 // ---------------------------------------------------------------------------
 
+/// Mutable state owned by the dynamic supervisor loop.
+///
+/// Children are keyed by their stable id; `pid_to_id` resolves the current
+/// incarnation's PID (used by the public PID-based API) to that id, and is
+/// updated on every (re)start so a restarted child stays addressable.
+struct DynSupervisorState {
+    spec: DynamicSupervisorSpec,
+    children: HashMap<String, DynChildState>,
+    pid_to_id: HashMap<ProcessId, String>,
+    restart_times: VecDeque<Instant>,
+    /// Ids whose current incarnation was deliberately terminated, so the
+    /// resulting `ChildExited` is not treated as a crash to restart.
+    terminated_ids: HashSet<String>,
+    /// Monotonic counter for minting unique internal keys (the user-facing
+    /// spec id need not be unique across children).
+    next_uid: u64,
+}
+
 async fn dynamic_supervisor_loop(
+    runtime: Arc<Runtime>,
     spec: DynamicSupervisorSpec,
     mut msg_rx: mpsc::UnboundedReceiver<DynSupervisorMsg>,
     msg_tx: mpsc::UnboundedSender<DynSupervisorMsg>,
 ) {
-    let mut children: HashMap<ProcessId, DynChildState> = HashMap::new();
-    let mut restart_times: VecDeque<Instant> = VecDeque::new();
-    let mut terminated_pids: HashSet<ProcessId> = HashSet::new();
+    let mut state = DynSupervisorState {
+        spec,
+        children: HashMap::new(),
+        pid_to_id: HashMap::new(),
+        restart_times: VecDeque::new(),
+        terminated_ids: HashSet::new(),
+        next_uid: 0,
+    };
 
     loop {
         let Some(msg) = msg_rx.recv().await else {
@@ -246,26 +268,15 @@ async fn dynamic_supervisor_loop(
 
         match msg {
             DynSupervisorMsg::StartChild { entry, reply } => {
-                let (pid, shutdown_tx) = start_dyn_child(&entry, &msg_tx);
-                let state = DynChildState {
-                    id: entry.spec.id.clone(),
-                    spec: entry.spec,
-                    factory: entry.factory,
-                    pid,
-                    active: true,
-                    shutdown_tx: Some(shutdown_tx),
-                };
-                children.insert(pid, state);
+                let pid = state.start_child(&runtime, entry, &msg_tx).await;
                 let _ = reply.send(Ok(pid));
             }
 
             DynSupervisorMsg::TerminateChild { pid, reply } => {
-                if let Some(child) = children.get_mut(&pid) {
-                    // Mark as deliberately terminated so ChildExited won't restart
-                    terminated_pids.insert(pid);
-                    // Signal shutdown by dropping the sender
-                    child.shutdown_tx.take();
-                    child.active = false;
+                if let Some(key) = state.pid_to_id.get(&pid).cloned() {
+                    // Mark as deliberately terminated so ChildExited won't restart.
+                    state.terminated_ids.insert(key.clone());
+                    state.stop_child_by_key(&key).await;
                     let _ = reply.send(Ok(()));
                 } else {
                     let _ = reply.send(Err("child not found".to_string()));
@@ -273,11 +284,13 @@ async fn dynamic_supervisor_loop(
             }
 
             DynSupervisorMsg::RemoveChild { pid, reply } => {
-                if let Some(child) = children.get(&pid) {
-                    if child.active {
+                if let Some(key) = state.pid_to_id.get(&pid).cloned() {
+                    if state.children.get(&key).is_some_and(|c| c.active) {
                         let _ = reply.send(Err("child still running".to_string()));
                     } else {
-                        children.remove(&pid);
+                        state.children.remove(&key);
+                        state.pid_to_id.remove(&pid);
+                        state.terminated_ids.remove(&key);
                         let _ = reply.send(Ok(()));
                     }
                 } else {
@@ -286,7 +299,8 @@ async fn dynamic_supervisor_loop(
             }
 
             DynSupervisorMsg::WhichChildren { reply } => {
-                let infos: Vec<DynChildInfo> = children
+                let infos: Vec<DynChildInfo> = state
+                    .children
                     .values()
                     .map(|c| DynChildInfo {
                         id: c.id.clone(),
@@ -298,33 +312,22 @@ async fn dynamic_supervisor_loop(
             }
 
             DynSupervisorMsg::CountChildren { reply } => {
-                let active = children.values().filter(|c| c.active).count();
-                let specs = children.len();
+                let active = state.children.values().filter(|c| c.active).count();
+                let specs = state.children.len();
                 let _ = reply.send(DynChildCounts { active, specs });
             }
 
             DynSupervisorMsg::ChildExited { pid, reason } => {
-                if handle_dyn_child_exit(
-                    pid,
-                    &reason,
-                    &mut children,
-                    &mut terminated_pids,
-                    &mut restart_times,
-                    &spec,
-                    &msg_tx,
-                ) {
+                if state
+                    .handle_child_exit(&runtime, pid, &reason, &msg_tx)
+                    .await
+                {
                     break;
                 }
             }
 
             DynSupervisorMsg::Shutdown => {
-                // Terminate all active children
-                for child in children.values_mut() {
-                    if child.active {
-                        child.shutdown_tx.take();
-                        child.active = false;
-                    }
-                }
+                state.shutdown_all_children().await;
                 break;
             }
         }
@@ -335,97 +338,212 @@ async fn dynamic_supervisor_loop(
 // Child spawning helpers
 // ---------------------------------------------------------------------------
 
-static DYN_CHILD_COUNTER: AtomicU64 = AtomicU64::new(2_000_000);
+/// Resources returned for a freshly spawned child: its routable PID, an abort
+/// handle for force-killing the inner task, and a oneshot that fires when the
+/// task has fully terminated.
+type SpawnedChild = (ProcessId, tokio::task::AbortHandle, oneshot::Receiver<()>);
 
-/// Spawn a child from a `ChildEntry`, returning `(pid, shutdown_tx)`.
-fn start_dyn_child(
+/// Spawn a child from a `ChildEntry` as a real runtime process.
+///
+/// The PID is routable; if the spec requests registration, the spec id is
+/// (re-)registered to the new incarnation.
+async fn start_dyn_child(
+    runtime: &Arc<Runtime>,
     entry: &ChildEntry,
     msg_tx: &mpsc::UnboundedSender<DynSupervisorMsg>,
-) -> (ProcessId, oneshot::Sender<()>) {
-    start_dyn_child_from_factory(&entry.factory, msg_tx)
+) -> SpawnedChild {
+    let register_name = entry.spec.register.then(|| entry.spec.id.clone());
+    start_dyn_child_from_factory(runtime, &entry.factory, register_name, msg_tx).await
 }
 
-/// Spawn a child task using a factory. Returns `(pid, shutdown_tx)`.
-fn start_dyn_child_from_factory(
+/// Spawn a child process using a factory.
+async fn start_dyn_child_from_factory(
+    runtime: &Arc<Runtime>,
     factory: &ChildFactory,
+    register_name: Option<String>,
     msg_tx: &mpsc::UnboundedSender<DynSupervisorMsg>,
-) -> (ProcessId, oneshot::Sender<()>) {
-    let local_id = DYN_CHILD_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = ProcessId::new(1, local_id);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let future = factory();
+) -> SpawnedChild {
+    let (abort_tx, abort_rx) = oneshot::channel::<tokio::task::AbortHandle>();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let factory = Arc::clone(factory);
     let msg_tx = msg_tx.clone();
-    let child_pid = pid;
+    let table = Arc::clone(runtime.table());
 
-    tokio::spawn(async move {
-        let reason = tokio::select! {
-            reason = future => reason,
-            _ = shutdown_rx => ExitReason::Normal,
-        };
-        let _ = msg_tx.send(DynSupervisorMsg::ChildExited {
-            pid: child_pid,
-            reason,
-        });
-    });
+    let pid = runtime
+        .spawn(move |ctx| async move {
+            let self_pid = ctx.self_pid();
+            if let Some(name) = register_name {
+                let _ = table.reregister(name, self_pid);
+            }
+            let future = factory(ctx);
 
-    (pid, shutdown_tx)
+            // Inner task so a panic becomes a JoinError instead of unwinding
+            // (and skipping) the ChildExited send — a Permanent child that
+            // panics IS restarted.
+            let inner = tokio::spawn(future);
+            let _ = abort_tx.send(inner.abort_handle());
+
+            let reason = match inner.await {
+                Ok(reason) => reason,
+                Err(join_err) if join_err.is_cancelled() => ExitReason::Normal,
+                Err(_) => ExitReason::Abnormal("panic".into()),
+            };
+
+            let _ = done_tx.send(());
+            let _ = msg_tx.send(DynSupervisorMsg::ChildExited {
+                pid: self_pid,
+                reason,
+            });
+        })
+        .await;
+
+    // The abort handle is always sent before the inner task is awaited.
+    let abort = abort_rx
+        .await
+        .unwrap_or_else(|_| tokio::spawn(std::future::ready(())).abort_handle());
+    (pid, abort, done_rx)
 }
 
-/// Handle a child exit event. Returns `true` if the supervisor should stop.
-fn handle_dyn_child_exit(
-    pid: ProcessId,
-    reason: &ExitReason,
-    children: &mut HashMap<ProcessId, DynChildState>,
-    terminated_pids: &mut HashSet<ProcessId>,
-    restart_times: &mut VecDeque<Instant>,
-    spec: &DynamicSupervisorSpec,
-    msg_tx: &mpsc::UnboundedSender<DynSupervisorMsg>,
-) -> bool {
-    if terminated_pids.remove(&pid) {
-        return false;
+impl DynSupervisorState {
+    /// Spawn a new child, tracking it under a fresh stable key. Returns the
+    /// new incarnation's PID.
+    async fn start_child(
+        &mut self,
+        runtime: &Arc<Runtime>,
+        entry: ChildEntry,
+        msg_tx: &mpsc::UnboundedSender<DynSupervisorMsg>,
+    ) -> ProcessId {
+        let key = format!("{}#{}", entry.spec.id, self.next_uid);
+        self.next_uid += 1;
+        let (pid, abort, done_rx) = start_dyn_child(runtime, &entry, msg_tx).await;
+        let child_state = DynChildState {
+            id: entry.spec.id.clone(),
+            spec: entry.spec,
+            factory: entry.factory,
+            pid,
+            active: true,
+            abort: Some(abort),
+            done_rx: Some(done_rx),
+        };
+        self.children.insert(key.clone(), child_state);
+        self.pid_to_id.insert(pid, key);
+        pid
     }
 
-    let Some(child) = children.get(&pid) else {
-        return false;
-    };
-
-    let should_restart = child.spec.restart.should_restart(reason);
-    let is_temporary = matches!(child.spec.restart, RestartType::Temporary);
-
-    if is_temporary {
-        children.remove(&pid);
-        return false;
+    /// Abort the child stored under `key` and await its actual termination,
+    /// marking it inactive. No-op if the key is unknown.
+    async fn stop_child_by_key(&mut self, key: &str) {
+        if let Some(child) = self.children.get_mut(key) {
+            let done_rx = child.done_rx.take();
+            if let Some(abort) = child.abort.take() {
+                abort.abort();
+            }
+            child.active = false;
+            if let Some(done_rx) = done_rx {
+                let _ = done_rx.await;
+            }
+        }
     }
 
-    if should_restart {
-        if !check_restart_limit(restart_times, spec.max_restarts, spec.max_seconds) {
-            return true;
+    /// Terminate every active child, awaiting termination so none outlive the
+    /// supervisor as orphan tasks.
+    async fn shutdown_all_children(&mut self) {
+        let active_keys: Vec<String> = self
+            .children
+            .iter()
+            .filter(|(_, c)| c.active)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in active_keys {
+            self.stop_child_by_key(&key).await;
+        }
+    }
+
+    /// Handle a child exit event. Returns `true` if the supervisor should stop.
+    async fn handle_child_exit(
+        &mut self,
+        runtime: &Arc<Runtime>,
+        pid: ProcessId,
+        reason: &ExitReason,
+        msg_tx: &mpsc::UnboundedSender<DynSupervisorMsg>,
+    ) -> bool {
+        // Resolve the stable key for this incarnation. The PID mapping is kept
+        // until the entry is fully removed (so a PID-based `remove_child` after
+        // termination still resolves); a restart replaces it with the new PID.
+        let Some(key) = self.pid_to_id.get(&pid).cloned() else {
+            return false;
+        };
+
+        // Deliberately terminated: keep the (now inactive) spec so the caller
+        // can still `remove_child`, but never restart it.
+        if self.terminated_ids.remove(&key) {
+            if let Some(child) = self.children.get_mut(&key) {
+                child.active = false;
+                child.abort = None;
+                child.done_rx = None;
+            }
+            return false;
         }
 
-        let factory = children.get(&pid).unwrap().factory.clone();
-        let old_spec = children.get(&pid).unwrap().spec.clone();
-        let old_id = children.get(&pid).unwrap().id.clone();
-        children.remove(&pid);
+        let Some(child) = self.children.get(&key) else {
+            return false;
+        };
 
-        let entry = ChildEntry {
-            spec: old_spec.clone(),
-            factory: factory.clone(),
-        };
-        let (new_pid, shutdown_tx) = start_dyn_child(&entry, msg_tx);
-        let new_state = DynChildState {
-            id: old_id,
-            spec: old_spec,
-            factory,
-            pid: new_pid,
-            active: true,
-            shutdown_tx: Some(shutdown_tx),
-        };
-        children.insert(new_pid, new_state);
-    } else if let Some(child) = children.get_mut(&pid) {
-        child.active = false;
-        child.shutdown_tx.take();
+        let should_restart = child.spec.restart.should_restart(reason);
+        let is_temporary = matches!(child.spec.restart, RestartType::Temporary);
+
+        if is_temporary {
+            // Temporary children are never restarted and never accumulate.
+            self.children.remove(&key);
+            self.pid_to_id.remove(&pid);
+            return false;
+        }
+
+        if should_restart {
+            if !check_restart_limit(
+                &mut self.restart_times,
+                self.spec.max_restarts,
+                self.spec.max_seconds,
+            ) {
+                return true;
+            }
+
+            self.pid_to_id.remove(&pid);
+            let Some(old_child) = self.children.remove(&key) else {
+                return false;
+            };
+            let DynChildState {
+                id: old_id,
+                spec: old_spec,
+                factory,
+                ..
+            } = old_child;
+
+            let entry = ChildEntry {
+                spec: old_spec.clone(),
+                factory: factory.clone(),
+            };
+            let (new_pid, abort, done_rx) = start_dyn_child(runtime, &entry, msg_tx).await;
+            let new_state = DynChildState {
+                id: old_id,
+                spec: old_spec,
+                factory,
+                pid: new_pid,
+                active: true,
+                abort: Some(abort),
+                done_rx: Some(done_rx),
+            };
+            self.children.insert(key.clone(), new_state);
+            self.pid_to_id.insert(new_pid, key);
+        } else if let Some(child) = self.children.get_mut(&key) {
+            // Transient child that exited normally: keep the spec (so it can be
+            // removed by the caller) but mark inactive and release the handles.
+            child.active = false;
+            child.abort = None;
+            child.done_rx = None;
+        }
+        false
     }
-    false
 }
 
 /// Sliding window restart limiter: returns `true` if a restart is allowed.
@@ -473,11 +591,7 @@ mod tests {
     fn long_running_factory() -> ChildEntry {
         ChildEntry::new(ChildSpec::new("worker"), || async {
             // Run until cancelled via shutdown_rx (which our spawn wrapper handles)
-            loop {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
-            }
-            #[allow(unreachable_code)]
-            ExitReason::Normal
+            std::future::pending::<ExitReason>().await
         })
     }
 
@@ -490,7 +604,7 @@ mod tests {
         let counter_clone = StdArc::clone(counter);
         ChildEntry {
             spec,
-            factory: Arc::new(move || {
+            factory: Arc::new(move |_ctx| {
                 let c = counter_clone.clone();
                 Box::pin(async move {
                     c.fetch_add(1, AtomOrd::SeqCst);
@@ -655,6 +769,71 @@ mod tests {
 
         let cloned = handle.clone();
         assert_eq!(handle.pid(), cloned.pid());
+
+        handle.shutdown();
+    }
+
+    /// Regression: a Permanent child that PANICS (rather than returning an
+    /// `ExitReason`) must still be restarted. Before the fix the panic unwound
+    /// the spawn body and skipped the `ChildExited` send.
+    #[tokio::test]
+    async fn panicking_permanent_child_is_restarted() {
+        let rt = make_runtime();
+        let spec = DynamicSupervisorSpec::new().max_restarts(10).max_seconds(5);
+        let handle = start_dynamic_supervisor(rt, spec).await;
+
+        let counter = StdArc::new(AtomicUsize::new(0));
+        let counter_clone = StdArc::clone(&counter);
+        let entry = ChildEntry {
+            spec: ChildSpec::new("panicker").restart(RestartType::Permanent),
+            factory: Arc::new(move |_ctx| {
+                let c = StdArc::clone(&counter_clone);
+                Box::pin(async move {
+                    c.fetch_add(1, AtomOrd::SeqCst);
+                    panic!("boom");
+                })
+            }),
+        };
+        let _ = handle.start_child(entry).await.unwrap();
+
+        for _ in 0..1_000_000 {
+            if counter.load(AtomOrd::SeqCst) >= 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            counter.load(AtomOrd::SeqCst) >= 3,
+            "panicking permanent child must be restarted, got {}",
+            counter.load(AtomOrd::SeqCst)
+        );
+
+        handle.shutdown();
+    }
+
+    /// Regression: a restarted child (new PID) accumulates no leaked spec
+    /// entries — `count_children().specs` stays bounded across many restarts.
+    #[tokio::test]
+    async fn restarted_child_does_not_leak_specs() {
+        let rt = make_runtime();
+        let spec = DynamicSupervisorSpec::new().max_restarts(100).max_seconds(60);
+        let handle = start_dynamic_supervisor(rt, spec).await;
+
+        let counter = StdArc::new(AtomicUsize::new(0));
+        let entry = crashing_factory(&counter, RestartType::Permanent);
+        let _ = handle.start_child(entry).await.unwrap();
+
+        for _ in 0..1_000_000 {
+            if counter.load(AtomOrd::SeqCst) >= 5 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // Despite many restarts, exactly one spec should be tracked.
+        let counts = handle.count_children().await.unwrap();
+        assert_eq!(counts.specs, 1, "restarts must not accumulate child specs");
 
         handle.shutdown();
     }

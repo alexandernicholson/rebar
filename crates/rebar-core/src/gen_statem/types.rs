@@ -213,6 +213,25 @@ pub trait GenStatem: Send + Sync + 'static {
     /// Returns a `String` describing the initialization failure.
     async fn init(&self) -> Result<(Self::State, Self::Data), String>;
 
+    /// Encode a synchronous call payload into the `rmpv::Value` event passed
+    /// to [`handle_event`](Self::handle_event).
+    ///
+    /// The default implementation returns `Nil`. Override it to make the call
+    /// content visible to `handle_event` (the typed `reply_tx` is still
+    /// delivered separately via [`EventType::Call`]).
+    fn encode_call(&self, _msg: &Self::Call) -> rmpv::Value {
+        rmpv::Value::Nil
+    }
+
+    /// Encode an asynchronous cast payload into the `rmpv::Value` event passed
+    /// to [`handle_event`](Self::handle_event).
+    ///
+    /// The default implementation returns `Nil`. Override it to make the cast
+    /// content visible to `handle_event`.
+    fn encode_cast(&self, _msg: &Self::Cast) -> rmpv::Value {
+        rmpv::Value::Nil
+    }
+
     /// Handle all events. Dispatched based on the current state and event type.
     async fn handle_event(
         &self,

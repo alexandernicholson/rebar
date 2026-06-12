@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use rebar_core::process::ProcessId;
 use uuid::Uuid;
@@ -20,25 +20,158 @@ pub enum RegistryDelta {
     Remove { name: String, tag: Uuid },
 }
 
+/// A detected name conflict.
+///
+/// Two live registrations for the same name (from different tags/nodes)
+/// survived a merge. The integration layer is expected to act on these
+/// (e.g. terminate the losing process / alert).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameConflict {
+    pub name: String,
+    /// The registration that `lookup` resolves to (deterministic LWW winner).
+    pub winner: RegistryEntry,
+    /// The registration that lost but is still a live process elsewhere.
+    pub loser: RegistryEntry,
+}
+
 /// An OR-Set CRDT-based global process name registry.
 ///
 /// Each registration gets a unique tag (UUID v4). Conflict resolution uses
 /// Last-Writer-Wins (LWW) based on timestamp, with deterministic tiebreaker
-/// on node_id (higher node_id wins).
+/// on `node_id` (higher `node_id` wins).
 ///
 /// Tombstoned tags cannot be re-added, preventing resurrection after merge.
 pub struct Registry {
     entries: HashMap<String, Vec<RegistryEntry>>,
-    tombstones: HashSet<Uuid>,
+    /// Tombstoned tags. We keep the name the tag was removed under (when known)
+    /// so a full-sync `Remove` can reap the live entry regardless of which name
+    /// it currently lives under, and a monotonically increasing generation so
+    /// stable tombstones can be expired (bounding growth).
+    tombstones: HashMap<Uuid, Tombstone>,
+    /// Monotonic generation counter assigned to each new tombstone.
+    tombstone_gen: u64,
+    /// Hard cap on the number of tombstones retained. Oldest are evicted when
+    /// exceeded (their tags can no longer be resurrected only if the cluster
+    /// has converged, hence callers should also use `expire_tombstones`).
+    max_tombstones: usize,
+    /// Same-name split-brain conflicts detected on merge, awaiting resolution
+    /// by the integration layer.
+    conflicts: Vec<NameConflict>,
+}
+
+/// Default cap on retained tombstones, bounding memory under churn.
+const DEFAULT_MAX_TOMBSTONES: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Tombstone {
+    /// The name this tag was registered under, if known. Empty for tombstones
+    /// learned via full-sync where the originating name was lost.
+    name: String,
+    /// Generation at which this tombstone was created.
+    generation: u64,
 }
 
 impl Registry {
     /// Create a new empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            tombstones: HashSet::new(),
+            tombstones: HashMap::new(),
+            tombstone_gen: 0,
+            max_tombstones: DEFAULT_MAX_TOMBSTONES,
+            conflicts: Vec::new(),
         }
+    }
+
+    const fn next_gen(&mut self) -> u64 {
+        self.tombstone_gen = self.tombstone_gen.saturating_add(1);
+        self.tombstone_gen
+    }
+
+    /// Insert a tombstone for `tag` removed under `name`, enforcing the cap.
+    fn tombstone(&mut self, tag: Uuid, name: &str) {
+        let generation = self.next_gen();
+        match self.tombstones.get_mut(&tag) {
+            Some(existing) => {
+                // Upgrade an empty (full-sync) name with a known one.
+                if existing.name.is_empty() && !name.is_empty() {
+                    existing.name = name.to_string();
+                }
+            }
+            None => {
+                self.tombstones.insert(
+                    tag,
+                    Tombstone {
+                        name: name.to_string(),
+                        generation,
+                    },
+                );
+            }
+        }
+        self.enforce_tombstone_cap();
+    }
+
+    /// Reap the live entry for `tag` regardless of which name it lives under.
+    /// Returns true if a live entry was removed.
+    fn reap_tag(&mut self, tag: Uuid) -> bool {
+        let mut removed = false;
+        let mut empty_names = Vec::new();
+        for (name, entries) in &mut self.entries {
+            let before = entries.len();
+            entries.retain(|e| e.tag != tag);
+            if entries.len() != before {
+                removed = true;
+            }
+            if entries.is_empty() {
+                empty_names.push(name.clone());
+            }
+        }
+        for name in empty_names {
+            self.entries.remove(&name);
+        }
+        removed
+    }
+
+    fn enforce_tombstone_cap(&mut self) {
+        while self.tombstones.len() > self.max_tombstones {
+            if let Some(&victim) = self
+                .tombstones
+                .iter()
+                .min_by_key(|(_, t)| t.generation)
+                .map(|(tag, _)| tag)
+            {
+                self.tombstones.remove(&victim);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Expire tombstones created at or before `stable_generation`, on the
+    /// premise the caller knows they have propagated to all members (analogous
+    /// to the dead-node removal delay). This bounds tombstone growth.
+    ///
+    /// Returns the number of tombstones expired.
+    pub fn expire_tombstones(&mut self, stable_generation: u64) -> usize {
+        let before = self.tombstones.len();
+        self.tombstones
+            .retain(|_, t| t.generation > stable_generation);
+        before - self.tombstones.len()
+    }
+
+    /// The current tombstone generation watermark. A caller that has gossiped
+    /// all tombstones up to this value to every member can pass it to
+    /// `expire_tombstones`.
+    #[must_use]
+    pub const fn tombstone_generation(&self) -> u64 {
+        self.tombstone_gen
+    }
+
+    /// Number of retained tombstones (for diagnostics / tests).
+    #[must_use]
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
     }
 
     /// Register a name to a process. Returns the unique tag for this registration.
@@ -64,7 +197,8 @@ impl Registry {
     /// Look up the winning registration for a name.
     ///
     /// Returns the entry with the highest timestamp. If timestamps are equal,
-    /// the entry with the higher node_id wins (deterministic tiebreaker).
+    /// the entry with the higher `node_id` wins (deterministic tiebreaker).
+    #[must_use]
     pub fn lookup(&self, name: &str) -> Option<&RegistryEntry> {
         self.entries.get(name).and_then(|entries| {
             entries.iter().max_by(|a, b| {
@@ -84,20 +218,20 @@ impl Registry {
         if entries.is_empty() {
             return None;
         }
-        let deltas: Vec<RegistryDelta> = entries
-            .iter()
-            .map(|e| {
-                self.tombstones.insert(e.tag);
-                RegistryDelta::Remove {
-                    name: name.to_string(),
-                    tag: e.tag,
-                }
-            })
-            .collect();
+        let tags: Vec<Uuid> = entries.iter().map(|e| e.tag).collect();
+        let mut deltas = Vec::with_capacity(tags.len());
+        for tag in tags {
+            self.tombstone(tag, name);
+            deltas.push(RegistryDelta::Remove {
+                name: name.to_string(),
+                tag,
+            });
+        }
         Some(deltas)
     }
 
     /// Return all current registrations (one winner per name).
+    #[must_use]
     pub fn registered(&self) -> Vec<(String, ProcessId)> {
         let mut result = Vec::new();
         for name in self.entries.keys() {
@@ -113,15 +247,17 @@ impl Registry {
     pub fn remove_by_pid(&mut self, pid: ProcessId) {
         let names: Vec<String> = self.entries.keys().cloned().collect();
         for name in names {
-            if let Some(entries) = self.entries.get_mut(&name) {
-                let removed: Vec<Uuid> = entries
+            let removed: Vec<Uuid> = self.entries.get(&name).map_or_else(Vec::new, |entries| {
+                entries
                     .iter()
                     .filter(|e| e.pid == pid)
                     .map(|e| e.tag)
-                    .collect();
-                for tag in &removed {
-                    self.tombstones.insert(*tag);
-                }
+                    .collect()
+            });
+            for tag in &removed {
+                self.tombstone(*tag, &name);
+            }
+            if let Some(entries) = self.entries.get_mut(&name) {
                 entries.retain(|e| e.pid != pid);
                 if entries.is_empty() {
                     self.entries.remove(&name);
@@ -134,15 +270,17 @@ impl Registry {
     pub fn remove_by_node(&mut self, node_id: u64) {
         let names: Vec<String> = self.entries.keys().cloned().collect();
         for name in names {
-            if let Some(entries) = self.entries.get_mut(&name) {
-                let removed: Vec<Uuid> = entries
+            let removed: Vec<Uuid> = self.entries.get(&name).map_or_else(Vec::new, |entries| {
+                entries
                     .iter()
                     .filter(|e| e.node_id == node_id)
                     .map(|e| e.tag)
-                    .collect();
-                for tag in &removed {
-                    self.tombstones.insert(*tag);
-                }
+                    .collect()
+            });
+            for tag in &removed {
+                self.tombstone(*tag, &name);
+            }
+            if let Some(entries) = self.entries.get_mut(&name) {
                 entries.retain(|e| e.node_id != node_id);
                 if entries.is_empty() {
                     self.entries.remove(&name);
@@ -153,35 +291,81 @@ impl Registry {
 
     /// Merge a remote delta into this registry.
     ///
-    /// - `Add`: adds the entry if its tag is not tombstoned and not already present.
-    /// - `Remove`: tombstones the tag and removes the entry from the entries map.
+    /// - `Add`: adds the entry if its tag is not tombstoned and not already
+    ///   present. If the add introduces a second *live* registration for a name
+    ///   that already has one (a split-brain same-name conflict), the conflict
+    ///   is recorded (see [`Registry::take_conflicts`]) so the integration layer
+    ///   can act. Resolution stays deterministic via LWW; nothing is silently
+    ///   dropped.
+    /// - `Remove`: tombstones the tag and reaps the matching live entry
+    ///   regardless of which name it lives under (so full-sync removes with an
+    ///   unknown name still converge).
     pub fn merge_delta(&mut self, delta: RegistryDelta) {
         match delta {
             RegistryDelta::Add(entry) => {
                 // A tombstoned tag cannot be re-added (prevents resurrection)
-                if self.tombstones.contains(&entry.tag) {
+                if self.tombstones.contains_key(&entry.tag) {
                     return;
                 }
-                // Check for idempotent add (tag already exists)
+                // Detect a same-name conflict against the existing live winner
+                // BEFORE inserting, so we can compare against the prior state.
+                let conflicting_winner = self
+                    .lookup(&entry.name)
+                    .filter(|w| w.tag != entry.tag && w.pid != entry.pid)
+                    .cloned();
+
                 let entries = self.entries.entry(entry.name.clone()).or_default();
+                // Check for idempotent add (tag already exists)
                 if entries.iter().any(|e| e.tag == entry.tag) {
                     return;
                 }
-                entries.push(entry);
+                entries.push(entry.clone());
+
+                if let Some(prior_winner) = conflicting_winner {
+                    // Both registrations are live. Determine the deterministic
+                    // LWW winner/loser and surface the conflict.
+                    let (winner, loser) = if Self::lww_cmp(&entry, &prior_winner).is_gt() {
+                        (entry, prior_winner)
+                    } else {
+                        (prior_winner, entry)
+                    };
+                    self.conflicts.push(NameConflict {
+                        name: winner.name.clone(),
+                        winner,
+                        loser,
+                    });
+                }
             }
             RegistryDelta::Remove { name, tag } => {
-                self.tombstones.insert(tag);
-                if let Some(entries) = self.entries.get_mut(&name) {
-                    entries.retain(|e| e.tag != tag);
-                    if entries.is_empty() {
-                        self.entries.remove(&name);
-                    }
-                }
+                self.tombstone(tag, &name);
+                // Reap by tag across all names: a full-sync Remove may carry an
+                // empty/wrong name, but the tag uniquely identifies the entry.
+                self.reap_tag(tag);
             }
         }
     }
 
+    /// Deterministic Last-Writer-Wins ordering between two entries: higher
+    /// timestamp wins; ties broken by higher `node_id`.
+    fn lww_cmp(a: &RegistryEntry, b: &RegistryEntry) -> std::cmp::Ordering {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    }
+
+    /// Drain and return any name conflicts detected since the last call.
+    pub fn take_conflicts(&mut self) -> Vec<NameConflict> {
+        std::mem::take(&mut self.conflicts)
+    }
+
+    /// Whether any unresolved conflicts are pending.
+    #[must_use]
+    pub const fn has_conflicts(&self) -> bool {
+        !self.conflicts.is_empty()
+    }
+
     /// Generate deltas representing all current state, for full sync to another node.
+    #[must_use]
     pub fn generate_deltas(&self) -> Vec<RegistryDelta> {
         let mut deltas = Vec::new();
         for entries in self.entries.values() {
@@ -189,15 +373,15 @@ impl Registry {
                 deltas.push(RegistryDelta::Add(entry.clone()));
             }
         }
-        // Also include tombstones as Remove deltas so the receiver
-        // knows not to re-add those tags. We don't have the name for
-        // tombstones that have already been fully removed, so we emit
-        // them with an empty name -- the receiver only needs the tag
-        // to prevent resurrection.
-        for &tag in &self.tombstones {
+        // Also include tombstones as Remove deltas so the receiver reaps any
+        // live entry it learned under that tag and refuses to re-add it. We
+        // carry the name the tag was removed under so the receiver can reap
+        // deterministically; even if the name is unknown (empty), the receiver
+        // reaps by tag.
+        for (tag, tombstone) in &self.tombstones {
             deltas.push(RegistryDelta::Remove {
-                name: String::new(),
-                tag,
+                name: tombstone.name.clone(),
+                tag: *tag,
             });
         }
         deltas
@@ -619,5 +803,158 @@ mod tests {
         let entry = reg.lookup("").expect("empty name should be valid");
         assert_eq!(entry.pid, p);
         assert_eq!(entry.name, "");
+    }
+
+    // ── Regression: full-sync remove converges regardless of name ──────
+
+    #[test]
+    fn full_sync_remove_with_empty_name_reaps_live_entry() {
+        // Node A registers a name, then unregisters it (creating a tombstone).
+        // Node B learned the name via an earlier full-sync Add. When A
+        // full-syncs again, its tombstone Remove must reap B's live entry even
+        // though A no longer knows the name (regression for empty-name Remove).
+        let mut reg_a = Registry::new();
+        let tag = reg_a.register("worker", pid(1, 1), 1, 100);
+
+        let mut reg_b = Registry::new();
+        reg_b.merge_delta(RegistryDelta::Add(RegistryEntry {
+            name: "worker".to_string(),
+            pid: pid(1, 1),
+            tag,
+            timestamp: 100,
+            node_id: 1,
+        }));
+        assert!(reg_b.lookup("worker").is_some());
+
+        // A unregisters; full-sync deltas now carry the tombstone.
+        reg_a.unregister("worker");
+        for d in reg_a.generate_deltas() {
+            reg_b.merge_delta(d);
+        }
+
+        assert!(
+            reg_b.lookup("worker").is_none(),
+            "remove must converge and reap the live entry"
+        );
+    }
+
+    #[test]
+    fn unregister_propagates_and_reaps_on_peer() {
+        // End-to-end: register on A, propagate to B, unregister on A, propagate
+        // the Remove deltas to B -> B must drop the entry.
+        let mut reg_a = Registry::new();
+        let mut reg_b = Registry::new();
+
+        let tag = reg_a.register("svc", pid(1, 5), 1, 100);
+        reg_b.merge_delta(RegistryDelta::Add(RegistryEntry {
+            name: "svc".to_string(),
+            pid: pid(1, 5),
+            tag,
+            timestamp: 100,
+            node_id: 1,
+        }));
+        assert!(reg_b.lookup("svc").is_some());
+
+        let remove_deltas = reg_a.unregister("svc").expect("had registration");
+        for d in remove_deltas {
+            reg_b.merge_delta(d);
+        }
+        assert!(reg_b.lookup("svc").is_none());
+        // And it cannot be resurrected with the same tag.
+        reg_b.merge_delta(RegistryDelta::Add(RegistryEntry {
+            name: "svc".to_string(),
+            pid: pid(1, 5),
+            tag,
+            timestamp: 100,
+            node_id: 1,
+        }));
+        assert!(reg_b.lookup("svc").is_none());
+    }
+
+    // ── Regression: same-name split-brain conflict surfaced ────────────
+
+    #[test]
+    fn same_name_conflict_is_reported_on_merge() {
+        // Two nodes register the SAME name during a partition (both live).
+        let mut reg_a = Registry::new();
+        reg_a.register("leader", pid(1, 1), 1, 100);
+
+        let tag_b = Uuid::new_v4();
+        // A merges in B's concurrent live registration for the same name.
+        reg_a.merge_delta(RegistryDelta::Add(RegistryEntry {
+            name: "leader".to_string(),
+            pid: pid(2, 2),
+            tag: tag_b,
+            timestamp: 200,
+            node_id: 2,
+        }));
+
+        assert!(reg_a.has_conflicts(), "conflict must be surfaced");
+        let conflicts = reg_a.take_conflicts();
+        assert_eq!(conflicts.len(), 1);
+        let c = &conflicts[0];
+        assert_eq!(c.name, "leader");
+        // Deterministic LWW: node 2 has the later timestamp, so it wins.
+        assert_eq!(c.winner.pid, pid(2, 2));
+        assert_eq!(c.loser.pid, pid(1, 1));
+        // Resolution is deterministic and matches lookup.
+        assert_eq!(reg_a.lookup("leader").unwrap().pid, pid(2, 2));
+        // Conflicts drained.
+        assert!(!reg_a.has_conflicts());
+    }
+
+    #[test]
+    fn no_conflict_for_idempotent_or_distinct_names() {
+        let mut reg = Registry::new();
+        let tag = Uuid::new_v4();
+        let entry = RegistryEntry {
+            name: "a".to_string(),
+            pid: pid(1, 1),
+            tag,
+            timestamp: 100,
+            node_id: 1,
+        };
+        reg.merge_delta(RegistryDelta::Add(entry.clone()));
+        reg.merge_delta(RegistryDelta::Add(entry)); // idempotent
+        reg.merge_delta(RegistryDelta::Add(RegistryEntry {
+            name: "b".to_string(),
+            pid: pid(2, 1),
+            tag: Uuid::new_v4(),
+            timestamp: 100,
+            node_id: 2,
+        }));
+        assert!(!reg.has_conflicts());
+    }
+
+    // ── Regression: bounded tombstones ─────────────────────────────────
+
+    #[test]
+    fn tombstones_can_be_expired() {
+        let mut reg = Registry::new();
+        reg.register("x", pid(1, 1), 1, 100);
+        reg.unregister("x");
+        let watermark = reg.tombstone_generation();
+        assert_eq!(reg.tombstone_count(), 1);
+
+        // Once the tombstone is known cluster-wide, it can be expired.
+        let expired = reg.expire_tombstones(watermark);
+        assert_eq!(expired, 1);
+        assert_eq!(reg.tombstone_count(), 0);
+    }
+
+    #[test]
+    fn tombstone_set_is_bounded() {
+        let mut reg = Registry::new();
+        reg.max_tombstones = 8;
+        for i in 0..100u64 {
+            let name = format!("svc{i}");
+            reg.register(&name, pid(1, i), 1, 100);
+            reg.unregister(&name);
+        }
+        assert!(
+            reg.tombstone_count() <= 8,
+            "tombstones must stay bounded, got {}",
+            reg.tombstone_count()
+        );
     }
 }

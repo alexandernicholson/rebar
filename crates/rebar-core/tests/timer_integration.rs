@@ -151,7 +151,7 @@ impl GenServer for TimerServer {
 
     async fn init(&self, ctx: &GenServerContext) -> Result<Self::State, String> {
         // Schedule a message to self after 20ms
-        ctx.send_after_self(
+        let _ = ctx.send_after_self(
             rmpv::Value::String("delayed_init".into()),
             Duration::from_millis(20),
         );
@@ -215,7 +215,7 @@ async fn process_context_send_after_to_self() {
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
 
     rt.spawn(move |mut ctx| async move {
-        ctx.send_after(
+        let _ = ctx.send_after(
             rmpv::Value::String("timer_msg".into()),
             Duration::from_millis(20),
         );
@@ -248,7 +248,7 @@ async fn process_context_send_after_to_other() {
         .await;
 
     rt.spawn(move |ctx| async move {
-        ctx.send_after_to(
+        let _ = ctx.send_after_to(
             receiver,
             rmpv::Value::String("to_other".into()),
             Duration::from_millis(20),
@@ -315,7 +315,7 @@ async fn timer_with_runtime_processes() {
     let router: Arc<dyn rebar_core::router::MessageRouter> =
         Arc::new(rebar_core::router::LocalRouter::new(table));
 
-    timer::send_after(
+    let _ = timer::send_after(
         router,
         ProcessId::new(1, 0),
         receiver,

@@ -20,7 +20,9 @@ pub enum TaskError {
 pub struct Task<T> {
     pub(crate) pid: ProcessId,
     pub(crate) result_rx: Option<tokio::sync::oneshot::Receiver<T>>,
-    pub(crate) join_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Abort handle for the tokio task running the user future, so that
+    /// [`Task::shutdown`] can actually stop a still-running task.
+    pub(crate) abort_handle: Option<tokio::task::AbortHandle>,
 }
 
 impl<T> Task<T> {
@@ -36,7 +38,7 @@ impl<T> fmt::Debug for Task<T> {
         f.debug_struct("Task")
             .field("pid", &self.pid)
             .field("has_result_rx", &self.result_rx.is_some())
-            .field("has_join_handle", &self.join_handle.is_some())
+            .field("has_abort_handle", &self.abort_handle.is_some())
             .finish()
     }
 }

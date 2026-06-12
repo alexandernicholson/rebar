@@ -109,6 +109,8 @@ pub enum SendError {
     MailboxFull(ProcessId),
     #[error("node unreachable: {0}")]
     NodeUnreachable(u64),
+    #[error("no process registered under name: {0}")]
+    NameNotRegistered(String),
 }
 
 #[cfg(test)]

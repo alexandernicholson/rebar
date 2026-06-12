@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::process::mailbox::Mailbox;
+use crate::process::table::ProcessHandle;
 use crate::process::{ExitReason, ProcessId};
 use crate::runtime::Runtime;
 
@@ -11,6 +13,10 @@ use super::dispatcher::{ConsumerDemand, DemandDispatcher, DispatchResult, Dispat
 use super::types::{
     CancelReason, DemandMode, GenStage, StageError, StageType, SubscribeOpts, SubscriptionTag,
 };
+
+/// Maximum number of events buffered by a stage before the overflow policy
+/// kicks in. Bounds memory when a downstream consumer is slow or absent.
+const MAX_EVENT_BUFFER: usize = 100_000;
 
 // ---------------------------------------------------------------------------
 // Internal message types
@@ -62,17 +68,35 @@ enum StageCommand {
 // ---------------------------------------------------------------------------
 
 /// Tracks a subscription from the consumer's perspective (upstream producer).
+///
+/// The sender to the producer is held *weakly*: a consumer must not keep its
+/// producer alive (and vice versa via [`DownstreamSubscription`]). Otherwise a
+/// pair of peered stages forms a strong-reference cycle that never terminates
+/// even after all external handles are dropped — and producer/consumer death
+/// could never be observed by the surviving peer. A failed upgrade means the
+/// producer has terminated.
 struct UpstreamSubscription {
-    producer_cmd_tx: mpsc::Sender<StageCommand>,
+    producer_cmd_tx: mpsc::WeakSender<StageCommand>,
     mode: DemandMode,
     min_demand: usize,
+    /// Negotiated upper bound on in-flight demand for this subscription.
+    max_demand: usize,
     /// How many events have been received but not yet re-demanded.
     pending_events: usize,
+    /// Demand we have asked for but not yet been satisfied (the in-flight
+    /// window). Tracked separately so re-asks never push the outstanding
+    /// window above `max_demand`.
+    outstanding_demand: usize,
 }
 
 /// Tracks a subscription from the producer's perspective (downstream consumer).
+///
+/// Held weakly for the same reason as [`UpstreamSubscription`]: a producer
+/// must not keep a dropped consumer alive, and a failed upgrade (or closed
+/// channel) signals consumer death so the producer can run the implicit
+/// cancel path.
 struct DownstreamSubscription {
-    consumer_cmd_tx: mpsc::Sender<StageCommand>,
+    consumer_cmd_tx: mpsc::WeakSender<StageCommand>,
 }
 
 // ---------------------------------------------------------------------------
@@ -195,9 +219,15 @@ impl GenStageRef {
     ///
     /// Returns [`StageError::Dead`] if the stage has terminated.
     pub fn cast(&self, msg: rmpv::Value) -> Result<(), StageError> {
-        self.cmd_tx
-            .try_send(StageCommand::Cast { msg })
-            .map_err(|_| StageError::Dead)
+        match self.cmd_tx.try_send(StageCommand::Cast { msg }) {
+            // `Full` means the command channel is full but the stage is alive.
+            // A cast is fire-and-forget (matching OTP `cast` semantics): we
+            // must not misreport a live, backpressured stage as `Dead`. The
+            // cast is dropped rather than blocking the caller. Only a closed
+            // channel (stage terminated) is reported as `Dead`.
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(StageError::Dead),
+        }
     }
 }
 
@@ -231,6 +261,16 @@ pub async fn spawn_stage_with_dispatcher<S: GenStage, D: Dispatcher>(
     let pid = runtime.table().allocate_pid();
     let (cmd_tx, cmd_rx) = mpsc::channel::<StageCommand>(256);
 
+    // Insert a routable, monitorable handle at spawn. Without this the stage's
+    // PID is allocated but never present in the table, so `table.send`,
+    // `monitor`, `register` and pg all treat the live stage as dead. The stage
+    // has no `handle_info`, so the mailbox is only used to make the PID
+    // addressable; we drain it in the loop to avoid unbounded growth.
+    let (mailbox_tx, mailbox_rx) = Mailbox::unbounded();
+    runtime
+        .table()
+        .insert(pid, ProcessHandle::new(mailbox_tx));
+
     let table = Arc::clone(runtime.table());
 
     // Use a WeakSender inside the loop so that when all external GenStageRef
@@ -238,10 +278,13 @@ pub async fn spawn_stage_with_dispatcher<S: GenStage, D: Dispatcher>(
     let weak_tx = cmd_tx.downgrade();
     tokio::spawn(async move {
         let inner = tokio::spawn(async move {
-            run_stage_loop(stage_impl, dispatcher, cmd_rx, weak_tx).await;
+            run_stage_loop(stage_impl, dispatcher, cmd_rx, weak_tx, mailbox_rx).await;
         });
         let _ = inner.await;
-        table.remove(&pid);
+        // Route death through the canonical cleanup path so monitors get
+        // DOWN, registered names are released, and exit hooks run — `remove`
+        // alone would leak all of that.
+        table.cleanup_process(pid);
     });
 
     GenStageRef { pid, cmd_tx }
@@ -274,10 +317,42 @@ impl<D: Dispatcher> LoopState<D> {
         }
     }
 
-    /// Dispatch events through the dispatcher and buffer leftovers.
-    async fn dispatch_and_deliver(&mut self, events: Vec<rmpv::Value>) {
-        if events.is_empty() {
+    /// Push leftover events into the bounded buffer, applying the
+    /// drop-oldest overflow policy so a slow/absent downstream cannot grow
+    /// memory without bound (the buffer used to be unbounded → OOM).
+    fn buffer_leftover(&mut self, leftover: Vec<rmpv::Value>) {
+        if leftover.is_empty() {
             return;
+        }
+        self.event_buffer.extend(leftover);
+        if self.event_buffer.len() > MAX_EVENT_BUFFER {
+            let overflow = self.event_buffer.len() - MAX_EVENT_BUFFER;
+            // Drop-oldest: discard the head so the freshest events survive.
+            self.event_buffer.drain(..overflow);
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                dropped = overflow,
+                buffer = MAX_EVENT_BUFFER,
+                "gen_stage event buffer overflow; dropping oldest events"
+            );
+        }
+    }
+
+    /// Total demand currently advertised by downstream consumers.
+    fn total_downstream_demand(&self) -> usize {
+        self.consumer_demands
+            .iter()
+            .map(|cd| cd.pending_demand)
+            .sum()
+    }
+
+    /// Dispatch events through the dispatcher and buffer leftovers.
+    ///
+    /// Returns the set of downstream subscription tags whose delivery channel
+    /// was found closed (an implicit cancel); the caller cleans them up.
+    fn dispatch_and_deliver(&mut self, events: Vec<rmpv::Value>) -> Vec<SubscriptionTag> {
+        if events.is_empty() {
+            return Vec::new();
         }
         let DispatchResult {
             deliveries,
@@ -285,18 +360,24 @@ impl<D: Dispatcher> LoopState<D> {
         } = self
             .dispatcher
             .dispatch(events, &mut self.consumer_demands);
-        self.event_buffer.extend(leftover);
-        deliver_events(&self.downstreams, deliveries).await;
+        self.buffer_leftover(leftover);
+        let (undelivered, dead) = deliver_events(&self.downstreams, deliveries);
+        // Undelivered events (channel Full) are re-buffered so we keep
+        // servicing the command loop instead of blocking — this avoids
+        // cross-stage deadlock on bounded channels.
+        self.buffer_leftover(undelivered);
+        dead
     }
 
     /// Dispatch events only if this stage type can emit downstream.
-    async fn maybe_dispatch_emitted(&mut self, emitted: Vec<rmpv::Value>) {
+    fn maybe_dispatch_emitted(&mut self, emitted: Vec<rmpv::Value>) -> Vec<SubscriptionTag> {
         if !emitted.is_empty()
             && (self.stage_type == StageType::Producer
                 || self.stage_type == StageType::ProducerConsumer)
         {
-            self.dispatch_and_deliver(emitted).await;
+            return self.dispatch_and_deliver(emitted);
         }
+        Vec::new()
     }
 }
 
@@ -311,6 +392,7 @@ async fn run_stage_loop<S: GenStage, D: Dispatcher>(
     dispatcher: D,
     mut cmd_rx: mpsc::Receiver<StageCommand>,
     self_weak_tx: mpsc::WeakSender<StageCommand>,
+    mut mailbox_rx: crate::process::mailbox::MailboxRx,
 ) {
     // Initialize
     let Ok((stage_type, mut user_state)) = stage_impl.init().await else {
@@ -320,8 +402,16 @@ async fn run_stage_loop<S: GenStage, D: Dispatcher>(
     let mut ls = LoopState::new(dispatcher, stage_type);
 
     loop {
+        // Drain the routing mailbox so it never grows unbounded. The stage
+        // exposes no `handle_info`, so inbound mailbox messages are discarded;
+        // this just keeps the mailbox empty while the PID stays addressable.
+        while mailbox_rx.try_recv().is_some() {}
+
         let Some(cmd) = cmd_rx.recv().await else {
-            // Channel closed — all refs dropped
+            // Channel closed — all refs dropped. Notify every connected peer
+            // (upstreams and downstreams) with Cancel{Down} so they run their
+            // handle_cancel/teardown instead of dangling on a dead stage.
+            propagate_down(&ls).await;
             stage_impl
                 .terminate(ExitReason::Normal, &mut user_state)
                 .await;
@@ -382,13 +472,64 @@ async fn run_stage_loop<S: GenStage, D: Dispatcher>(
                 let (response, emitted) =
                     stage_impl.handle_call(msg, &mut user_state).await;
                 let _ = reply.send(response);
-                ls.maybe_dispatch_emitted(emitted).await;
+                let dead = ls.maybe_dispatch_emitted(emitted);
+                cleanup_dead_downstreams(&stage_impl, &mut user_state, &mut ls, dead).await;
             }
 
             StageCommand::Cast { msg } => {
                 let emitted = stage_impl.handle_cast(msg, &mut user_state).await;
-                ls.maybe_dispatch_emitted(emitted).await;
+                let dead = ls.maybe_dispatch_emitted(emitted);
+                cleanup_dead_downstreams(&stage_impl, &mut user_state, &mut ls, dead).await;
             }
+        }
+    }
+}
+
+/// Notify all connected peers that this stage is going down.
+///
+/// Sends `Cancel{reason: Down}` to every upstream producer and downstream
+/// consumer so peers run their `handle_cancel`/teardown instead of being left
+/// pointing at a dead stage.
+async fn propagate_down<D: Dispatcher>(ls: &LoopState<D>) {
+    for (tag, up) in &ls.upstreams {
+        send_weak(
+            &up.producer_cmd_tx,
+            StageCommand::Cancel {
+                tag: *tag,
+                reason: CancelReason::Down,
+            },
+        )
+        .await;
+    }
+    for (tag, down) in &ls.downstreams {
+        send_weak(
+            &down.consumer_cmd_tx,
+            StageCommand::Cancel {
+                tag: *tag,
+                reason: CancelReason::Down,
+            },
+        )
+        .await;
+    }
+}
+
+/// Treat downstream consumers whose delivery channel was found closed as an
+/// implicit cancel: run `handle_cancel`, drop the subscription and its demand
+/// accounting so we stop allocating it demand and dropping events into a dead
+/// channel.
+async fn cleanup_dead_downstreams<S: GenStage, D: Dispatcher>(
+    stage_impl: &S,
+    user_state: &mut S::State,
+    ls: &mut LoopState<D>,
+    dead: Vec<SubscriptionTag>,
+) {
+    for tag in dead {
+        if ls.downstreams.remove(&tag).is_some() {
+            ls.dispatcher.cancel(tag);
+            ls.consumer_demands.retain(|cd| cd.tag != tag);
+            stage_impl
+                .handle_cancel(CancelReason::Down, tag, user_state)
+                .await;
         }
     }
 }
@@ -433,7 +574,7 @@ async fn handle_subscribe<S: GenStage, D: Dispatcher>(
     ls.downstreams.insert(
         consumer_tag,
         DownstreamSubscription {
-            consumer_cmd_tx: consumer_cmd_tx.clone(),
+            consumer_cmd_tx: consumer_cmd_tx.downgrade(),
         },
     );
 
@@ -463,8 +604,12 @@ async fn handle_subscription_confirmed<S: GenStage, D: Dispatcher>(
     producer_cmd_tx: mpsc::Sender<StageCommand>,
     opts: SubscribeOpts,
 ) {
-    let max_demand = opts.max_demand;
-    let min_demand = opts.min_demand;
+    let max_demand = opts.max_demand.max(1);
+    // Clamp `min_demand` to `max_demand`. A `min_demand > max_demand`
+    // subscription would, in automatic mode, never reach its re-ask threshold
+    // after the first batch (pending_events caps at max_demand < min_demand) →
+    // the pipeline stalls. Clamping keeps automatic mode making progress.
+    let min_demand = opts.min_demand.min(max_demand);
 
     // The consumer decides the demand mode
     let mode = stage_impl
@@ -474,21 +619,37 @@ async fn handle_subscription_confirmed<S: GenStage, D: Dispatcher>(
     ls.upstreams.insert(
         tag,
         UpstreamSubscription {
-            producer_cmd_tx: producer_cmd_tx.clone(),
+            producer_cmd_tx: producer_cmd_tx.downgrade(),
             mode,
             min_demand,
+            max_demand,
             pending_events: 0,
+            outstanding_demand: 0,
         },
     );
 
-    // In automatic mode, immediately send initial demand
+    // In automatic mode, immediately send initial demand (the full window).
     if mode == DemandMode::Automatic {
+        if let Some(up) = ls.upstreams.get_mut(&tag) {
+            up.outstanding_demand = max_demand;
+        }
         let _ = producer_cmd_tx
             .send(StageCommand::AskDemand {
                 tag,
                 demand: max_demand,
             })
             .await;
+    }
+}
+
+/// Send a command over a weakly-held peer sender, upgrading first.
+///
+/// Returns `false` if the peer has terminated (upgrade failed or channel
+/// closed), so the caller can treat it as an implicit cancel.
+async fn send_weak(weak: &mpsc::WeakSender<StageCommand>, cmd: StageCommand) -> bool {
+    match weak.upgrade() {
+        Some(tx) => tx.send(cmd).await.is_ok(),
+        None => false,
     }
 }
 
@@ -507,20 +668,14 @@ async fn handle_cancel<S: GenStage, D: Dispatcher>(
         stage_impl
             .handle_cancel(reason, tag, user_state)
             .await;
-        let _ = down
-            .consumer_cmd_tx
-            .send(StageCommand::Cancel { tag, reason })
-            .await;
+        send_weak(&down.consumer_cmd_tx, StageCommand::Cancel { tag, reason }).await;
     }
     // Check if it's an upstream subscription (we are consumer)
     else if let Some(up) = ls.upstreams.remove(&tag) {
         stage_impl
             .handle_cancel(reason, tag, user_state)
             .await;
-        let _ = up
-            .producer_cmd_tx
-            .send(StageCommand::Cancel { tag, reason })
-            .await;
+        send_weak(&up.producer_cmd_tx, StageCommand::Cancel { tag, reason }).await;
     }
 }
 
@@ -539,10 +694,16 @@ async fn handle_ask_demand<S: GenStage, D: Dispatcher>(
 ) {
     // If the tag belongs to an upstream subscription, forward demand to the producer
     if let Some(up) = ls.upstreams.get(&tag) {
-        let _ = up
-            .producer_cmd_tx
-            .send(StageCommand::AskDemand { tag, demand })
-            .await;
+        let weak = up.producer_cmd_tx.clone();
+        if !send_weak(&weak, StageCommand::AskDemand { tag, demand }).await {
+            // Producer is gone: synthesize an implicit Cancel{Down} so this
+            // consumer runs its teardown instead of dangling.
+            if ls.upstreams.remove(&tag).is_some() {
+                stage_impl
+                    .handle_cancel(CancelReason::Down, tag, user_state)
+                    .await;
+            }
+        }
         return;
     }
 
@@ -561,24 +722,25 @@ async fn handle_ask_demand<S: GenStage, D: Dispatcher>(
             .dispatcher
             .dispatch(buffered, &mut ls.consumer_demands);
         ls.event_buffer = leftover;
-        deliver_events(&ls.downstreams, deliveries).await;
+        let (undelivered, dead) = deliver_events(&ls.downstreams, deliveries);
+        ls.buffer_leftover(undelivered);
+        cleanup_dead_downstreams(stage_impl, user_state, ls, dead).await;
     }
 
-    // If there's still demand after draining the buffer, ask the stage for events
-    let total_demand: usize = ls
-        .consumer_demands
-        .iter()
-        .map(|cd| cd.pending_demand)
-        .sum();
-    if total_demand > 0
-        && (ls.stage_type == StageType::Producer
-            || ls.stage_type == StageType::ProducerConsumer)
-    {
-        let events = stage_impl
-            .handle_demand(total_demand, user_state)
-            .await;
-        if !events.is_empty() {
-            ls.dispatch_and_deliver(events).await;
+    // After draining the buffer, ask the user's producer callback only for the
+    // demand *increment* from this command (not the cumulative outstanding
+    // demand). Passing the running total made convention-following producers
+    // re-produce events they already emitted on each new ask.
+    //
+    // For pure producers this is bounded by the negotiated window via the
+    // consumer's re-ask logic; we additionally do not pull more than the
+    // current outstanding downstream demand can absorb.
+    if ls.stage_type == StageType::Producer {
+        let want = demand.min(ls.total_downstream_demand());
+        if want > 0 {
+            let events = stage_impl.handle_demand(want, user_state).await;
+            let dead = ls.dispatch_and_deliver(events);
+            cleanup_dead_downstreams(stage_impl, user_state, ls, dead).await;
         }
     }
 }
@@ -597,41 +759,100 @@ async fn handle_events<S: GenStage, D: Dispatcher>(
         .handle_events(events, tag, user_state)
         .await;
 
-    // In automatic mode, track events and re-demand when threshold hit
+    // If this is a producer_consumer, dispatch emitted events downstream first
+    // so `total_downstream_demand` below reflects the post-dispatch state.
+    if ls.stage_type == StageType::ProducerConsumer && !emitted.is_empty() {
+        let dead = ls.dispatch_and_deliver(emitted);
+        cleanup_dead_downstreams(stage_impl, user_state, ls, dead).await;
+    }
+
+    // For a producer_consumer, only re-ask upstream for what we can actually
+    // dispatch downstream, so a slow/absent downstream cannot make us pull an
+    // unbounded amount from upstream into the (now bounded) event buffer.
+    let downstream_room = if ls.stage_type == StageType::ProducerConsumer {
+        ls.total_downstream_demand()
+    } else {
+        usize::MAX
+    };
+
+    // In automatic mode, track events and re-demand when the threshold is hit,
+    // capping the in-flight window at `max_demand`. We compute the demand to
+    // re-ask under the mutable borrow, then release the borrow before the
+    // (await-ing) send so we can clean up the upstream if the producer is dead.
+    let mut reask: Option<(mpsc::WeakSender<StageCommand>, usize)> = None;
     if let Some(up) = ls.upstreams.get_mut(&tag)
         && up.mode == DemandMode::Automatic
     {
         up.pending_events += event_count;
+        // These events satisfy outstanding demand.
+        up.outstanding_demand = up.outstanding_demand.saturating_sub(event_count);
+
         if up.pending_events >= up.min_demand {
-            let ask = up.pending_events;
             up.pending_events = 0;
-            let _ = up
-                .producer_cmd_tx
-                .send(StageCommand::AskDemand {
-                    tag,
-                    demand: ask,
-                })
-                .await;
+            // Re-ask up to the negotiated window: never let outstanding demand
+            // ratchet beyond `max_demand`, and never pull more than the
+            // downstream can currently absorb.
+            let headroom = up.max_demand.saturating_sub(up.outstanding_demand);
+            let ask = headroom.min(downstream_room);
+            if ask > 0 {
+                up.outstanding_demand += ask;
+                reask = Some((up.producer_cmd_tx.clone(), ask));
+            }
         }
     }
 
-    // If this is a producer_consumer, dispatch emitted events downstream
-    if ls.stage_type == StageType::ProducerConsumer && !emitted.is_empty() {
-        ls.dispatch_and_deliver(emitted).await;
+    if let Some((weak, ask)) = reask
+        && !send_weak(&weak, StageCommand::AskDemand { tag, demand: ask }).await
+        && ls.upstreams.remove(&tag).is_some()
+    {
+        // Producer died: synthesize Cancel{Down} for this consumer.
+        stage_impl
+            .handle_cancel(CancelReason::Down, tag, user_state)
+            .await;
     }
 }
 
 /// Deliver dispatched events to the appropriate downstream consumers.
-async fn deliver_events(
+///
+/// Uses non-blocking `try_send`: events that cannot be delivered because the
+/// consumer's channel is full are returned (so the caller re-buffers them and
+/// keeps servicing its command loop — blocking here can deadlock a
+/// producer/consumer cycle). Tags whose channel is closed are returned
+/// separately so the caller can treat them as an implicit cancel.
+fn deliver_events(
     downstreams: &HashMap<SubscriptionTag, DownstreamSubscription>,
     deliveries: Vec<(SubscriptionTag, Vec<rmpv::Value>)>,
-) {
+) -> (Vec<rmpv::Value>, Vec<SubscriptionTag>) {
+    let mut undelivered = Vec::new();
+    let mut dead = Vec::new();
     for (tag, events) in deliveries {
-        if let Some(down) = downstreams.get(&tag) {
-            let _ = down
-                .consumer_cmd_tx
-                .send(StageCommand::Events { tag, events })
-                .await;
+        let Some(down) = downstreams.get(&tag) else {
+            continue;
+        };
+        let Some(tx) = down.consumer_cmd_tx.upgrade() else {
+            // Consumer has terminated entirely.
+            undelivered.extend(events);
+            dead.push(tag);
+            continue;
+        };
+        match tx.try_send(StageCommand::Events { tag, events }) {
+            Ok(()) => {}
+            // Channel full: keep servicing our loop instead of blocking; the
+            // undelivered events are re-buffered by the caller. The events are
+            // recovered from the rejected command (always an `Events`).
+            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                if let StageCommand::Events { events, .. } = cmd {
+                    undelivered.extend(events);
+                }
+            }
+            // Channel closed: an implicit cancel — re-buffer and mark dead.
+            Err(mpsc::error::TrySendError::Closed(cmd)) => {
+                if let StageCommand::Events { events, .. } = cmd {
+                    undelivered.extend(events);
+                }
+                dead.push(tag);
+            }
         }
     }
+    (undelivered, dead)
 }

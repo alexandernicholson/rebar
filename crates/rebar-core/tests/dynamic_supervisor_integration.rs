@@ -19,9 +19,7 @@ async fn dynamic_supervisor_manages_many_children() {
         let entry = ChildEntry::new(
             ChildSpec::new(format!("worker-{i}")),
             || async {
-                std::future::pending::<()>().await;
-                #[allow(unreachable_code)]
-                ExitReason::Normal
+                std::future::pending::<ExitReason>().await
             },
         );
         handle.start_child(entry).await.unwrap();
@@ -68,9 +66,7 @@ async fn remove_running_child_returns_error() {
     let handle = start_dynamic_supervisor(rt, DynamicSupervisorSpec::new()).await;
 
     let entry = ChildEntry::new(ChildSpec::new("worker"), || async {
-        std::future::pending::<()>().await;
-        #[allow(unreachable_code)]
-        ExitReason::Normal
+        std::future::pending::<ExitReason>().await
     });
     let pid = handle.start_child(entry).await.unwrap();
 
@@ -94,7 +90,7 @@ async fn transient_child_restarted_on_abnormal_exit() {
 
     let entry = ChildEntry {
         spec: ChildSpec::new("crasher").restart(RestartType::Transient),
-        factory: Arc::new(move || {
+        factory: Arc::new(move |_ctx| {
             let c = counter_clone.clone();
             Box::pin(async move {
                 c.fetch_add(1, Ordering::SeqCst);
@@ -132,7 +128,7 @@ async fn transient_child_not_restarted_on_normal_exit() {
 
     let entry = ChildEntry {
         spec: ChildSpec::new("normal-exit").restart(RestartType::Transient),
-        factory: Arc::new(move || {
+        factory: Arc::new(move |_ctx| {
             let c = counter_clone.clone();
             Box::pin(async move {
                 c.fetch_add(1, Ordering::SeqCst);

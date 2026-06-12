@@ -8,16 +8,16 @@
 // Transport trait contracts
 // ---------------------------------------------------------------------------
 
-/// Guards that TcpConnection implements TransportConnection + Send + Sync.
+/// Guards that `TcpConnection` implements `TransportConnection` + Send + Sync.
 /// The v5 fork removed Send + Sync bounds from the transport traits, which
-/// broke tokio::spawn usage across the codebase.
+/// broke `tokio::spawn` usage across the codebase.
 #[test]
 fn transport_connection_requires_send_sync() {
     fn assert_send_sync<T: rebar_cluster::transport::TransportConnection + Send + Sync>() {}
     assert_send_sync::<rebar_cluster::transport::tcp::TcpConnection>();
 }
 
-/// Guards that TcpTransportListener implements TransportListener + Send + Sync.
+/// Guards that `TcpTransportListener` implements `TransportListener` + Send + Sync.
 /// Listeners must be Send + Sync so they can be moved into spawned tasks.
 #[test]
 fn transport_listener_requires_send_sync() {
@@ -25,8 +25,8 @@ fn transport_listener_requires_send_sync() {
     assert_send_sync::<rebar_cluster::transport::tcp::TcpTransportListener>();
 }
 
-/// Guards that QuicTransportConnector implements TransportConnector + Send + Sync.
-/// The ConnectionManager holds a Box<dyn TransportConnector> which requires
+/// Guards that `QuicTransportConnector` implements `TransportConnector` + Send + Sync.
+/// The `ConnectionManager` holds a `Box<dyn TransportConnector>` which requires
 /// Send + Sync for use across async task boundaries.
 #[test]
 fn transport_connector_requires_send_sync() {
@@ -35,8 +35,8 @@ fn transport_connector_requires_send_sync() {
     assert_send_sync::<rebar_cluster::transport::quic::QuicTransportConnector>();
 }
 
-/// Guards that TransportConnector can be used as a trait object (Box<dyn>).
-/// The ConnectionManager accepts Box<dyn TransportConnector>, so the trait
+/// Guards that `TransportConnector` can be used as a trait object (`Box<dyn>`).
+/// The `ConnectionManager` accepts `Box<dyn TransportConnector>`, so the trait
 /// must remain object-safe.
 #[test]
 fn transport_connector_returns_boxed_dyn_connection() {
@@ -48,7 +48,7 @@ fn transport_connector_returns_boxed_dyn_connection() {
 // QUIC transport
 // ---------------------------------------------------------------------------
 
-/// Guards that QuicTransport and related types exist and can be constructed
+/// Guards that `QuicTransport` and related types exist and can be constructed
 /// from a generated certificate.  The v5 fork removed quinn/rustls/rcgen
 /// dependencies entirely.
 #[test]
@@ -128,7 +128,7 @@ async fn quic_send_recv_roundtrip() {
 // DistributedRuntime
 // ---------------------------------------------------------------------------
 
-/// Guards that DistributedRuntime is NOT generic — it is a concrete type
+/// Guards that `DistributedRuntime` is NOT generic — it is a concrete type
 /// with no type parameters.  The v5 fork made it generic over the transport,
 /// which broke the facade crate's public API.
 #[test]
@@ -142,8 +142,8 @@ fn distributed_runtime_is_not_generic() {
 // ConnectionManager
 // ---------------------------------------------------------------------------
 
-/// Guards that ConnectionManager::new accepts Box<dyn TransportConnector>.
-/// The v5 fork made ConnectionManager generic over the connector type,
+/// Guards that `ConnectionManager::new` accepts `Box<dyn TransportConnector>`.
+/// The v5 fork made `ConnectionManager` generic over the connector type,
 /// which broke dynamic dispatch and the ability to swap transports at runtime.
 #[test]
 fn connection_manager_accepts_boxed_dyn_connector() {
@@ -169,15 +169,15 @@ fn connection_manager_accepts_boxed_dyn_connector() {
 // Wire protocol
 // ---------------------------------------------------------------------------
 
-/// Guards that all 13 MsgType variants exist with correct u8 discriminants.
+/// Guards that all 14 `MsgType` variants exist with correct u8 discriminants.
 /// The wire protocol is critical for cluster interop — changing discriminant
 /// values would silently corrupt cross-node communication.
 #[test]
 fn msg_type_variants_complete() {
     use rebar_cluster::protocol::MsgType;
 
-    // All 13 variants with their expected discriminant values
-    let variants: [(MsgType, u8); 13] = [
+    // All 14 variants with their expected discriminant values
+    let variants: [(MsgType, u8); 14] = [
         (MsgType::Send, 0x01),
         (MsgType::Monitor, 0x02),
         (MsgType::Demonitor, 0x03),
@@ -191,13 +191,13 @@ fn msg_type_variants_complete() {
         (MsgType::Heartbeat, 0x0B),
         (MsgType::HeartbeatAck, 0x0C),
         (MsgType::NodeInfo, 0x0D),
+        (MsgType::Swim, 0x0E),
     ];
 
     for (variant, expected_value) in &variants {
         assert_eq!(
             *variant as u8, *expected_value,
-            "MsgType::{:?} should have discriminant 0x{:02X}",
-            variant, expected_value
+            "MsgType::{variant:?} should have discriminant 0x{expected_value:02X}"
         );
     }
 
@@ -207,8 +207,8 @@ fn msg_type_variants_complete() {
         "0x00 must not be a valid MsgType"
     );
     assert!(
-        MsgType::from_u8(0x0E).is_err(),
-        "0x0E must not be a valid MsgType"
+        MsgType::from_u8(0x0F).is_err(),
+        "0x0F must not be a valid MsgType"
     );
 }
 
@@ -247,7 +247,7 @@ fn frame_encode_decode_deterministic() {
 // Router
 // ---------------------------------------------------------------------------
 
-/// Guards that DistributedRouter implements Send + Sync.  The router is
+/// Guards that `DistributedRouter` implements Send + Sync.  The router is
 /// wrapped in Arc and shared across async tasks — losing Send + Sync
 /// would break the runtime's message routing.
 #[test]

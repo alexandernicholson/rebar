@@ -17,13 +17,31 @@ pub struct RunningApp {
     pub supervisor: SupervisorHandle,
     /// The application's environment.
     pub env: AppEnv,
+    /// The application implementation, held so that `prep_stop`/`stop`
+    /// always run on shutdown even if the registration was replaced or
+    /// removed in the meantime (see [`ApplicationManager::stop`]).
+    app: Arc<dyn Application>,
+}
+
+/// State of a slot in the `running` map.
+///
+/// A slot transitions `Starting -> Running` on a successful start, or is
+/// removed entirely on a failed start.  The `Starting` marker lets a
+/// concurrent `start` for the same name observe an in-progress start and
+/// reject it, closing the check-then-act race between the initial
+/// "already running?" test and the final insert.
+enum RunState {
+    /// A start is in progress; no supervisor exists yet.
+    Starting,
+    /// The application is running.
+    Running(RunningApp),
 }
 
 /// Registration entry: the spec together with the trait object that
 /// implements [`Application`].
 struct Registration {
     spec: AppSpec,
-    app: Box<dyn Application>,
+    app: Arc<dyn Application>,
 }
 
 /// Manages the lifecycle of registered applications.
@@ -35,8 +53,8 @@ pub struct ApplicationManager {
     runtime: Arc<Runtime>,
     /// Registered (but not necessarily running) applications.
     registrations: DashMap<String, Registration>,
-    /// Currently running applications.
-    running: DashMap<String, RunningApp>,
+    /// Currently running (or starting) applications, keyed by name.
+    running: DashMap<String, RunState>,
     /// The order in which applications were started (used for reverse
     /// shutdown).
     start_order: Mutex<Vec<String>>,
@@ -64,7 +82,7 @@ impl ApplicationManager {
             name,
             Registration {
                 spec,
-                app: Box::new(app),
+                app: Arc::new(app),
             },
         );
     }
@@ -79,59 +97,97 @@ impl ApplicationManager {
     /// already running, has unstarted dependencies, or if its `start`
     /// callback fails.
     pub async fn start(&self, name: &str) -> Result<(), AppError> {
-        // Already running?
-        if self.running.contains_key(name) {
-            return Err(AppError::AlreadyStarted(name.to_string()));
-        }
-
-        // Must be registered.  We extract what we need from the
-        // `DashMap` ref and drop it before any `.await` point so the
-        // guard does not live across an await boundary.
-        // Extract deps and initial env from the registration while
-        // holding the DashMap guard, then drop it before any await.
-        let (deps, initial_env) = {
+        // Extract the app implementation, deps, and initial env from the
+        // registration while holding the DashMap guard, then drop it
+        // before any await.
+        let (app, deps, initial_env) = {
             let reg = self
                 .registrations
                 .get(name)
                 .ok_or_else(|| AppError::NotFound(name.to_string()))?;
-            (reg.spec.dependencies.clone(), reg.spec.env.clone())
+            (
+                Arc::clone(&reg.app),
+                reg.spec.dependencies.clone(),
+                reg.spec.env.clone(),
+            )
         };
 
-        // All deps must be running.
-        for dep in &deps {
-            if !self.running.contains_key(dep.as_str()) {
+        // Atomically claim the slot BEFORE the await so that a concurrent
+        // start of the same app observes the `Starting` marker and is
+        // rejected, rather than racing the final insert and producing a
+        // second (orphaned) live instance.  The `Entry` guard holds the
+        // shard lock only for the duration of this synchronous block.
+        match self.running.entry(name.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(AppError::AlreadyStarted(name.to_string()));
+            }
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(RunState::Starting);
+            }
+        }
+
+        // From here on, any early return must release the reservation so
+        // a failed start does not permanently block restarts.
+        let result = self.start_reserved(name, &app, &deps, &initial_env).await;
+        if result.is_err() {
+            // Only drop the slot if it is still our `Starting` marker; a
+            // successful concurrent path would have replaced it (it cannot,
+            // because we hold the reservation, but be defensive).
+            self.running
+                .remove_if(name, |_, state| matches!(state, RunState::Starting));
+        }
+        result
+    }
+
+    /// Complete a start whose `Starting` reservation is already held in
+    /// `running`.  On success the slot is promoted to `Running` and the
+    /// name appended to `start_order`; on error the caller removes the
+    /// reservation.
+    async fn start_reserved(
+        &self,
+        name: &str,
+        app: &Arc<dyn Application>,
+        deps: &[String],
+        initial_env: &[(String, rmpv::Value)],
+    ) -> Result<(), AppError> {
+        // All deps must be running (a `Starting` dep does not count as
+        // running).
+        for dep in deps {
+            let dep_running = self
+                .running
+                .get(dep.as_str())
+                .is_some_and(|state| matches!(state.value(), RunState::Running(_)));
+            if !dep_running {
                 return Err(AppError::DependencyNotStarted(dep.clone()));
             }
         }
 
         // Build env from spec defaults.
         let env = AppEnv::new();
-        for (k, v) in &initial_env {
+        for (k, v) in initial_env {
             env.put(k, v.clone());
         }
 
-        // Start the application (reg guard is dropped here).
-        let reg = self
-            .registrations
-            .get(name)
-            .ok_or_else(|| AppError::NotFound(name.to_string()))?;
-        let handle = reg
-            .app
+        let handle = app
             .start(Arc::clone(&self.runtime), &env)
             .await
             .map_err(|e| AppError::StartFailed(e.to_string()))?;
-        drop(reg);
 
-        // Record as running.
+        // Promote the reservation to a running instance and record the
+        // start order under the same logical step.  We append to
+        // `start_order` first (while still holding our reservation) and
+        // then swap the slot, so the two stay consistent: nothing can
+        // observe `Running` without a matching `start_order` entry.
+        self.start_order.lock().await.push(name.to_string());
         self.running.insert(
             name.to_string(),
-            RunningApp {
+            RunState::Running(RunningApp {
                 name: name.to_string(),
                 supervisor: handle,
                 env,
-            },
+                app: Arc::clone(app),
+            }),
         );
-        self.start_order.lock().await.push(name.to_string());
 
         Ok(())
     }
@@ -149,31 +205,68 @@ impl ApplicationManager {
     /// dependency is not registered, or any application fails to start.
     pub async fn ensure_all_started(&self, name: &str) -> Result<Vec<String>, AppError> {
         let order = self.topological_sort(name)?;
-        let mut started = Vec::new();
+        let mut started: Vec<String> = Vec::new();
 
         for app_name in &order {
-            if self.running.contains_key(app_name.as_str()) {
+            if self.is_running(app_name) {
                 continue;
             }
-            self.start(app_name).await?;
+            if let Err(e) = self.start(app_name).await {
+                // Roll back the applications THIS call started, in reverse
+                // order, so a partial start does not leave the system in a
+                // half-initialised state.  Best-effort: stop failures are
+                // swallowed, but the original error is returned and the
+                // names started here are no longer left silently running.
+                for done in started.iter().rev() {
+                    let _ = self.stop(done).await;
+                }
+                return Err(e);
+            }
             started.push(app_name.clone());
         }
 
         Ok(started)
     }
 
+    /// Whether `name` is fully running (a `Starting` reservation does not
+    /// count).
+    fn is_running(&self, name: &str) -> bool {
+        self.running
+            .get(name)
+            .is_some_and(|state| matches!(state.value(), RunState::Running(_)))
+    }
+
     /// Stop a running application.
     ///
-    /// Calls `prep_stop`, shuts down the supervisor, then calls `stop`.
+    /// Calls `prep_stop`, signals the supervision tree to shut down, then
+    /// calls `stop`.  The lifecycle hooks are taken from the
+    /// [`RunningApp`] captured at start time, so `prep_stop`/`stop` always
+    /// run even if the registration was replaced or removed since the app
+    /// started.
+    ///
+    /// # Shutdown ordering
+    ///
+    /// `SupervisorHandle::shutdown` is fire-and-forget: it enqueues a
+    /// shutdown message and returns before the supervision tree has
+    /// actually torn down.  There is no ack mechanism on the supervisor
+    /// API, so this method cannot block until the children have stopped.
+    /// `prep_stop` runs before the shutdown is signalled and `stop` runs
+    /// after, but the children may still be winding down when `stop`
+    /// returns (eventual consistency).
     ///
     /// # Errors
     ///
     /// Returns [`AppError::NotFound`] if the application is not running.
     pub async fn stop(&self, name: &str) -> Result<(), AppError> {
-        let (_, running_app) = self
+        // Only remove a fully `Running` entry; a `Starting` reservation
+        // belongs to an in-flight `start` and must not be torn down here.
+        // Either absent or a `Starting` reservation: treat as not running.
+        let Some((_, RunState::Running(running_app))) = self
             .running
-            .remove(name)
-            .ok_or_else(|| AppError::NotFound(name.to_string()))?;
+            .remove_if(name, |_, state| matches!(state, RunState::Running(_)))
+        else {
+            return Err(AppError::NotFound(name.to_string()));
+        };
 
         // Remove from start order.
         {
@@ -181,21 +274,28 @@ impl ApplicationManager {
             order.retain(|n| n != name);
         }
 
-        // Lifecycle: prep_stop -> shutdown supervisor -> stop.
-        if let Some(reg) = self.registrations.get(name) {
-            reg.app.prep_stop(&running_app.env).await;
-        }
+        // Lifecycle: prep_stop -> signal supervisor shutdown -> stop.
+        // Hooks come from the captured app, not the (possibly changed)
+        // registration.
+        running_app.app.prep_stop(&running_app.env).await;
 
         running_app.supervisor.shutdown();
 
-        if let Some(reg) = self.registrations.get(name) {
-            reg.app.stop(&running_app.env).await;
-        }
+        running_app.app.stop(&running_app.env).await;
 
         Ok(())
     }
 
     /// Stop all running applications in reverse start order.
+    ///
+    /// Each app's `prep_stop`/`stop` hooks are invoked in strict reverse
+    /// of [`start_order`](Self::start_order), and `stop` for app `N`
+    /// completes before `stop` for app `N-1` begins.  However, because
+    /// `SupervisorHandle::shutdown` is fire-and-forget (no ack — see
+    /// [`stop`](Self::stop)), app `N`'s supervision tree may still be
+    /// winding down when app `N-1` starts tearing down.  The *hook*
+    /// ordering is strict; the *child-process* teardown is only eventually
+    /// consistent.
     ///
     /// # Errors
     ///
@@ -225,6 +325,7 @@ impl ApplicationManager {
     pub fn started_applications(&self) -> Vec<String> {
         self.running
             .iter()
+            .filter(|entry| matches!(entry.value(), RunState::Running(_)))
             .map(|entry| entry.key().clone())
             .collect()
     }
@@ -232,7 +333,10 @@ impl ApplicationManager {
     /// Get a clone of the environment for a running application.
     #[must_use]
     pub fn env(&self, name: &str) -> Option<AppEnv> {
-        self.running.get(name).map(|entry| entry.env.clone())
+        self.running.get(name).and_then(|entry| match entry.value() {
+            RunState::Running(app) => Some(app.env.clone()),
+            RunState::Starting => None,
+        })
     }
 
     /// Compute a topological ordering of `name` and its transitive
@@ -363,6 +467,29 @@ mod tests {
             _env: &AppEnv,
         ) -> Result<SupervisorHandle, AppError> {
             self.order.lock().await.push(self.name.clone());
+            let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
+            Ok(start_supervisor(runtime, spec, vec![]).await)
+        }
+    }
+
+    /// Application that counts how many times `start` ran, with a yield
+    /// point inside `start` so concurrent starts interleave across the
+    /// await boundary (exercising the check-then-act window).
+    struct CountingApp {
+        starts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Application for CountingApp {
+        async fn start(
+            &self,
+            runtime: Arc<Runtime>,
+            _env: &AppEnv,
+        ) -> Result<SupervisorHandle, AppError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            // Force a yield so a concurrent start has a chance to observe
+            // a missing-or-Starting slot and race the insert.
+            tokio::task::yield_now().await;
             let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
             Ok(start_supervisor(runtime, spec, vec![]).await)
         }
@@ -700,5 +827,119 @@ mod tests {
         assert!(pos("base") < pos("right"));
         assert!(pos("left") < pos("top"));
         assert!(pos("right") < pos("top"));
+    }
+
+    /// Regression (fix 1): two concurrent `start("app")` calls must result
+    /// in exactly one running instance and no orphan.  `start` is invoked
+    /// at most once; the loser gets `AlreadyStarted` (or the slot is held
+    /// as `Starting` and the second call is rejected).
+    #[tokio::test]
+    async fn concurrent_start_yields_single_instance() {
+        let rt = Arc::new(Runtime::new(2));
+        let mgr = Arc::new(ApplicationManager::new(rt));
+
+        let starts = Arc::new(AtomicUsize::new(0));
+        mgr.register(
+            AppSpec::new("app"),
+            CountingApp {
+                starts: Arc::clone(&starts),
+            },
+        );
+
+        let m1 = Arc::clone(&mgr);
+        let m2 = Arc::clone(&mgr);
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move { m1.start("app").await }),
+            tokio::spawn(async move { m2.start("app").await }),
+        );
+        let r1 = r1.unwrap();
+        let r2 = r2.unwrap();
+
+        // Exactly one succeeded.
+        assert_ne!(r1.is_ok(), r2.is_ok(), "exactly one start must succeed");
+        let loser = if r1.is_err() { r1 } else { r2 };
+        assert!(matches!(loser.unwrap_err(), AppError::AlreadyStarted(_)));
+
+        // The app's `start` ran exactly once -> no orphaned supervisor.
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert_eq!(mgr.started_applications(), vec!["app".to_string()]);
+    }
+
+    /// Regression (fix 1): a failed start releases the reservation so the
+    /// app can be started again later.
+    #[tokio::test]
+    async fn failed_start_releases_reservation() {
+        let rt = Arc::new(Runtime::new(1));
+        let mgr = ApplicationManager::new(rt);
+
+        mgr.register(AppSpec::new("bad"), FailApp);
+        assert!(mgr.start("bad").await.is_err());
+        // Slot must be free again (not stuck as `Starting`).
+        assert!(mgr.started_applications().is_empty());
+        // A second attempt reaches `start` again (still fails, but is not
+        // short-circuited by a leftover reservation).
+        let err = mgr.start("bad").await.unwrap_err();
+        assert!(matches!(err, AppError::StartFailed(_)));
+    }
+
+    /// Regression (fix 4): when app `k` fails to start, `ensure_all_started`
+    /// rolls back the apps it started earlier in the same call.
+    #[tokio::test]
+    async fn ensure_all_started_rolls_back_on_failure() {
+        let rt = Arc::new(Runtime::new(1));
+        let mgr = ApplicationManager::new(rt);
+
+        let prep = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicUsize::new(0));
+
+        // base (ok) <- top (fails). top depends on base.
+        mgr.register(
+            AppSpec::new("base"),
+            LifecycleApp {
+                prep_stop_count: Arc::clone(&prep),
+                stop_count: Arc::clone(&stop),
+            },
+        );
+        mgr.register(AppSpec::new("top").dependency("base"), FailApp);
+
+        let err = mgr.ensure_all_started("top").await.unwrap_err();
+        assert!(matches!(err, AppError::StartFailed(_)));
+
+        // base was started then rolled back -> nothing left running.
+        assert!(
+            mgr.started_applications().is_empty(),
+            "partial start must be rolled back, not left running"
+        );
+        // Rollback ran base's stop lifecycle hooks.
+        assert_eq!(stop.load(Ordering::SeqCst), 1);
+    }
+
+    /// Regression (fix 2): `stop` runs `prep_stop`/`stop` from the captured
+    /// app even if the registration is replaced after start.
+    #[tokio::test]
+    async fn stop_uses_captured_app_after_reregister() {
+        let rt = Arc::new(Runtime::new(1));
+        let mgr = ApplicationManager::new(rt);
+
+        let prep = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicUsize::new(0));
+
+        mgr.register(
+            AppSpec::new("app"),
+            LifecycleApp {
+                prep_stop_count: Arc::clone(&prep),
+                stop_count: Arc::clone(&stop),
+            },
+        );
+        mgr.start("app").await.unwrap();
+
+        // Replace the registration with one whose hooks do NOT touch our
+        // counters. The running instance must still use the captured app.
+        mgr.register(AppSpec::new("app"), DummyApp);
+
+        mgr.stop("app").await.unwrap();
+
+        assert_eq!(prep.load(Ordering::SeqCst), 1);
+        assert_eq!(stop.load(Ordering::SeqCst), 1);
     }
 }

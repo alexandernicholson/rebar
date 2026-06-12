@@ -30,12 +30,47 @@ impl Default for DrainConfig {
 pub struct DrainResult {
     /// Number of processes stopped during shutdown.
     pub processes_stopped: usize,
-    /// Number of outbound messages drained.
+    /// Number of outbound messages successfully delivered during the drain.
     pub messages_drained: usize,
-    /// Duration of each phase: [announce, drain, shutdown].
+    /// Number of outbound messages that could NOT be delivered (route error)
+    /// or were still pending when the drain timed out. Non-zero means data was
+    /// potentially lost; the caller should treat the drain as unclean.
+    pub messages_undrained: usize,
+    /// Duration of each phase: [drain, announce, shutdown].
     pub phase_durations: [Duration; 3],
-    /// Whether any phase hit its timeout.
+    /// Whether any phase hit its timeout (an unclean drain).
     pub timed_out: bool,
+}
+
+impl DrainResult {
+    /// Whether the drain completed cleanly: no timeout and nothing undrained.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        !self.timed_out && self.messages_undrained == 0
+    }
+}
+
+/// Outcome of draining the outbound queue.
+#[derive(Debug)]
+pub struct OutboundDrainOutcome {
+    /// Messages successfully delivered.
+    pub delivered: usize,
+    /// Messages that failed to route or were left pending at timeout.
+    pub undrained: usize,
+    /// Whether the drain hit its timeout instead of reaching a clean empty.
+    pub timed_out: bool,
+}
+
+/// Mutable handles to the cluster components a drain operates on.
+pub struct DrainContext<'a> {
+    /// Gossip queue used to broadcast the Leave announcement.
+    pub gossip: &'a mut GossipQueue,
+    /// Registry to unregister this node's names from.
+    pub registry: &'a mut Registry,
+    /// Channel of outbound router commands to drain.
+    pub remote_rx: &'a mut tokio::sync::mpsc::Receiver<crate::router::RouterCommand>,
+    /// Connection manager used to flush and close connections.
+    pub connection_manager: &'a mut crate::connection::manager::ConnectionManager,
 }
 
 /// Orchestrates the three-phase drain protocol.
@@ -44,22 +79,32 @@ pub struct NodeDrain {
 }
 
 impl NodeDrain {
-    pub fn new(config: DrainConfig) -> Self {
+    #[must_use]
+    pub const fn new(config: DrainConfig) -> Self {
         Self { config }
     }
 
     /// Phase 1: Announce departure to the cluster.
     /// - Broadcasts Leave via SWIM gossip
     /// - Unregisters all names from the registry
+    ///
     /// Returns the number of names unregistered.
+    ///
+    /// The `incarnation` is this node's current SWIM incarnation; it is carried
+    /// on the Leave so a replayed stale Leave cannot evict a rejoined node.
     pub fn announce(
         &self,
         node_id: u64,
         addr: SocketAddr,
+        incarnation: u64,
         gossip: &mut GossipQueue,
         registry: &mut Registry,
     ) -> usize {
-        gossip.add(GossipUpdate::Leave { node_id, addr });
+        gossip.add(GossipUpdate::Leave {
+            node_id,
+            addr,
+            incarnation,
+        });
 
         let names_before = registry.registered().len();
         registry.remove_by_node(node_id);
@@ -68,31 +113,50 @@ impl NodeDrain {
         names_before - names_after
     }
 
-    /// Phase 2: Drain in-flight outbound messages.
-    /// Processes RouterCommands from the channel until empty or timeout.
-    /// Returns (count, timed_out).
+    /// Drain in-flight outbound messages.
+    ///
+    /// Processes `RouterCommand`s from the channel until the channel is closed
+    /// (`recv` returns `None` — the real "no more producers" signal) or the
+    /// drain timeout elapses. A route error does NOT count as drained; the
+    /// message is counted as undrained (potentially lost). On timeout, any
+    /// messages still buffered in the channel are counted as undrained and the
+    /// outcome is flagged `timed_out`.
+    ///
+    /// This must be run BEFORE announcing Leave / unregistering, so producers
+    /// have stopped enqueuing only because the upstream is shutting down, not
+    /// because we silently dropped them.
     pub async fn drain_outbound(
         &self,
         remote_rx: &mut tokio::sync::mpsc::Receiver<crate::router::RouterCommand>,
         connection_manager: &mut crate::connection::manager::ConnectionManager,
-    ) -> (usize, bool) {
+    ) -> OutboundDrainOutcome {
         let start = Instant::now();
-        let mut drained = 0;
+        let mut delivered = 0;
+        let mut undrained = 0;
         let mut timed_out = false;
 
         loop {
-            if start.elapsed() >= self.config.drain_timeout {
+            let remaining = self
+                .config
+                .drain_timeout
+                .checked_sub(start.elapsed())
+                .unwrap_or(Duration::ZERO);
+            if remaining.is_zero() {
                 timed_out = true;
                 break;
             }
 
-            let remaining = self.config.drain_timeout - start.elapsed();
-
             match tokio::time::timeout(remaining, remote_rx.recv()).await {
                 Ok(Some(crate::router::RouterCommand::Send { node_id, frame })) => {
-                    let _ = connection_manager.route(node_id, &frame).await;
-                    drained += 1;
+                    match connection_manager.route(node_id, &frame).await {
+                        Ok(()) => delivered += 1,
+                        // A route error means the message was NOT delivered;
+                        // count it as undrained rather than as drained.
+                        Err(_) => undrained += 1,
+                    }
                 }
+                // Channel closed: all producers gone, queue truly empty. This is
+                // the only clean termination.
                 Ok(None) => break,
                 Err(_) => {
                     timed_out = true;
@@ -101,7 +165,18 @@ impl NodeDrain {
             }
         }
 
-        (drained, timed_out)
+        // On timeout, account for whatever is still buffered as undrained.
+        if timed_out {
+            while remote_rx.try_recv().is_ok() {
+                undrained += 1;
+            }
+        }
+
+        OutboundDrainOutcome {
+            delivered,
+            undrained,
+            timed_out,
+        }
     }
 
     /// Execute the full three-phase drain protocol.
@@ -109,37 +184,41 @@ impl NodeDrain {
         &self,
         node_id: u64,
         addr: SocketAddr,
-        gossip: &mut GossipQueue,
-        registry: &mut Registry,
-        remote_rx: &mut tokio::sync::mpsc::Receiver<crate::router::RouterCommand>,
-        connection_manager: &mut crate::connection::manager::ConnectionManager,
+        incarnation: u64,
+        ctx: DrainContext<'_>,
         process_count: usize,
     ) -> DrainResult {
         let mut phase_durations = [Duration::ZERO; 3];
         let mut timed_out = false;
 
-        // Phase 1: Announce
+        // Phase 1: Drain outbound to empty FIRST, while we are still a full
+        // cluster member. In-flight replies/messages must be delivered before
+        // we announce departure or unregister — otherwise they are lost.
         let phase1_start = Instant::now();
-        let _names_removed = self.announce(node_id, addr, gossip, registry);
+        let outcome = self
+            .drain_outbound(ctx.remote_rx, ctx.connection_manager)
+            .await;
         phase_durations[0] = phase1_start.elapsed();
-
-        // Phase 2: Drain outbound
-        let phase2_start = Instant::now();
-        let (messages_drained, phase2_timed_out) =
-            self.drain_outbound(remote_rx, connection_manager).await;
-        phase_durations[1] = phase2_start.elapsed();
-        if phase2_timed_out {
+        if outcome.timed_out {
             timed_out = true;
         }
 
+        // Phase 2: Announce departure (gossip Leave + unregister names) only
+        // after the outbound queue has been drained.
+        let phase2_start = Instant::now();
+        let _names_removed =
+            self.announce(node_id, addr, incarnation, ctx.gossip, ctx.registry);
+        phase_durations[1] = phase2_start.elapsed();
+
         // Phase 3: Shutdown connections
         let phase3_start = Instant::now();
-        let _connections_closed = connection_manager.drain_connections().await;
+        let _connections_closed = ctx.connection_manager.drain_connections().await;
         phase_durations[2] = phase3_start.elapsed();
 
         DrainResult {
             processes_stopped: process_count,
-            messages_drained,
+            messages_drained: outcome.delivered,
+            messages_undrained: outcome.undrained,
             phase_durations,
             timed_out,
         }
@@ -181,6 +260,7 @@ mod tests {
         let result = DrainResult {
             processes_stopped: 10,
             messages_drained: 50,
+            messages_undrained: 0,
             phase_durations: [
                 Duration::from_millis(100),
                 Duration::from_millis(500),
@@ -199,7 +279,7 @@ mod tests {
         let mut gossip = GossipQueue::new();
         let mut registry = Registry::default();
 
-        drain.announce(1, test_addr(), &mut gossip, &mut registry);
+        drain.announce(1, test_addr(), 0, &mut gossip, &mut registry);
 
         let updates = gossip.drain(10);
         assert_eq!(updates.len(), 1);
@@ -218,7 +298,7 @@ mod tests {
 
         assert_eq!(registry.registered().len(), 3);
 
-        let removed = drain.announce(1, test_addr(), &mut gossip, &mut registry);
+        let removed = drain.announce(1, test_addr(), 0, &mut gossip, &mut registry);
 
         assert_eq!(removed, 2);
         assert_eq!(registry.registered().len(), 1);
@@ -284,9 +364,133 @@ mod tests {
             ..DrainConfig::default()
         });
 
-        let (count, timed_out) = drain.drain_outbound(&mut rx, &mut mgr).await;
-        assert_eq!(count, 3);
-        assert!(!timed_out);
+        let outcome = drain.drain_outbound(&mut rx, &mut mgr).await;
+        assert_eq!(outcome.delivered, 3);
+        assert_eq!(outcome.undrained, 0);
+        assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn route_error_counts_as_undrained_not_drained() {
+        use crate::connection::manager::ConnectionManager;
+        use crate::protocol::{Frame, MsgType};
+        use crate::router::RouterCommand;
+        use crate::transport::{TransportConnection, TransportError};
+
+        struct NullConn;
+        #[async_trait::async_trait]
+        impl TransportConnection for NullConn {
+            async fn send(&mut self, _: &Frame) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn recv(&mut self) -> Result<Frame, TransportError> {
+                Err(TransportError::ConnectionClosed)
+            }
+            async fn close(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        struct NullConnector;
+        #[async_trait::async_trait]
+        impl crate::connection::manager::TransportConnector for NullConnector {
+            async fn connect(
+                &self,
+                _: SocketAddr,
+            ) -> Result<Box<dyn TransportConnection>, TransportError> {
+                Ok(Box::new(NullConn))
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RouterCommand>(64);
+        // No connection registered for node 99 -> route() returns UnknownNode.
+        let mut mgr = ConnectionManager::new(Box::new(NullConnector));
+
+        tx.send(RouterCommand::Send {
+            node_id: 99,
+            frame: Frame {
+                version: 1,
+                msg_type: MsgType::Send,
+                request_id: 0,
+                header: rmpv::Value::Nil,
+                payload: rmpv::Value::Nil,
+            },
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        let drain = NodeDrain::new(DrainConfig {
+            drain_timeout: Duration::from_secs(1),
+            ..DrainConfig::default()
+        });
+        let outcome = drain.drain_outbound(&mut rx, &mut mgr).await;
+        assert_eq!(outcome.delivered, 0, "failed route must not count as drained");
+        assert_eq!(outcome.undrained, 1);
+        assert!(!outcome.timed_out);
+    }
+
+    #[tokio::test]
+    async fn timeout_reports_undrained_count() {
+        use crate::connection::manager::ConnectionManager;
+        use crate::protocol::{Frame, MsgType};
+        use crate::router::RouterCommand;
+        use crate::transport::{TransportConnection, TransportError};
+
+        struct StallConn;
+        #[async_trait::async_trait]
+        impl TransportConnection for StallConn {
+            async fn send(&mut self, _: &Frame) -> Result<(), TransportError> {
+                Ok(())
+            }
+            async fn recv(&mut self) -> Result<Frame, TransportError> {
+                Err(TransportError::ConnectionClosed)
+            }
+            async fn close(&mut self) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+        struct StallConnector;
+        #[async_trait::async_trait]
+        impl crate::connection::manager::TransportConnector for StallConnector {
+            async fn connect(
+                &self,
+                _: SocketAddr,
+            ) -> Result<Box<dyn TransportConnection>, TransportError> {
+                Ok(Box::new(StallConn))
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RouterCommand>(64);
+        let mut mgr = ConnectionManager::new(Box::new(StallConnector));
+
+        // Two messages to an unconnected node -> route() fails (undrained). The
+        // sender is kept alive so the channel never closes and the drain must
+        // time out; nothing is silently dropped.
+        for i in 0..2 {
+            tx.send(RouterCommand::Send {
+                node_id: 99,
+                frame: Frame {
+                    version: 1,
+                    msg_type: MsgType::Send,
+                    request_id: i,
+                    header: rmpv::Value::Nil,
+                    payload: rmpv::Value::Nil,
+                },
+            })
+            .await
+            .unwrap();
+        }
+
+        let drain = NodeDrain::new(DrainConfig {
+            drain_timeout: Duration::from_millis(50),
+            ..DrainConfig::default()
+        });
+        let outcome = drain.drain_outbound(&mut rx, &mut mgr).await;
+        assert!(outcome.timed_out, "open channel with no close must time out");
+        // Nothing delivered (unknown node); both counted as undrained, not lost.
+        assert_eq!(outcome.delivered, 0);
+        assert_eq!(outcome.undrained, 2);
+        drop(tx);
     }
 
     #[tokio::test]
@@ -329,11 +533,11 @@ mod tests {
         });
 
         let start = Instant::now();
-        let (count, timed_out) = drain.drain_outbound(&mut rx, &mut mgr).await;
+        let outcome = drain.drain_outbound(&mut rx, &mut mgr).await;
         let elapsed = start.elapsed();
 
-        assert_eq!(count, 0);
-        assert!(timed_out);
+        assert_eq!(outcome.delivered, 0);
+        assert!(outcome.timed_out);
         assert!(elapsed >= Duration::from_millis(100));
         assert!(elapsed < Duration::from_secs(1));
 
@@ -404,17 +608,22 @@ mod tests {
             .drain(
                 1,
                 test_addr(),
-                &mut gossip,
-                &mut registry,
-                &mut rx,
-                &mut mgr,
+                0,
+                DrainContext {
+                    gossip: &mut gossip,
+                    registry: &mut registry,
+                    remote_rx: &mut rx,
+                    connection_manager: &mut mgr,
+                },
                 5,
             )
             .await;
 
         assert_eq!(result.messages_drained, 1);
+        assert_eq!(result.messages_undrained, 0);
         assert_eq!(result.processes_stopped, 5);
         assert!(!result.timed_out);
+        assert!(result.is_clean());
         assert!(registry.lookup("svc").is_none());
 
         let updates = gossip.drain(10);
@@ -459,8 +668,8 @@ mod tests {
 
         let mut gossip = GossipQueue::new();
         let mut registry = Registry::new();
-        let (_tx, mut rx) = tokio::sync::mpsc::channel::<RouterCommand>(64);
-        drop(_tx);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<RouterCommand>(64);
+        drop(tx);
         let mut mgr = ConnectionManager::new(Box::new(NullConnector));
 
         let drain = NodeDrain::new(DrainConfig::default());
@@ -468,10 +677,13 @@ mod tests {
             .drain(
                 1,
                 test_addr(),
-                &mut gossip,
-                &mut registry,
-                &mut rx,
-                &mut mgr,
+                0,
+                DrainContext {
+                    gossip: &mut gossip,
+                    registry: &mut registry,
+                    remote_rx: &mut rx,
+                    connection_manager: &mut mgr,
+                },
                 0,
             )
             .await;

@@ -29,52 +29,51 @@ impl Default for SwimConfig {
 
 impl SwimConfig {
     /// Returns a new builder with default values.
+    #[must_use]
     pub fn builder() -> SwimConfigBuilder {
         SwimConfigBuilder::default()
     }
 }
 
 /// Builder for `SwimConfig`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SwimConfigBuilder {
     config: SwimConfig,
 }
 
-impl Default for SwimConfigBuilder {
-    fn default() -> Self {
-        Self {
-            config: SwimConfig::default(),
-        }
-    }
-}
-
 impl SwimConfigBuilder {
-    pub fn protocol_period(mut self, d: Duration) -> Self {
+    #[must_use]
+    pub const fn protocol_period(mut self, d: Duration) -> Self {
         self.config.protocol_period = d;
         self
     }
 
-    pub fn suspect_timeout(mut self, d: Duration) -> Self {
+    #[must_use]
+    pub const fn suspect_timeout(mut self, d: Duration) -> Self {
         self.config.suspect_timeout = d;
         self
     }
 
-    pub fn dead_removal_delay(mut self, d: Duration) -> Self {
+    #[must_use]
+    pub const fn dead_removal_delay(mut self, d: Duration) -> Self {
         self.config.dead_removal_delay = d;
         self
     }
 
-    pub fn indirect_probe_count(mut self, n: usize) -> Self {
+    #[must_use]
+    pub const fn indirect_probe_count(mut self, n: usize) -> Self {
         self.config.indirect_probe_count = n;
         self
     }
 
-    pub fn max_gossip_per_tick(mut self, n: usize) -> Self {
+    #[must_use]
+    pub const fn max_gossip_per_tick(mut self, n: usize) -> Self {
         self.config.max_gossip_per_tick = n;
         self
     }
 
-    pub fn build(self) -> SwimConfig {
+    #[must_use]
+    pub const fn build(self) -> SwimConfig {
         self.config
     }
 }

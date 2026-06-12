@@ -146,29 +146,41 @@ impl Dispatcher for BroadcastDispatcher {
             };
         }
 
-        // Check if any subscriber has demand
-        let any_demand = subscribers.iter().any(|s| s.pending_demand > 0);
-        if !any_demand {
+        // Broadcast semantics: every subscriber must eventually receive every
+        // event in order. We can therefore only dispatch as many events as the
+        // *least*-demanding subscriber can currently accept; the remainder is
+        // returned as leftover so it is re-delivered to ALL subscribers once
+        // demand recovers. Dispatching `min(its_demand)` to each subscriber
+        // independently (the old behaviour) permanently drops events for the
+        // lower-demand subscribers.
+        let min_demand = subscribers
+            .iter()
+            .map(|s| s.pending_demand)
+            .min()
+            .unwrap_or(0);
+
+        if min_demand == 0 {
+            // At least one subscriber has no demand: buffer everything so no
+            // subscriber is skipped.
             return DispatchResult {
                 deliveries: Vec::new(),
                 leftover: events,
             };
         }
 
-        let mut deliveries = Vec::with_capacity(subscribers.len());
+        let take = events.len().min(min_demand);
+        let mut remaining = events;
+        let batch: Vec<rmpv::Value> = remaining.drain(..take).collect();
 
+        let mut deliveries = Vec::with_capacity(subscribers.len());
         for sub in subscribers.iter_mut() {
-            if sub.pending_demand > 0 {
-                let take = events.len().min(sub.pending_demand);
-                let batch = events[..take].to_vec();
-                sub.pending_demand = sub.pending_demand.saturating_sub(batch.len());
-                deliveries.push((sub.tag, batch));
-            }
+            sub.pending_demand = sub.pending_demand.saturating_sub(batch.len());
+            deliveries.push((sub.tag, batch.clone()));
         }
 
         DispatchResult {
             deliveries,
-            leftover: Vec::new(),
+            leftover: remaining,
         }
     }
 }
@@ -347,5 +359,46 @@ mod tests {
         assert_eq!(result.deliveries.len(), 1);
         // Gets min(5, 2) = 2 events
         assert_eq!(result.deliveries[0].1.len(), 2);
+    }
+
+    #[test]
+    fn broadcast_dispatcher_unequal_demand_buffers_remainder() {
+        // Regression for the silent fan-out data loss: with subscribers at
+        // demand 5 and 2, a 5-event batch must dispatch only min(5,2)=2 events
+        // to BOTH subscribers and buffer the remaining 3 for redelivery —
+        // rather than giving the lower-demand subscriber only events it can
+        // hold and permanently dropping the rest.
+        let mut dispatcher = BroadcastDispatcher::new();
+        let tag1 = SubscriptionTag::next();
+        let tag2 = SubscriptionTag::next();
+        let mut subs = vec![
+            ConsumerDemand {
+                tag: tag1,
+                pending_demand: 5,
+            },
+            ConsumerDemand {
+                tag: tag2,
+                pending_demand: 2,
+            },
+        ];
+
+        let result = dispatcher.dispatch(make_events(5), &mut subs);
+        assert_eq!(result.deliveries.len(), 2);
+        // Both subscribers receive the same first 2 events.
+        assert_eq!(result.deliveries[0].1.len(), 2);
+        assert_eq!(result.deliveries[1].1.len(), 2);
+        assert_eq!(result.deliveries[0].1, result.deliveries[1].1);
+        // The remaining 3 events are buffered, not dropped.
+        assert_eq!(result.leftover.len(), 3);
+        assert_eq!(subs[0].pending_demand, 3);
+        assert_eq!(subs[1].pending_demand, 0);
+
+        // When the slow subscriber regains demand, the buffered events are
+        // delivered to everyone — so both eventually see all 5 events.
+        subs[1].pending_demand = 3;
+        let result2 = dispatcher.dispatch(result.leftover, &mut subs);
+        assert_eq!(result2.deliveries[0].1.len(), 3);
+        assert_eq!(result2.deliveries[1].1.len(), 3);
+        assert!(result2.leftover.is_empty());
     }
 }

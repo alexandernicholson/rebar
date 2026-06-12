@@ -13,7 +13,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Spawn a worker process that receives tasks (rmpv::Value),
+    /// Spawn a worker process that receives tasks (`rmpv::Value`),
     /// multiplies the integer payload by 2, and sends the result back
     /// to the `reply_to` PID encoded in the message.
     async fn spawn_doubler_worker(rt: &Runtime) -> ProcessId {
@@ -146,7 +146,7 @@ mod tests {
             coord.register_worker(w, rmpv::Value::Nil).await.unwrap();
         }
 
-        let tasks: Vec<rmpv::Value> = (1..=6).map(|i| rmpv::Value::from(i)).collect();
+        let tasks: Vec<rmpv::Value> = (1..=6).map(rmpv::Value::from).collect();
         let results = coord.submit_many(tasks, Duration::from_secs(2)).await;
 
         let mut values: Vec<i64> = results
@@ -227,7 +227,7 @@ mod tests {
         // Phase 2: Now the scheduler knows fast ≈ 1ms and slow ≈ 500ms.
         // Score formula (in_flight + 1) * avg_response means the scheduler
         // heavily prefers the fast worker even when both are idle.
-        let tasks: Vec<rmpv::Value> = (0..18).map(|i| rmpv::Value::from(i)).collect();
+        let tasks: Vec<rmpv::Value> = (0..18).map(rmpv::Value::from).collect();
         let results = coord.submit_many(tasks, Duration::from_secs(15)).await;
         assert_eq!(results.len(), 18);
         assert!(results.iter().all(Result::is_ok));
@@ -328,6 +328,71 @@ mod tests {
 
         // Dead worker should have been removed
         assert_eq!(coord.worker_count().await.unwrap(), 1);
+    }
+
+    /// A worker that accepts (and silently swallows) every task without ever
+    /// replying. It stays alive in the table — the "dead-but-not-cleaned /
+    /// black-holing" case that `route().is_err()` alone cannot detect.
+    async fn spawn_blackhole_worker(rt: &Runtime) -> ProcessId {
+        rt.spawn(|mut ctx| async move {
+            while ctx.recv().await.is_some() {
+                // drop the task, never reply
+            }
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fails_over_off_blackhole_worker_instead_of_hanging() {
+        let rt = Arc::new(Runtime::new(1));
+        let coord = start_coordinator(Arc::clone(&rt), CoordinatorSpec::default()).await;
+
+        // Register the black-hole worker first (it will be picked first), then
+        // a live doubler to fail over to.
+        let blackhole = spawn_blackhole_worker(&rt).await;
+        coord
+            .register_worker(blackhole, rmpv::Value::Nil)
+            .await
+            .unwrap();
+        let live = spawn_doubler_worker(&rt).await;
+        coord.register_worker(live, rmpv::Value::Nil).await.unwrap();
+
+        // With a short per-task timeout, the black-hole attempt times out and
+        // the coordinator must fail over to the live worker and return its
+        // result — not hang for the full timeout with no failover.
+        let result = coord
+            .submit(rmpv::Value::from(21), Duration::from_millis(300))
+            .await;
+        assert_eq!(result.unwrap().as_i64().unwrap(), 42);
+
+        // The black-hole worker should have been retired.
+        for _ in 0..1000 {
+            if coord.worker_count().await.unwrap() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let workers = coord.list_workers().await.unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].pid, live);
+    }
+
+    #[tokio::test]
+    async fn all_workers_blackhole_returns_timeout_not_hang() {
+        let rt = Arc::new(Runtime::new(1));
+        let coord = start_coordinator(Arc::clone(&rt), CoordinatorSpec::default()).await;
+
+        let bh1 = spawn_blackhole_worker(&rt).await;
+        let bh2 = spawn_blackhole_worker(&rt).await;
+        coord.register_worker(bh1, rmpv::Value::Nil).await.unwrap();
+        coord.register_worker(bh2, rmpv::Value::Nil).await.unwrap();
+
+        // Both time out; after exhausting failover the caller gets an error
+        // (not a permanent hang).
+        let result = coord
+            .submit(rmpv::Value::from(1), Duration::from_millis(150))
+            .await;
+        assert!(result.is_err());
     }
 
     // ---------------------------------------------------------------
@@ -451,7 +516,7 @@ mod tests {
 
         // Weighted batch: score = (in_flight + 1) * avg_response routes
         // most tasks to the fast worker
-        let tasks: Vec<rmpv::Value> = (0..18).map(|i| rmpv::Value::from(i)).collect();
+        let tasks: Vec<rmpv::Value> = (0..18).map(rmpv::Value::from).collect();
         let results = coord.submit_many(tasks, Duration::from_secs(5)).await;
         assert_eq!(results.len(), 18);
         assert!(results.iter().all(Result::is_ok));

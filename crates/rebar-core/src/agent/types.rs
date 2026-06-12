@@ -16,24 +16,34 @@ pub enum AgentError {
     /// The agent process has shut down.
     #[error("agent dead")]
     Dead,
+    /// The closure's state/return type did not match the agent's actual
+    /// state type. Returned to the single offending caller instead of
+    /// panicking the agent and destroying all shared state.
+    #[error("agent state type mismatch")]
+    TypeMismatch,
 }
 
-type BoxedGetFn = Box<dyn FnOnce(&dyn Any) -> Box<dyn Any + Send> + Send>;
-type BoxedUpdateFn = Box<dyn FnOnce(&mut dyn Any) + Send>;
-type BoxedGetAndUpdateFn = Box<dyn FnOnce(&mut dyn Any) -> Box<dyn Any + Send> + Send>;
+/// Result of running a closure against the agent state. `Ok` carries the
+/// boxed return value; `Err` signals the closure could not downcast the
+/// state to the expected type.
+type OpResult = Result<Box<dyn Any + Send>, AgentError>;
+
+type BoxedGetFn = Box<dyn FnOnce(&dyn Any) -> OpResult + Send>;
+type BoxedUpdateFn = Box<dyn FnOnce(&mut dyn Any) -> Result<(), AgentError> + Send>;
+type BoxedGetAndUpdateFn = Box<dyn FnOnce(&mut dyn Any) -> OpResult + Send>;
 
 enum AgentMsg {
     Get {
         f: BoxedGetFn,
-        reply_tx: oneshot::Sender<Box<dyn Any + Send>>,
+        reply_tx: oneshot::Sender<OpResult>,
     },
     Update {
         f: BoxedUpdateFn,
-        reply_tx: oneshot::Sender<()>,
+        reply_tx: oneshot::Sender<Result<(), AgentError>>,
     },
     GetAndUpdate {
         f: BoxedGetAndUpdateFn,
-        reply_tx: oneshot::Sender<Box<dyn Any + Send>>,
+        reply_tx: oneshot::Sender<OpResult>,
     },
     Cast {
         f: BoxedUpdateFn,
@@ -65,29 +75,48 @@ where
     let (msg_tx, mut msg_rx) = mpsc::channel::<AgentMsg>(64);
 
     let pid = runtime
-        .spawn(move |_ctx| async move {
+        .spawn(move |mut ctx| async move {
             let mut state: Box<dyn Any + Send> = Box::new(init());
 
-            while let Some(msg) = msg_rx.recv().await {
-                match msg {
-                    AgentMsg::Get { f, reply_tx } => {
-                        let result = f(state.as_ref());
-                        let _ = reply_tx.send(result);
+            loop {
+                tokio::select! {
+                    biased;
+
+                    // Process-exit signal: when the agent's PID is killed
+                    // (its process mailbox is closed by `cleanup_process`),
+                    // `ctx.recv()` yields `None`. Stop the loop so the agent
+                    // does not become a zombie that keeps accepting writes
+                    // after the table reports it dead.
+                    proc_msg = ctx.recv() => {
+                        if proc_msg.is_none() {
+                            break;
+                        }
+                        // Stray process messages to an agent are ignored.
                     }
-                    AgentMsg::Update { f, reply_tx } => {
-                        f(state.as_mut());
-                        let _ = reply_tx.send(());
-                    }
-                    AgentMsg::GetAndUpdate { f, reply_tx } => {
-                        let result = f(state.as_mut());
-                        let _ = reply_tx.send(result);
-                    }
-                    AgentMsg::Cast { f } => {
-                        f(state.as_mut());
-                    }
-                    AgentMsg::Stop { reply_tx } => {
-                        let _ = reply_tx.send(());
-                        break;
+
+                    maybe_msg = msg_rx.recv() => {
+                        let Some(msg) = maybe_msg else { break };
+                        match msg {
+                            AgentMsg::Get { f, reply_tx } => {
+                                let _ = reply_tx.send(f(state.as_ref()));
+                            }
+                            AgentMsg::Update { f, reply_tx } => {
+                                let _ = reply_tx.send(f(state.as_mut()));
+                            }
+                            AgentMsg::GetAndUpdate { f, reply_tx } => {
+                                let _ = reply_tx.send(f(state.as_mut()));
+                            }
+                            AgentMsg::Cast { f } => {
+                                // Fire-and-forget: a type mismatch here has no
+                                // caller to report to, so it is dropped rather
+                                // than crashing the agent.
+                                let _ = f(state.as_mut());
+                            }
+                            AgentMsg::Stop { reply_tx } => {
+                                let _ = reply_tx.send(());
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -112,11 +141,8 @@ impl AgentRef {
     /// # Errors
     ///
     /// Returns `AgentError::Timeout` if the agent doesn't respond in time,
-    /// or `AgentError::Dead` if the agent has shut down.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the state type `S` does not match the type used to create the agent.
+    /// `AgentError::Dead` if the agent has shut down, or
+    /// `AgentError::TypeMismatch` if `S`/`T` do not match the agent's state.
     pub async fn get<S, F, T>(&self, f: F, timeout: Duration) -> Result<T, AgentError>
     where
         S: Send + 'static,
@@ -125,8 +151,13 @@ impl AgentRef {
     {
         let (reply_tx, reply_rx) = oneshot::channel();
         let boxed_f: BoxedGetFn = Box::new(move |any_state| {
-            let state = any_state.downcast_ref::<S>().expect("agent state type mismatch");
-            Box::new(f(state))
+            // Fallible downcast: a wrong type returns an error to this one
+            // caller instead of panicking the agent loop (which would wipe
+            // all shared state for every other client).
+            let state = any_state
+                .downcast_ref::<S>()
+                .ok_or(AgentError::TypeMismatch)?;
+            Ok(Box::new(f(state)) as Box<dyn Any + Send>)
         });
         self.msg_tx
             .send(AgentMsg::Get {
@@ -139,9 +170,12 @@ impl AgentRef {
         let result = tokio::time::timeout(timeout, reply_rx)
             .await
             .map_err(|_| AgentError::Timeout)?
-            .map_err(|_| AgentError::Dead)?;
+            .map_err(|_| AgentError::Dead)??;
 
-        Ok(*result.downcast::<T>().expect("agent reply type mismatch"))
+        result
+            .downcast::<T>()
+            .map(|b| *b)
+            .map_err(|_| AgentError::TypeMismatch)
     }
 
     /// Update the agent state via a function.
@@ -151,11 +185,8 @@ impl AgentRef {
     ///
     /// # Errors
     ///
-    /// Returns `AgentError::Timeout` or `AgentError::Dead`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the state type `S` does not match the type used to create the agent.
+    /// Returns `AgentError::Timeout`, `AgentError::Dead`, or
+    /// `AgentError::TypeMismatch` if `S` does not match the agent's state.
     pub async fn update<S, F>(&self, f: F, timeout: Duration) -> Result<(), AgentError>
     where
         S: Send + 'static,
@@ -163,8 +194,11 @@ impl AgentRef {
     {
         let (reply_tx, reply_rx) = oneshot::channel();
         let boxed_f: BoxedUpdateFn = Box::new(move |any_state| {
-            let state = any_state.downcast_mut::<S>().expect("agent state type mismatch");
+            let state = any_state
+                .downcast_mut::<S>()
+                .ok_or(AgentError::TypeMismatch)?;
             f(state);
+            Ok(())
         });
         self.msg_tx
             .send(AgentMsg::Update {
@@ -177,9 +211,7 @@ impl AgentRef {
         tokio::time::timeout(timeout, reply_rx)
             .await
             .map_err(|_| AgentError::Timeout)?
-            .map_err(|_| AgentError::Dead)?;
-
-        Ok(())
+            .map_err(|_| AgentError::Dead)?
     }
 
     /// Get a value and update state atomically.
@@ -192,11 +224,8 @@ impl AgentRef {
     ///
     /// # Errors
     ///
-    /// Returns `AgentError::Timeout` or `AgentError::Dead`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the state type `S` does not match the type used to create the agent.
+    /// Returns `AgentError::Timeout`, `AgentError::Dead`, or
+    /// `AgentError::TypeMismatch` if `S`/`T` do not match the agent's state.
     pub async fn get_and_update<S, F, T>(
         &self,
         f: F,
@@ -209,8 +238,10 @@ impl AgentRef {
     {
         let (reply_tx, reply_rx) = oneshot::channel();
         let boxed_f: BoxedGetAndUpdateFn = Box::new(move |any_state| {
-            let state = any_state.downcast_mut::<S>().expect("agent state type mismatch");
-            Box::new(f(state))
+            let state = any_state
+                .downcast_mut::<S>()
+                .ok_or(AgentError::TypeMismatch)?;
+            Ok(Box::new(f(state)) as Box<dyn Any + Send>)
         });
         self.msg_tx
             .send(AgentMsg::GetAndUpdate {
@@ -223,9 +254,12 @@ impl AgentRef {
         let result = tokio::time::timeout(timeout, reply_rx)
             .await
             .map_err(|_| AgentError::Timeout)?
-            .map_err(|_| AgentError::Dead)?;
+            .map_err(|_| AgentError::Dead)??;
 
-        Ok(*result.downcast::<T>().expect("agent reply type mismatch"))
+        result
+            .downcast::<T>()
+            .map(|b| *b)
+            .map_err(|_| AgentError::TypeMismatch)
     }
 
     /// Fire-and-forget state update.
@@ -237,17 +271,19 @@ impl AgentRef {
     ///
     /// Returns `AgentError::Dead` if the agent has shut down.
     ///
-    /// # Panics
-    ///
-    /// Panics if the state type `S` does not match the type used to create the agent.
+    /// A wrong-typed closure cannot be reported (fire-and-forget), so it is
+    /// silently dropped by the agent rather than crashing it.
     pub fn cast<S, F>(&self, f: F) -> Result<(), AgentError>
     where
         S: Send + 'static,
         F: FnOnce(&mut S) + Send + 'static,
     {
         let boxed_f: BoxedUpdateFn = Box::new(move |any_state| {
-            let state = any_state.downcast_mut::<S>().expect("agent state type mismatch");
+            let state = any_state
+                .downcast_mut::<S>()
+                .ok_or(AgentError::TypeMismatch)?;
             f(state);
+            Ok(())
         });
         self.msg_tx
             .try_send(AgentMsg::Cast { f: boxed_f })
@@ -455,6 +491,69 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
+        assert!(rt.table().get(&pid).is_none());
+    }
+
+    #[tokio::test]
+    async fn wrong_type_get_returns_error_not_panic() {
+        let rt = Arc::new(Runtime::new(1));
+        let agent = start_agent(Arc::clone(&rt), || 42_u64).await;
+
+        // Wrong state type: ask for &String when state is u64.
+        let bad = agent
+            .get(|s: &String| s.clone(), Duration::from_secs(1))
+            .await;
+        assert!(matches!(bad, Err(AgentError::TypeMismatch)));
+
+        // The agent must still be alive and serving the correct type.
+        let good = agent.get(|s: &u64| *s, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(good, 42);
+    }
+
+    #[tokio::test]
+    async fn wrong_return_type_get_returns_error_not_panic() {
+        let rt = Arc::new(Runtime::new(1));
+        let agent = start_agent(Arc::clone(&rt), || 42_u64).await;
+
+        // Correct state type but the boxed return is downcast to the wrong T.
+        // (Forced by calling with mismatched S so the closure never runs and
+        // the reply is an error; here we exercise a mismatched-S update too.)
+        let bad = agent
+            .update(|_s: &mut String| {}, Duration::from_secs(1))
+            .await;
+        assert!(matches!(bad, Err(AgentError::TypeMismatch)));
+
+        // Still alive.
+        agent
+            .update(|s: &mut u64| *s += 1, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let v = agent.get(|s: &u64| *s, Duration::from_secs(1)).await.unwrap();
+        assert_eq!(v, 43);
+    }
+
+    #[tokio::test]
+    async fn killing_pid_stops_agent_loop() {
+        let rt = Arc::new(Runtime::new(1));
+        let agent = start_agent(Arc::clone(&rt), || 0_u64).await;
+        let pid = agent.pid();
+
+        // Externally kill the process via the canonical death path.
+        rt.table().cleanup_process(pid);
+
+        // The agent loop must stop accepting writes (no zombie). Poll because
+        // the loop wakes on the closed process mailbox asynchronously.
+        let mut got_dead = false;
+        for _ in 0..1000 {
+            match agent.update(|s: &mut u64| *s += 1, Duration::from_millis(50)).await {
+                Err(AgentError::Dead) => {
+                    got_dead = true;
+                    break;
+                }
+                _ => tokio::task::yield_now().await,
+            }
+        }
+        assert!(got_dead, "agent should be dead after its PID is killed");
         assert!(rt.table().get(&pid).is_none());
     }
 

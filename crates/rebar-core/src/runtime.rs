@@ -4,8 +4,10 @@ use std::sync::Arc;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
+use crate::pg::PgScope;
 use crate::process::mailbox::{Mailbox, MailboxRx};
-use crate::process::table::{ProcessHandle, ProcessTable};
+use crate::process::monitor::MonitorRef;
+use crate::process::table::{ProcessHandle, ProcessTable, RegistryError};
 use crate::process::{Message, ProcessId, SendError};
 use crate::router::{LocalRouter, MessageRouter, RouterKind};
 
@@ -15,6 +17,7 @@ pub struct ProcessContext {
     pid: ProcessId,
     rx: MailboxRx,
     router: Arc<RouterKind>,
+    table: Arc<ProcessTable>,
 }
 
 impl ProcessContext {
@@ -84,6 +87,57 @@ impl ProcessContext {
     ) -> crate::timer::TimerRef {
         let router: Arc<dyn crate::router::MessageRouter> = self.router.clone();
         crate::timer::send_interval(router, self.pid, self.pid, payload, interval)
+    }
+
+    /// Register a name for this process (like Erlang's `register/2`).
+    ///
+    /// The name is automatically unregistered when this process exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RegistryError::NameTaken` if the name is registered to a
+    /// different live process.
+    pub fn register(&self, name: impl Into<String>) -> Result<(), RegistryError> {
+        self.table.register(name, self.pid)
+    }
+
+    /// Look up the PID registered under a name (like Erlang's `whereis/1`).
+    #[must_use]
+    pub fn whereis(&self, name: &str) -> Option<ProcessId> {
+        self.table.whereis(name)
+    }
+
+    /// Send a message to the process currently registered under `name`.
+    ///
+    /// Unlike caching a PID, resolving the name on every send survives the
+    /// target being killed and respawned (as long as the new incarnation
+    /// re-registers, e.g. via a supervisor's registered child spec).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError::NameNotRegistered` if no process is registered
+    /// under the name, or any other `SendError` from the send itself.
+    pub async fn send_named(&self, name: &str, payload: rmpv::Value) -> Result<(), SendError> {
+        let dest = self
+            .table
+            .whereis(name)
+            .ok_or_else(|| SendError::NameNotRegistered(name.to_string()))?;
+        self.send(dest, payload).await
+    }
+
+    /// Monitor another process (like Erlang's `monitor/2`).
+    ///
+    /// When `target` exits, a [`DownMessage`](crate::process::monitor::DownMessage)
+    /// is delivered to this process's mailbox. If `target` is already dead,
+    /// the notification (reason `"noproc"`) is delivered immediately.
+    #[must_use]
+    pub fn monitor(&self, target: ProcessId) -> MonitorRef {
+        self.table.monitor(self.pid, target)
+    }
+
+    /// Remove a monitor created with [`monitor`](Self::monitor).
+    pub fn demonitor(&self, mref: MonitorRef) {
+        self.table.demonitor(mref);
     }
 }
 
@@ -157,6 +211,7 @@ impl Runtime {
             pid,
             rx,
             router: Arc::clone(&self.router),
+            table: Arc::clone(&self.table),
         };
 
         let table = Arc::clone(&self.table);
@@ -173,10 +228,11 @@ impl Runtime {
             }
             impl Drop for CleanupGuard {
                 fn drop(&mut self) {
-                    // Remove from table but defer the expensive channel
-                    // deallocation (mpsc block freeing) off the hot path
-                    // by moving the ProcessHandle to a spawned task.
-                    if let Some((_pid, handle)) = self.table.remove(&self.pid) {
+                    // Full death-time cleanup: unregister names, fire DOWN
+                    // notifications, run exit hooks. Defer the expensive
+                    // channel deallocation (mpsc block freeing) off the hot
+                    // path by moving the ProcessHandle to a spawned task.
+                    if let Some((_pid, handle)) = self.table.cleanup_process(self.pid) {
                         tokio::spawn(async move {
                             drop(handle);
                         });
@@ -202,6 +258,70 @@ impl Runtime {
     pub async fn send(&self, dest: ProcessId, payload: rmpv::Value) -> Result<(), SendError> {
         let from = ProcessId::new(self.node_id, 0);
         self.router.route(from, dest, payload)
+    }
+
+    /// Register a name for a live process (like Erlang's `register/2`).
+    ///
+    /// The name is automatically unregistered when the process exits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RegistryError::ProcessNotAlive` if `pid` is not alive, or
+    /// `RegistryError::NameTaken` if the name is registered to a different
+    /// live process.
+    pub fn register(&self, name: impl Into<String>, pid: ProcessId) -> Result<(), RegistryError> {
+        self.table.register(name, pid)
+    }
+
+    /// Look up the PID registered under a name (like Erlang's `whereis/1`).
+    #[must_use]
+    pub fn whereis(&self, name: &str) -> Option<ProcessId> {
+        self.table.whereis(name)
+    }
+
+    /// Remove a name registration. Returns the PID it pointed to, if any.
+    #[must_use = "returns the PID the name pointed to; check for None to detect a missing registration"]
+    pub fn unregister(&self, name: &str) -> Option<ProcessId> {
+        self.table.unregister(name)
+    }
+
+    /// Send a message to the process currently registered under `name`,
+    /// resolving the name at send time.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SendError::NameNotRegistered` if no process is registered
+    /// under the name, or any other `SendError` from the send itself.
+    pub async fn send_named(&self, name: &str, payload: rmpv::Value) -> Result<(), SendError> {
+        let dest = self
+            .table
+            .whereis(name)
+            .ok_or_else(|| SendError::NameNotRegistered(name.to_string()))?;
+        self.send(dest, payload).await
+    }
+
+    /// Have `watcher` monitor `target`. See [`ProcessTable::monitor`].
+    #[must_use]
+    pub fn monitor(&self, watcher: ProcessId, target: ProcessId) -> MonitorRef {
+        self.table.monitor(watcher, target)
+    }
+
+    /// Remove a monitor created with [`monitor`](Self::monitor).
+    pub fn demonitor(&self, mref: MonitorRef) {
+        self.table.demonitor(mref);
+    }
+
+    /// Attach a pg scope to this runtime so that exiting processes are
+    /// automatically removed from all groups in the scope.
+    ///
+    /// Holds only a weak reference: dropping the scope detaches it.
+    pub fn attach_pg_scope(&self, scope: &Arc<PgScope>) {
+        let weak = Arc::downgrade(scope);
+        self.table.add_exit_hook(move |pid| {
+            if let Some(scope) = weak.upgrade() {
+                scope.remove_pid(pid);
+            }
+        });
     }
 }
 

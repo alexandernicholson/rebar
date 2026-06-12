@@ -20,18 +20,28 @@ where
     T: Send + 'static,
 {
     let (result_tx, result_rx) = oneshot::channel();
+    let (abort_tx, abort_rx) = oneshot::channel();
 
     let pid = runtime
         .spawn(move |_ctx| async move {
-            let result = f().await;
-            let _ = result_tx.send(result);
+            // Run the user future as an inner tokio task so we can hand its
+            // `AbortHandle` back to the `Task`. Without this, `shutdown()`
+            // could never actually stop a long-running task.
+            let inner = tokio::spawn(async move {
+                let result = f().await;
+                let _ = result_tx.send(result);
+            });
+            let _ = abort_tx.send(inner.abort_handle());
+            // Keep the process alive until the user future finishes (or is
+            // aborted), so the process table reflects the task's lifetime.
+            let _ = inner.await;
         })
         .await;
 
     Task {
         pid,
         result_rx: Some(result_rx),
-        join_handle: None,
+        abort_handle: abort_rx.await.ok(),
     }
 }
 
@@ -45,18 +55,23 @@ where
     T: Send + 'static,
 {
     let (result_tx, result_rx) = oneshot::channel();
+    let (abort_tx, abort_rx) = oneshot::channel();
 
     let pid = runtime
         .spawn(move |ctx| async move {
-            let result = f(ctx).await;
-            let _ = result_tx.send(result);
+            let inner = tokio::spawn(async move {
+                let result = f(ctx).await;
+                let _ = result_tx.send(result);
+            });
+            let _ = abort_tx.send(inner.abort_handle());
+            let _ = inner.await;
         })
         .await;
 
     Task {
         pid,
         result_rx: Some(result_rx),
-        join_handle: None,
+        abort_handle: abort_rx.await.ok(),
     }
 }
 
@@ -71,10 +86,19 @@ impl<T: Send + 'static> Task<T> {
     /// Returns `TaskError::ProcessDead` if the task panicked or was already consumed.
     /// Returns `TaskError::Timeout` if the task didn't complete within the duration.
     pub async fn await_result(&mut self, timeout: Duration) -> Result<T, TaskError> {
-        let rx = self.result_rx.take().ok_or(TaskError::ProcessDead)?;
+        // Borrow the receiver rather than taking it: a timeout must leave a
+        // still-pending result recoverable on a subsequent call instead of
+        // permanently destroying it (or misreporting it as `ProcessDead`).
+        let rx = self.result_rx.as_mut().ok_or(TaskError::ProcessDead)?;
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(val)) => Ok(val),
-            Ok(Err(_)) => Err(TaskError::ProcessDead),
+            Ok(Ok(val)) => {
+                self.result_rx = None;
+                Ok(val)
+            }
+            Ok(Err(_)) => {
+                self.result_rx = None;
+                Err(TaskError::ProcessDead)
+            }
             Err(_) => Err(TaskError::Timeout),
         }
     }
@@ -114,8 +138,10 @@ impl<T: Send + 'static> Task<T> {
                 Err(oneshot::error::TryRecvError::Closed) => return None,
             }
         }
-        // Kill the task process by aborting its join handle
-        if let Some(handle) = self.join_handle.take() {
+        // Kill the running task by aborting the tokio task that drives the
+        // user future. Dropping `result_rx` is not enough — the future would
+        // keep running to completion.
+        if let Some(handle) = self.abort_handle.take() {
             handle.abort();
         }
         None
@@ -161,7 +187,9 @@ where
     let f = Arc::new(f);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(opts.max_concurrency));
 
-    let mut tasks: Vec<(usize, Task<T>)> = Vec::new();
+    // Each task reports an explicit `Result` so a per-item timeout is
+    // distinguishable from a process death (channel closed before sending).
+    let mut tasks: Vec<(usize, oneshot::Receiver<Result<T, TaskError>>)> = Vec::new();
 
     for (idx, item) in items.into_iter().enumerate() {
         let permit = semaphore
@@ -174,35 +202,25 @@ where
 
         let (result_tx, result_rx) = oneshot::channel();
 
-        let pid = runtime
+        runtime
             .spawn(move |_ctx| async move {
-                let result = tokio::time::timeout(timeout, f(item)).await;
-                if let Ok(val) = result {
-                    let _ = result_tx.send(val);
-                } else {
-                    drop(result_tx); // signals timeout via channel close
-                }
+                let outcome = tokio::time::timeout(timeout, f(item))
+                    .await
+                    .map_err(|_| TaskError::Timeout);
+                let _ = result_tx.send(outcome);
                 drop(permit);
             })
             .await;
 
-        tasks.push((
-            idx,
-            Task {
-                pid,
-                result_rx: Some(result_rx),
-                join_handle: None,
-            },
-        ));
+        tasks.push((idx, result_rx));
     }
 
-    // Collect results by awaiting each oneshot
+    // Collect results by awaiting each oneshot. A closed channel (no value
+    // sent, e.g. the process panicked) maps to `ProcessDead`; an explicit
+    // `Err(Timeout)` maps to a timeout.
     let mut results: Vec<(usize, Result<T, TaskError>)> = Vec::with_capacity(tasks.len());
-    for (idx, mut task) in tasks {
-        let result = match task.result_rx.take() {
-            Some(rx) => rx.await.map_err(|_| TaskError::ProcessDead),
-            None => Err(TaskError::ProcessDead),
-        };
+    for (idx, rx) in tasks {
+        let result = rx.await.unwrap_or(Err(TaskError::ProcessDead));
         results.push((idx, result));
     }
 
@@ -318,6 +336,80 @@ mod tests {
 
         let result = task.shutdown().await;
         assert_eq!(result, Some(42));
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_running_task() {
+        let rt = Runtime::new(1);
+        let ran_to_completion = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran_to_completion.clone();
+
+        let task = async_task(&rt, move || async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            flag.store(true, Ordering::SeqCst);
+            42_u64
+        })
+        .await;
+        let pid = task.pid();
+
+        // Shutdown should abort the still-running task, not wait 60s.
+        let result = tokio::time::timeout(Duration::from_secs(2), task.shutdown())
+            .await
+            .expect("shutdown must not block on the long task");
+        assert_eq!(result, None);
+
+        // The process should be torn down (its body returns once aborted).
+        for _ in 0..1000 {
+            if rt.table().get(&pid).is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(rt.table().get(&pid).is_none(), "task process should be gone");
+        // The body never completed.
+        assert!(!ran_to_completion.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn await_result_timeout_preserves_pending_result() {
+        let rt = Runtime::new(1);
+        let mut task = async_task(&rt, || async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            7_u64
+        })
+        .await;
+
+        // First await times out — must NOT consume the result.
+        let first = task.await_result(Duration::from_millis(1)).await;
+        assert!(matches!(first, Err(TaskError::Timeout)));
+
+        // Second await still recovers the real value (not ProcessDead).
+        let second = task.await_result(Duration::from_secs(2)).await;
+        assert_eq!(second.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn async_map_per_item_timeout_is_reported_as_timeout() {
+        let rt = Arc::new(Runtime::new(1));
+        let results = async_map(
+            rt,
+            vec![1_u64],
+            |_x| async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                0_u64
+            },
+            StreamOpts {
+                max_concurrency: 1,
+                ordered: true,
+                timeout: Duration::from_millis(10),
+            },
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(
+            matches!(results[0], Err(TaskError::Timeout)),
+            "per-item timeout should be Timeout, not ProcessDead"
+        );
     }
 
     #[tokio::test]

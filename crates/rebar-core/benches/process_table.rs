@@ -13,7 +13,7 @@ fn bench_allocate_pid(c: &mut Criterion) {
     group.bench_function("single_thread", |b| {
         let table = ProcessTable::new(1);
         b.iter(|| {
-            table.allocate_pid();
+            let _ = table.allocate_pid();
         });
     });
 
@@ -30,7 +30,7 @@ fn bench_allocate_pid(c: &mut Criterion) {
                         let t = Arc::clone(&table);
                         handles.push(std::thread::spawn(move || {
                             for _ in 0..100 {
-                                t.allocate_pid();
+                                let _ = t.allocate_pid();
                             }
                         }));
                     }

@@ -2,7 +2,7 @@
 //!
 //! These tests exercise the rebar-cluster components working together:
 //! SWIM membership + gossip, TCP transport + wire protocol, OR-Set registry
-//! with delta replication, and the ConnectionManager with mock transport.
+//! with delta replication, and the `ConnectionManager` with mock transport.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -28,7 +28,7 @@ struct MockConnection {
 }
 
 impl MockConnection {
-    fn new(sent: Arc<Mutex<Vec<Vec<u8>>>>) -> Self {
+    const fn new(sent: Arc<Mutex<Vec<Vec<u8>>>>) -> Self {
         Self { sent }
     }
 }
@@ -63,10 +63,6 @@ impl MockConnector {
         }
     }
 
-    #[allow(dead_code)]
-    fn set_should_fail(&self, fail: bool) {
-        *self.should_fail.lock().unwrap() = fail;
-    }
 }
 
 #[async_trait::async_trait]
@@ -100,10 +96,10 @@ impl TransportConnector for ArcConnector {
 }
 
 fn test_addr(port: u16) -> SocketAddr {
-    format!("127.0.0.1:{}", port).parse().unwrap()
+    format!("127.0.0.1:{port}").parse().unwrap()
 }
 
-fn pid(node: u64, local: u64) -> ProcessId {
+const fn pid(node: u64, local: u64) -> ProcessId {
     ProcessId::new(node, local)
 }
 
@@ -244,8 +240,8 @@ async fn send_message_across_nodes() {
 /// Simulate the monitor protocol flow over TCP:
 /// 1. Node A sends a Monitor request frame to Node B.
 /// 2. Node B receives it and verifies the message type.
-/// 3. Node B sends a ProcessDown frame back to Node A.
-/// 4. Node A verifies the ProcessDown frame.
+/// 3. Node B sends a `ProcessDown` frame back to Node A.
+/// 4. Node A verifies the `ProcessDown` frame.
 #[tokio::test]
 async fn remote_process_monitor_fires_on_exit() {
     let transport = TcpTransport::new();
@@ -376,8 +372,8 @@ async fn registry_name_resolves_across_nodes() {
 
 // ─── Test 5: node_down_fires_when_node_disconnects ─────────────────────────
 
-/// Use the ConnectionManager with a mock transport. Connect to a node, then
-/// trigger on_connection_lost. Verify the NodeDown event is emitted.
+/// Use the `ConnectionManager` with a mock transport. Connect to a node, then
+/// trigger `on_connection_lost`. Verify the `NodeDown` event is emitted.
 #[tokio::test]
 async fn node_down_fires_when_node_disconnects() {
     let connector = Arc::new(MockConnector::new());
@@ -389,13 +385,12 @@ async fn node_down_fires_when_node_disconnects() {
     assert_eq!(mgr.connection_count(), 1);
 
     // Simulate connection loss
-    let events = mgr.on_connection_lost(5).await;
+    let events = mgr.on_connection_lost(5);
 
     // Verify NodeDown event was emitted
     assert!(
         events.contains(&ConnectionEvent::NodeDown(5)),
-        "should emit NodeDown(5), got: {:?}",
-        events
+        "should emit NodeDown(5), got: {events:?}"
     );
 
     // Node should no longer be connected
@@ -405,7 +400,7 @@ async fn node_down_fires_when_node_disconnects() {
 
 // ─── Test 6: reconnection_after_transient_failure ──────────────────────────
 
-/// Connect to a node, simulate connection loss, then use attempt_reconnect
+/// Connect to a node, simulate connection loss, then use `attempt_reconnect`
 /// to restore the connection. Verify the node is connected again afterward.
 #[tokio::test]
 async fn reconnection_after_transient_failure() {
@@ -417,7 +412,7 @@ async fn reconnection_after_transient_failure() {
     assert!(mgr.is_connected(10));
 
     // Simulate transient failure — connection lost
-    let events = mgr.on_connection_lost(10).await;
+    let events = mgr.on_connection_lost(10);
     assert!(events.contains(&ConnectionEvent::NodeDown(10)));
     assert!(events.contains(&ConnectionEvent::ReconnectTriggered(10)));
     assert!(!mgr.is_connected(10));
@@ -436,8 +431,8 @@ async fn reconnection_after_transient_failure() {
 
 // ─── Test 7: three_node_mesh_all_connected ─────────────────────────────────
 
-/// Simulate three nodes, each with a ConnectionManager, forming a full mesh.
-/// Each node connects to the other two. Verify each has connection_count() == 2.
+/// Simulate three nodes, each with a `ConnectionManager`, forming a full mesh.
+/// Each node connects to the other two. Verify each has `connection_count()` == 2.
 #[tokio::test]
 async fn three_node_mesh_all_connected() {
     // Create three independent ConnectionManagers (one per node)
@@ -494,7 +489,7 @@ async fn three_node_mesh_all_connected() {
 
 // ─── Test 8: end_to_end_cross_node_send_via_tcp ────────────────────────────
 
-/// End-to-end: two DistributedRuntimes send messages via TCP transport.
+/// End-to-end: two `DistributedRuntime`s send messages via TCP transport.
 #[tokio::test]
 async fn end_to_end_cross_node_send_via_tcp() {
     struct TcpConnector;
@@ -513,7 +508,7 @@ async fn end_to_end_cross_node_send_via_tcp() {
 
     // --- Node 1 setup ---
     let table1 = Arc::new(ProcessTable::new(1));
-    let (remote_tx1, mut remote_rx1) = mpsc::channel::<RouterCommand>(64);
+    let (remote_tx1, mut outbound_rx1) = mpsc::channel::<RouterCommand>(64);
     let router1 = Arc::new(DistributedRouter::new(1, Arc::clone(&table1), remote_tx1));
     let rt1 = Runtime::with_router(1, Arc::clone(&table1), router1);
 
@@ -549,14 +544,9 @@ async fn end_to_end_cross_node_send_via_tcp() {
     let table2_clone = Arc::clone(&table2);
     let server = tokio::spawn(async move {
         let mut conn = listener.accept().await.unwrap();
-        loop {
-            match conn.recv().await {
-                Ok(frame) => {
-                    deliver_inbound_frame(&table2_clone, &frame)
-                        .expect("inbound frame delivery should succeed");
-                }
-                Err(_) => break,
-            }
+        while let Ok(frame) = conn.recv().await {
+            deliver_inbound_frame(&table2_clone, &frame)
+                .expect("inbound frame delivery should succeed");
         }
     });
 
@@ -570,7 +560,7 @@ async fn end_to_end_cross_node_send_via_tcp() {
         .unwrap();
 
     // Node 1: process the outbound message (drain remote_rx1 → connection_manager)
-    if let Some(RouterCommand::Send { node_id, frame }) = remote_rx1.recv().await {
+    if let Some(RouterCommand::Send { node_id, frame }) = outbound_rx1.recv().await {
         assert_eq!(node_id, 2);
         mgr1.route(2, &frame).await.unwrap();
     }

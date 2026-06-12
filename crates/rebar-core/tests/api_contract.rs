@@ -56,16 +56,18 @@ fn process_id_is_copy_send_sync() {
     assert_eq!(a, b); // original still usable
 }
 
-/// Guards that `SendError` has exactly three variants: `ProcessDead`, `MailboxFull`, `NodeUnreachable`.
+/// Guards that `SendError` has exactly four variants: `ProcessDead`,
+/// `MailboxFull`, `NodeUnreachable`, and `NameNotRegistered`.
 ///
 /// The fork may add or remove error variants. This exhaustive match ensures all
-/// three canonical variants exist and no others have been introduced.
+/// four canonical variants exist and no others have been introduced.
 #[test]
 fn send_error_variants_exhaustive() {
     let errors: Vec<SendError> = vec![
         SendError::ProcessDead(ProcessId::new(1, 1)),
         SendError::MailboxFull(ProcessId::new(1, 2)),
         SendError::NodeUnreachable(99),
+        SendError::NameNotRegistered("name".into()),
     ];
 
     for err in &errors {
@@ -73,7 +75,8 @@ fn send_error_variants_exhaustive() {
         match err {
             SendError::ProcessDead(_)
             | SendError::MailboxFull(_)
-            | SendError::NodeUnreachable(_) => {}
+            | SendError::NodeUnreachable(_)
+            | SendError::NameNotRegistered(_) => {}
         }
     }
 }

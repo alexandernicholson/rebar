@@ -76,12 +76,20 @@ impl<S: GenServer> GenServerRef<S> {
             from: ProcessId::new(0, 0), // caller PID not tracked for now
             reply_tx,
         };
-        self.call_tx
-            .send(envelope)
-            .await
-            .map_err(|_| CallError::ServerDead)?;
 
-        match tokio::time::timeout(timeout, reply_rx).await {
+        // The whole call — enqueue plus reply — shares one timeout budget so a
+        // full or suspended server cannot hang the caller indefinitely on the
+        // `send().await` alone. A bounded `call_tx` channel only completes the
+        // send once the server makes room, which a suspended server never does.
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        match tokio::time::timeout_at(deadline, self.call_tx.send(envelope)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(CallError::ServerDead),
+            Err(_) => return Err(CallError::Timeout),
+        }
+
+        match tokio::time::timeout_at(deadline, reply_rx).await {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(_)) => Err(CallError::ServerDead),
             Err(_) => Err(CallError::Timeout),
@@ -326,10 +334,13 @@ pub async fn spawn_gen_server<S: GenServer>(
 
             // Event loop: select between sys, call, cast, info, and continue
             loop {
-                // Process any pending continue messages before external messages.
-                // This ensures handle_continue runs before the next mailbox message,
-                // matching Elixir's semantics.
-                while let Ok(payload) = continue_rx.try_recv() {
+                // Process at most ONE pending continue before external messages.
+                // This keeps handle_continue ahead of the next mailbox message
+                // (matching Elixir's semantics) while ensuring a continue that
+                // re-enqueues itself cannot starve sys/shutdown: each iteration
+                // falls through to the select! below, which still observes any
+                // freshly queued continue on the next pass.
+                if let Ok(payload) = continue_rx.try_recv() {
                     server
                         .handle_continue(payload, &mut state, &ctx)
                         .await;
@@ -340,79 +351,87 @@ pub async fn spawn_gen_server<S: GenServer>(
                     handle_sys_command::<S>(cmd, &state, &mut debug, pid);
                 }
 
-                // If suspended, enter a loop that only processes sys commands.
+                // If suspended, only process sys commands until a Resume; the
+                // loop also ends if the sys channel closes (→ shutdown).
                 if debug.suspended {
-                    loop {
-                        if let Some(cmd) = sys_rx.recv().await {
-                            let resumed =
-                                handle_sys_command::<S>(cmd, &state, &mut debug, pid);
-                            if resumed {
-                                break;
-                            }
-                        } else {
-                            // sys channel closed — server shutting down
-                            server.terminate(ExitReason::Normal, &mut state).await;
-                            return;
+                    while let Some(cmd) = sys_rx.recv().await {
+                        if handle_sys_command::<S>(cmd, &state, &mut debug, pid) {
+                            break; // resumed
                         }
                     }
-                    // After resuming, restart the main loop
-                    continue;
+                    if debug.suspended {
+                        break; // channel closed, not a Resume → shut down
+                    }
+                    continue; // resumed → restart the loop
                 }
 
+                // `biased` select: a client's `cast` then `call` travel on
+                // distinct channels, so the later `call` may be observed first.
+                // Strict per-sender ordering would need one shared channel (a
+                // public-shape rework); clients needing it must synchronise.
                 tokio::select! {
                     biased;
 
                     // Highest priority: sys debug commands
                     cmd = sys_rx.recv() => {
-                        if let Some(cmd) = cmd {
-                            handle_sys_command::<S>(cmd, &state, &mut debug, pid);
-                            // If we just got suspended, the top of the loop
-                            // will enter the suspended branch.
-                        } else {
-                            // sys channel closed — all refs dropped
-                            server.terminate(ExitReason::Normal, &mut state).await;
-                            break;
-                        }
+                        let Some(cmd) = cmd else { break }; // all refs dropped
+                        handle_sys_command::<S>(cmd, &state, &mut debug, pid);
                     }
 
                     // Prioritize calls (they have timeouts)
                     call = call_rx.recv() => {
-                        if let Some(envelope) = call {
-                            let reply = server
-                                .handle_call(envelope.msg, envelope.from, &mut state, &ctx)
-                                .await;
-                            let _ = envelope.reply_tx.send(reply);
-                        } else {
-                            // All call senders dropped
-                            server.terminate(ExitReason::Normal, &mut state).await;
-                            break;
-                        }
+                        let Some(envelope) = call else { break };
+                        let reply = server
+                            .handle_call(envelope.msg, envelope.from, &mut state, &ctx)
+                            .await;
+                        let _ = envelope.reply_tx.send(reply);
                     }
 
                     cast = cast_rx.recv() => {
-                        if let Some(msg) = cast {
-                            server.handle_cast(msg, &mut state, &ctx).await;
-                        } else {
-                            server.terminate(ExitReason::Normal, &mut state).await;
-                            break;
-                        }
+                        let Some(msg) = cast else { break };
+                        server.handle_cast(msg, &mut state, &ctx).await;
                     }
 
                     info = mailbox_rx.recv() => {
-                        if let Some(msg) = info {
-                            server.handle_info(msg, &mut state, &ctx).await;
-                        } else {
-                            server.terminate(ExitReason::Normal, &mut state).await;
-                            break;
-                        }
+                        let Some(msg) = info else { break };
+                        server.handle_info(msg, &mut state, &ctx).await;
+                    }
+
+                    // Lowest priority: a continue that arrived after the top-of-loop
+                    // `try_recv`. Because we only take one continue per iteration up
+                    // top, this arm guarantees a pending continue is eventually run
+                    // even when no external message is flowing — without letting a
+                    // self-reenqueuing continue starve the higher-priority arms.
+                    Some(payload) = continue_rx.recv() => {
+                        server.handle_continue(payload, &mut state, &ctx).await;
                     }
                 }
             }
+
+            // Graceful shutdown: best-effort drain of any pending casts and info
+            // messages so they are not silently lost, then run `terminate`. Calls
+            // are intentionally not drained — their callers will observe
+            // `ServerDead`/`Timeout` and can retry. Sys commands are debug-only.
+            while let Ok(msg) = cast_rx.try_recv() {
+                server.handle_cast(msg, &mut state, &ctx).await;
+            }
+            while let Some(msg) = mailbox_rx.try_recv() {
+                server.handle_info(msg, &mut state, &ctx).await;
+            }
+            server.terminate(ExitReason::Normal, &mut state).await;
         });
 
-        // Panic isolation: whether inner completes or panics, clean up
-        let _ = inner.await;
-        table.remove(&pid);
+        // Panic isolation: whether the inner task completes or panics, route
+        // the death through `cleanup_process` so monitors get a `DOWN` and
+        // names are unregistered. A panic surfaces as a `JoinError`; report it
+        // (don't swallow) but never panic in this guard, or cleanup would be
+        // skipped and a watcher would hang forever.
+        if let Err(join_err) = inner.await
+            && join_err.is_panic()
+        {
+            eprintln!("rebar gen_server {pid} panicked: {join_err}");
+        }
+        table.cleanup_process(pid);
     });
 
     GenServerRef {

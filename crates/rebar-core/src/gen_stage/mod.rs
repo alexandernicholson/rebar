@@ -257,6 +257,63 @@ mod tests {
         }
     }
 
+    /// A producer that emits at most `total` distinct integers across all
+    /// demand, then emits nothing more. Useful for asserting that every event
+    /// reaches every broadcast subscriber.
+    struct FiniteProducer {
+        total: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl GenStage for FiniteProducer {
+        type State = u64; // next value to emit
+
+        async fn init(&self) -> Result<(StageType, Self::State), String> {
+            Ok((StageType::Producer, 0))
+        }
+
+        async fn handle_demand(
+            &self,
+            demand: usize,
+            state: &mut Self::State,
+        ) -> Vec<rmpv::Value> {
+            let mut events = Vec::new();
+            for _ in 0..demand {
+                if *state >= self.total {
+                    break;
+                }
+                events.push(rmpv::Value::Integer((*state).into()));
+                *state += 1;
+            }
+            events
+        }
+    }
+
+    /// A producer-consumer that forwards events unchanged and counts how many
+    /// it has emitted downstream (used to bound-check buffering).
+    struct PassthroughPC {
+        emitted: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl GenStage for PassthroughPC {
+        type State = ();
+
+        async fn init(&self) -> Result<(StageType, Self::State), String> {
+            Ok((StageType::ProducerConsumer, ()))
+        }
+
+        async fn handle_events(
+            &self,
+            events: Vec<rmpv::Value>,
+            _from: SubscriptionTag,
+            _state: &mut Self::State,
+        ) -> Vec<rmpv::Value> {
+            self.emitted.fetch_add(events.len(), Ordering::Relaxed);
+            events
+        }
+    }
+
     /// A stage that fails init.
     struct FailInit;
 
@@ -346,7 +403,7 @@ mod tests {
     async fn stage_stops_cleanly() {
         let rt = Arc::new(Runtime::new(1));
         let terminated = Arc::new(AtomicUsize::new(0));
-        let _stage_ref = spawn_stage(
+        let stage_ref = spawn_stage(
             Arc::clone(&rt),
             TerminateTracker {
                 terminated: Arc::clone(&terminated),
@@ -354,7 +411,7 @@ mod tests {
         )
         .await;
         // Drop the ref to close the channel
-        drop(_stage_ref);
+        drop(stage_ref);
         for _ in 0..1000 {
             if terminated.load(Ordering::Relaxed) > 0 { break; }
             tokio::task::yield_now().await;
@@ -436,8 +493,8 @@ mod tests {
         }
 
         // Producer should have generated exactly max_demand events initially
-        let produced = counter.load(Ordering::Relaxed);
-        assert!(produced >= 5, "expected at least 5, got {produced}");
+        let produced_count = counter.load(Ordering::Relaxed);
+        assert!(produced_count >= 5, "expected at least 5, got {produced_count}");
     }
 
     // -----------------------------------------------------------------------
@@ -566,11 +623,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let produced = counter.load(Ordering::Relaxed);
+        let produced_count = counter.load(Ordering::Relaxed);
         // Should produce more than just the initial max_demand (4) due to re-asks
         assert!(
-            produced > 4,
-            "expected re-asks to produce more than 4, got {produced}"
+            produced_count > 4,
+            "expected re-asks to produce more than 4, got {produced_count}"
         );
     }
 
@@ -1063,20 +1120,23 @@ mod tests {
 
         // Wait for the slow consumer to process some events
         for _ in 0..1000 {
-            if collected.lock().await.len() > 0 { break; }
+            if !collected.lock().await.is_empty() { break; }
             tokio::task::yield_now().await;
         }
         // Let a few more batches flow for a meaningful back-pressure check
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let produced = counter.load(Ordering::Relaxed);
-        let consumed = collected.lock().await.len();
+        let produced_count = counter.load(Ordering::Relaxed);
+        let consumed_count = collected.lock().await.len();
         // Due to back-pressure, the producer shouldn't have run ahead unboundedly
         assert!(
-            produced < 100,
-            "producer should be back-pressured, produced: {produced}"
+            produced_count < 100,
+            "producer should be back-pressured, produced: {produced_count}"
         );
-        assert!(consumed > 0, "consumer should have processed some events");
+        assert!(
+            consumed_count > 0,
+            "consumer should have processed some events"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1295,5 +1355,182 @@ mod tests {
         assert!(format!("{err}").contains("timeout"));
         let err = StageError::SubscriptionFailed("bad".into());
         assert!(format!("{err}").contains("bad"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 31. Broadcast to unequal-demand subscribers delivers all events to both
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn broadcast_unequal_demand_delivers_all_events() {
+        let rt = Arc::new(Runtime::new(1));
+        let collected1 = Arc::new(Mutex::new(Vec::new()));
+        let collected2 = Arc::new(Mutex::new(Vec::new()));
+
+        // Finite producer so we can assert *every* event reaches *both*
+        // consumers despite unequal demand windows.
+        let total: u64 = 20;
+        let producer = spawn_stage_with_dispatcher(
+            Arc::clone(&rt),
+            FiniteProducer { total },
+            BroadcastDispatcher::new(),
+        )
+        .await;
+
+        // Manual consumers so BOTH are subscribed before any event is
+        // produced (avoiding the inherent broadcast late-subscriber race) and
+        // so we drive demand explicitly with unequal windows.
+        let consumer1 = spawn_stage(
+            Arc::clone(&rt),
+            ManualConsumer {
+                collected: Arc::clone(&collected1),
+            },
+        )
+        .await;
+        let consumer2 = spawn_stage(
+            Arc::clone(&rt),
+            ManualConsumer {
+                collected: Arc::clone(&collected2),
+            },
+        )
+        .await;
+
+        let tag1 = consumer1
+            .subscribe(&producer, SubscribeOpts::new(100, 1))
+            .await
+            .unwrap();
+        let tag2 = consumer2
+            .subscribe(&producer, SubscribeOpts::new(100, 1))
+            .await
+            .unwrap();
+
+        // Deliberately unequal demand: consumer1 asks for a large window up
+        // front, consumer2 dribbles demand a few at a time. Broadcast must
+        // still deliver EVERY event to BOTH — the small-demand subscriber must
+        // not silently lose the events beyond its current window.
+        consumer1.ask(tag1, usize::try_from(total).unwrap()).await.unwrap();
+        for _ in 0..total {
+            consumer2.ask(tag2, 1).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+
+        // Both consumers must eventually receive all `total` events.
+        for _ in 0..100_000 {
+            if collected1.lock().await.len() >= usize::try_from(total).unwrap()
+                && collected2.lock().await.len() >= usize::try_from(total).unwrap()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let c1 = collected1.lock().await;
+        let c2 = collected2.lock().await;
+        let expected: Vec<rmpv::Value> =
+            (0..total).map(|i| rmpv::Value::Integer(i.into())).collect();
+        assert_eq!(*c1, expected, "consumer1 must receive every event in order");
+        assert_eq!(*c2, expected, "consumer2 must receive every event in order");
+    }
+
+    // -----------------------------------------------------------------------
+    // 32. A slow/absent downstream behind a ProducerConsumer stays bounded
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn producer_consumer_with_absent_downstream_stays_bounded() {
+        let rt = Arc::new(Runtime::new(1));
+        let produced_count = Arc::new(AtomicUsize::new(0));
+        let pc_emitted = Arc::new(AtomicUsize::new(0));
+
+        let producer = spawn_stage(
+            Arc::clone(&rt),
+            CounterProducer {
+                counter: Arc::clone(&produced_count),
+            },
+        )
+        .await;
+
+        let pc = spawn_stage(
+            Arc::clone(&rt),
+            PassthroughPC {
+                emitted: Arc::clone(&pc_emitted),
+            },
+        )
+        .await;
+
+        // PC subscribes upstream, but NO downstream consumer subscribes to the
+        // PC — so the PC has zero downstream demand. With the bounded-buffer +
+        // demand-gated re-ask fix, the PC must not pull an unbounded stream
+        // from the producer.
+        pc.subscribe(&producer, SubscribeOpts::new(4, 2))
+            .await
+            .unwrap();
+
+        // Give the pipeline plenty of opportunity to run away if unbounded.
+        for _ in 0..50_000 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let total_produced = produced_count.load(Ordering::Relaxed);
+        // Without the fix the producer would be re-asked forever and emit an
+        // ever-growing count. With the fix it stops after at most the initial
+        // window plus a small constant.
+        assert!(
+            total_produced <= 1_000,
+            "producer ran away with no downstream demand: produced {total_produced}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 33. Producer death propagates Cancel{Down} to a subscribed consumer
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn producer_death_propagates_cancel_to_consumer() {
+        let rt = Arc::new(Runtime::new(1));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+
+        let producer = spawn_stage(
+            Arc::clone(&rt),
+            CounterProducer {
+                counter: Arc::clone(&counter),
+            },
+        )
+        .await;
+
+        let consumer = spawn_stage(
+            Arc::clone(&rt),
+            CancelTracker {
+                cancelled: Arc::clone(&cancelled),
+            },
+        )
+        .await;
+
+        let tag = consumer
+            .subscribe(&producer, SubscribeOpts::new(5, 3))
+            .await
+            .unwrap();
+
+        // Dropping the only producer handle closes its command channel and
+        // terminates the producer loop, which must emit Cancel{Down} to the
+        // downstream consumer.
+        drop(producer);
+
+        for _ in 0..100_000 {
+            if !cancelled.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let cancels = cancelled.lock().await;
+        assert!(
+            cancels
+                .iter()
+                .any(|(reason, t)| *reason == CancelReason::Down && *t == tag),
+            "consumer should receive Cancel{{Down}} when producer dies, got {cancels:?}"
+        );
     }
 }

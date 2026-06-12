@@ -705,7 +705,7 @@ mod tests {
     #[async_trait::async_trait]
     impl GenStatem for StateTimeoutCancelStatem {
         type State = TwoState;
-        type Data = ();
+        type Data = bool;
         type Call = String;
         type Cast = String;
         type Reply = bool;
@@ -715,7 +715,7 @@ mod tests {
         }
 
         async fn init(&self) -> Result<(Self::State, Self::Data), String> {
-            Ok((TwoState::A, ()))
+            Ok((TwoState::A, false))
         }
 
         async fn handle_event(
@@ -723,22 +723,29 @@ mod tests {
             event_type: EventType<Self::Reply>,
             _event: rmpv::Value,
             state: &Self::State,
-            _data: &mut Self::Data,
+            data: &mut Self::Data,
         ) -> TransitionResult<Self::State, Self::Data, Self::Reply> {
             match event_type {
-                EventType::Cast => {
-                    if *state == TwoState::A {
-                        TransitionResult::NextState {
-                            state: TwoState::B,
-                            data: (),
-                            actions: vec![Action::StateTimeout(
-                                Duration::from_millis(50),
-                                rmpv::Value::Nil,
-                            )],
-                        }
-                    } else {
-                        TransitionResult::KeepStateAndData { actions: vec![] }
+                // First cast: stay in state A and arm a long-lived state timeout.
+                EventType::Cast if *state == TwoState::A && !*data => {
+                    TransitionResult::KeepState {
+                        data: true,
+                        actions: vec![Action::StateTimeout(
+                            Duration::from_millis(50),
+                            rmpv::Value::Nil,
+                        )],
                     }
+                }
+                // Second cast: leave A -> B WITHOUT arming a new state timeout,
+                // so the pre-existing (old-state) timeout must be cancelled by
+                // the state change.
+                EventType::Cast if *state == TwoState::A => TransitionResult::NextState {
+                    state: TwoState::B,
+                    data: true,
+                    actions: vec![],
+                },
+                EventType::Cast => {
+                    TransitionResult::KeepStateAndData { actions: vec![] }
                 }
                 EventType::StateTimeout => {
                     self.timeout_fired.store(true, Ordering::SeqCst);
@@ -767,6 +774,10 @@ mod tests {
         )
         .await;
 
+        // Arm a 50ms state timeout while remaining in state A, then immediately
+        // transition A -> B (which arms no new state timeout). The pre-existing
+        // timeout must be cancelled by the state change.
+        statem_ref.cast("arm".to_string()).unwrap();
         statem_ref.cast("go".to_string()).unwrap();
         // Must wait longer than the 50ms timeout to confirm it did NOT fire
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2013,5 +2024,270 @@ mod tests {
         };
         let debug = format!("{result:?}");
         assert!(debug.contains("Stop"));
+    }
+
+    // ========================================================================
+    // 35. routable_via_pid_and_monitor_fires_down_on_exit  (regression)
+    //
+    // Verifies fix C1/C2: the statem is inserted into the process table at
+    // spawn (routable via its PID, delivering EventType::Info), monitorable,
+    // and that its death runs the canonical cleanup path so a watcher receives
+    // a DOWN message.
+    // ========================================================================
+    struct InfoEchoStatem {
+        last_info: Arc<tokio::sync::Mutex<Option<rmpv::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl GenStatem for InfoEchoStatem {
+        type State = &'static str;
+        type Data = ();
+        type Call = String;
+        type Cast = String;
+        type Reply = Option<rmpv::Value>;
+
+        fn callback_mode(&self) -> (CallbackMode, bool) {
+            (CallbackMode::HandleEventFunction, false)
+        }
+
+        async fn init(&self) -> Result<(Self::State, Self::Data), String> {
+            Ok(("alive", ()))
+        }
+
+        async fn handle_event(
+            &self,
+            event_type: EventType<Self::Reply>,
+            event: rmpv::Value,
+            _state: &Self::State,
+            _data: &mut Self::Data,
+        ) -> TransitionResult<Self::State, Self::Data, Self::Reply> {
+            match event_type {
+                EventType::Info => {
+                    *self.last_info.lock().await = Some(event);
+                    TransitionResult::KeepStateAndData { actions: vec![] }
+                }
+                EventType::Call(reply_tx) => {
+                    let v = self.last_info.lock().await.clone();
+                    TransitionResult::KeepStateAndData {
+                        actions: vec![Action::Reply(reply_tx, v)],
+                    }
+                }
+                EventType::Cast => TransitionResult::Stop {
+                    reason: ExitReason::Normal,
+                    data: (),
+                },
+                _ => TransitionResult::KeepStateAndData { actions: vec![] },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn routable_via_pid_and_monitor_fires_down_on_exit() {
+        use crate::process::mailbox::Mailbox;
+        use crate::process::monitor::DownMessage;
+        use crate::process::table::ProcessHandle;
+        use crate::process::Message;
+
+        let last_info = Arc::new(tokio::sync::Mutex::new(None::<rmpv::Value>));
+        let rt = Arc::new(Runtime::new(1));
+        let statem_ref = spawn_gen_statem(
+            Arc::clone(&rt),
+            InfoEchoStatem {
+                last_info: Arc::clone(&last_info),
+            },
+        )
+        .await;
+        let target = statem_ref.pid();
+
+        // A watcher process with its own mailbox, registered in the table so it
+        // can receive a DOWN message.
+        let watcher = rt.table().allocate_pid();
+        let (watcher_tx, mut watcher_rx) = Mailbox::unbounded();
+        rt.table()
+            .insert(watcher, ProcessHandle::new(watcher_tx));
+
+        // Monitor the statem by PID; this only works if it's in the table.
+        let _mref = rt.table().monitor(watcher, target);
+
+        // Route a message to the statem by PID -> delivered as EventType::Info.
+        rt.table()
+            .send(
+                target,
+                Message::new(watcher, rmpv::Value::String("ping".into())),
+            )
+            .expect("statem should be routable via its PID");
+
+        // The Info payload must reach handle_event.
+        for _ in 0..1000 {
+            let got = statem_ref
+                .call("get_info".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if got == Some(rmpv::Value::String("ping".into())) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let got = statem_ref
+            .call("get_info".to_string(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(got, Some(rmpv::Value::String("ping".into())));
+
+        // Stop the statem; its death must fire a DOWN to the watcher.
+        statem_ref.cast("stop".to_string()).unwrap();
+
+        let down = watcher_rx
+            .recv_timeout(Duration::from_secs(2))
+            .await
+            .expect("watcher should receive a DOWN message on statem exit");
+        let down = DownMessage::from_value(down.payload())
+            .expect("payload should be a DOWN message");
+        assert_eq!(down.pid, target);
+        assert_eq!(down.reason, "exit");
+    }
+
+    // ========================================================================
+    // 36. state_timeout_armed_during_transition_fires  (regression)
+    //
+    // Verifies fix C4: a StateTimeout armed by the SAME transition that
+    // changes state must survive (not be cancelled by the state change).
+    // ========================================================================
+    struct TransitionArmsTimeoutStatem {
+        timeout_fired: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl GenStatem for TransitionArmsTimeoutStatem {
+        type State = TwoState;
+        type Data = ();
+        type Call = String;
+        type Cast = String;
+        type Reply = bool;
+
+        fn callback_mode(&self) -> (CallbackMode, bool) {
+            (CallbackMode::HandleEventFunction, false)
+        }
+
+        async fn init(&self) -> Result<(Self::State, Self::Data), String> {
+            Ok((TwoState::A, ()))
+        }
+
+        async fn handle_event(
+            &self,
+            event_type: EventType<Self::Reply>,
+            _event: rmpv::Value,
+            state: &Self::State,
+            _data: &mut Self::Data,
+        ) -> TransitionResult<Self::State, Self::Data, Self::Reply> {
+            match event_type {
+                // Transition A -> B and arm a state timeout in the same step.
+                EventType::Cast if *state == TwoState::A => TransitionResult::NextState {
+                    state: TwoState::B,
+                    data: (),
+                    actions: vec![Action::StateTimeout(
+                        Duration::from_millis(40),
+                        rmpv::Value::Nil,
+                    )],
+                },
+                EventType::StateTimeout => {
+                    self.timeout_fired.store(true, Ordering::SeqCst);
+                    TransitionResult::KeepStateAndData { actions: vec![] }
+                }
+                EventType::Call(reply_tx) => {
+                    let fired = self.timeout_fired.load(Ordering::SeqCst);
+                    TransitionResult::KeepStateAndData {
+                        actions: vec![Action::Reply(reply_tx, fired)],
+                    }
+                }
+                _ => TransitionResult::KeepStateAndData { actions: vec![] },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn state_timeout_armed_during_transition_fires() {
+        let timeout_fired = Arc::new(AtomicBool::new(false));
+        let rt = Arc::new(Runtime::new(1));
+        let statem_ref = spawn_gen_statem(
+            Arc::clone(&rt),
+            TransitionArmsTimeoutStatem {
+                timeout_fired: Arc::clone(&timeout_fired),
+            },
+        )
+        .await;
+
+        statem_ref.cast("go".to_string()).unwrap();
+
+        // The 40ms timeout armed during the A->B transition must fire.
+        for _ in 0..400 {
+            let fired = statem_ref
+                .call("check".to_string(), Duration::from_secs(1))
+                .await
+                .unwrap();
+            if fired {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("state timeout armed during the transition should have fired");
+    }
+
+    // ========================================================================
+    // 37. call_payload_reaches_handle_event  (regression)
+    //
+    // Verifies fix C5: a call's payload (encoded via encode_call) is delivered
+    // to handle_event rather than being replaced by Nil.
+    // ========================================================================
+    struct CallPayloadStatem;
+
+    #[async_trait::async_trait]
+    impl GenStatem for CallPayloadStatem {
+        type State = &'static str;
+        type Data = ();
+        type Call = u64;
+        type Cast = String;
+        type Reply = u64;
+
+        fn callback_mode(&self) -> (CallbackMode, bool) {
+            (CallbackMode::HandleEventFunction, false)
+        }
+
+        fn encode_call(&self, msg: &Self::Call) -> rmpv::Value {
+            rmpv::Value::Integer((*msg).into())
+        }
+
+        async fn init(&self) -> Result<(Self::State, Self::Data), String> {
+            Ok(("alive", ()))
+        }
+
+        async fn handle_event(
+            &self,
+            event_type: EventType<Self::Reply>,
+            event: rmpv::Value,
+            _state: &Self::State,
+            _data: &mut Self::Data,
+        ) -> TransitionResult<Self::State, Self::Data, Self::Reply> {
+            match event_type {
+                EventType::Call(reply_tx) => {
+                    // Echo back the payload that handle_event observed, doubled.
+                    let n = event.as_u64().unwrap_or(0);
+                    TransitionResult::KeepStateAndData {
+                        actions: vec![Action::Reply(reply_tx, n * 2)],
+                    }
+                }
+                _ => TransitionResult::KeepStateAndData { actions: vec![] },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn call_payload_reaches_handle_event() {
+        let rt = Arc::new(Runtime::new(1));
+        let statem_ref = spawn_gen_statem(Arc::clone(&rt), CallPayloadStatem).await;
+
+        let reply = statem_ref.call(21, Duration::from_secs(1)).await.unwrap();
+        // If the payload were dropped to Nil, the reply would be 0.
+        assert_eq!(reply, 42, "call payload must reach handle_event");
     }
 }

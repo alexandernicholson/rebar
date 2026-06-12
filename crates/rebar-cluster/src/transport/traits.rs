@@ -10,6 +10,8 @@ pub enum TransportError {
     Io(#[from] std::io::Error),
     #[error("connection closed")]
     ConnectionClosed,
+    #[error("declared frame length {declared} exceeds maximum {max}")]
+    FrameTooLarge { declared: usize, max: usize },
     #[error("frame error: {0}")]
     Frame(#[from] crate::protocol::FrameError),
 }

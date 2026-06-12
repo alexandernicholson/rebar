@@ -74,6 +74,10 @@ pub struct ChildSpec {
     pub id: String,
     pub restart: RestartType,
     pub shutdown: ShutdownStrategy,
+    /// When true, the supervisor registers the child's `id` as a process
+    /// name on every (re)start, so `whereis(id)` / name-based sends always
+    /// resolve to the current incarnation.
+    pub register: bool,
 }
 
 impl ChildSpec {
@@ -83,6 +87,7 @@ impl ChildSpec {
             id: id.into(),
             restart: RestartType::Permanent,
             shutdown: ShutdownStrategy::Timeout(Duration::from_secs(5)),
+            register: false,
         }
     }
 
@@ -95,6 +100,16 @@ impl ChildSpec {
     #[must_use]
     pub const fn shutdown(mut self, strategy: ShutdownStrategy) -> Self {
         self.shutdown = strategy;
+        self
+    }
+
+    /// Register the child's `id` as a process name on every (re)start.
+    ///
+    /// This is the supported way to keep talking to a child across restarts:
+    /// resolve the name at send time instead of caching a PID.
+    #[must_use]
+    pub const fn registered(mut self) -> Self {
+        self.register = true;
         self
     }
 }

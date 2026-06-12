@@ -24,6 +24,81 @@ impl MonitorRef {
     pub fn new() -> Self {
         Self(MONITOR_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// The raw numeric id of this reference.
+    #[must_use]
+    pub const fn id(self) -> u64 {
+        self.0
+    }
+
+    /// Reconstruct a reference from a raw id (e.g. when decoding a
+    /// [`DownMessage`]). Does not allocate a new id.
+    #[must_use]
+    pub const fn from_id(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+/// The tag identifying a monitor `DOWN` notification payload.
+pub const DOWN_TAG: &str = "DOWN";
+
+/// A monitor notification delivered to a watcher's mailbox when a monitored
+/// process exits (like Erlang's `{'DOWN', Ref, process, Pid, Reason}`).
+///
+/// The message's sender ([`Message::from`](crate::process::Message::from))
+/// is the dead process's PID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownMessage {
+    /// The monitor reference returned when the monitor was created.
+    pub monitor_ref: MonitorRef,
+    /// The PID of the process that exited.
+    pub pid: ProcessId,
+    /// Why the notification fired: `"exit"` for a real exit, `"noproc"` if
+    /// the target was already dead when the monitor was created.
+    pub reason: String,
+}
+
+impl DownMessage {
+    /// Create a new `DOWN` notification.
+    #[must_use]
+    pub fn new(monitor_ref: MonitorRef, pid: ProcessId, reason: impl Into<String>) -> Self {
+        Self {
+            monitor_ref,
+            pid,
+            reason: reason.into(),
+        }
+    }
+
+    /// Encode as a message payload: `["DOWN", ref, node_id, local_id, reason]`.
+    #[must_use]
+    pub fn to_value(&self) -> rmpv::Value {
+        rmpv::Value::Array(vec![
+            rmpv::Value::String(DOWN_TAG.into()),
+            rmpv::Value::Integer(self.monitor_ref.id().into()),
+            rmpv::Value::Integer(self.pid.node_id().into()),
+            rmpv::Value::Integer(self.pid.local_id().into()),
+            rmpv::Value::String(self.reason.clone().into()),
+        ])
+    }
+
+    /// Decode a payload produced by [`to_value`](Self::to_value).
+    ///
+    /// Returns `None` if the payload is not a `DOWN` notification.
+    #[must_use]
+    pub fn from_value(value: &rmpv::Value) -> Option<Self> {
+        let items = value.as_array()?;
+        let [tag, mref, node_id, local_id, reason] = items.as_slice() else {
+            return None;
+        };
+        if tag.as_str()? != DOWN_TAG {
+            return None;
+        }
+        Some(Self {
+            monitor_ref: MonitorRef::from_id(mref.as_u64()?),
+            pid: ProcessId::new(node_id.as_u64()?, local_id.as_u64()?),
+            reason: reason.as_str()?.to_string(),
+        })
+    }
 }
 
 /// Tracks monitor relationships: who is monitoring whom.

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rebar_core::gen_server::{spawn_gen_server, GenServer, GenServerContext};
+use rebar_core::gen_server::{spawn_gen_server, CallError, GenServer, GenServerContext};
+use rebar_core::process::monitor::DownMessage;
 use rebar_core::process::{Message, ProcessId};
 use rebar_core::runtime::Runtime;
 
@@ -214,4 +215,219 @@ async fn gen_server_init_failure() {
     // Server should be dead due to init failure, call should fail (timeout or dead)
     let result = server.call((), Duration::from_millis(100)).await;
     assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a dying gen_server must fire monitor DOWNs (fix #1).
+//
+// Before the fix the engine exited via `ProcessTable::remove`, which is a bare
+// map delete: a watcher monitoring the server's PID waited forever for a DOWN
+// that never arrived. The exit now routes through `cleanup_process`, the
+// canonical death path that fires DOWNs and unregisters names.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn dying_gen_server_fires_monitor_down() {
+    let rt = Arc::new(Runtime::new(1));
+
+    // Hold the server in an Option so we can drop all its refs to kill it.
+    let server = spawn_gen_server(Arc::clone(&rt), Counter).await;
+    let target = server.pid();
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (down_tx, down_rx) = tokio::sync::oneshot::channel();
+    rt.spawn(move |mut ctx| async move {
+        let mref = ctx.monitor(target);
+        ready_tx.send(()).unwrap();
+        let msg = ctx.recv().await.unwrap();
+        let down = DownMessage::from_value(msg.payload()).expect("payload is a DOWN message");
+        down_tx.send((mref, down)).unwrap();
+    })
+    .await;
+
+    // Ensure the monitor is registered before the server dies.
+    ready_rx.await.unwrap();
+
+    // Dropping the last ref closes all client channels; the engine breaks out of
+    // its loop and the death runs through cleanup_process.
+    drop(server);
+
+    let (mref, down) = tokio::time::timeout(Duration::from_secs(2), down_rx)
+        .await
+        .expect("DOWN must be delivered when the gen_server dies")
+        .unwrap();
+    assert_eq!(down.monitor_ref, mref);
+    assert_eq!(down.pid, target);
+}
+
+// ---------------------------------------------------------------------------
+// Regression: call() must time out on a backed-up send, not just the reply
+// (fix #3). A suspended server stops servicing its bounded call channel, so a
+// caller that fills the channel must get CallError::Timeout from the
+// `call_tx.send().await` rather than hanging forever.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn call_to_suspended_server_times_out_on_full_channel() {
+    let rt = Arc::new(Runtime::new(1));
+    let server = spawn_gen_server(Arc::clone(&rt), Counter).await;
+
+    // Suspend the server: it now only services sys commands, never calls.
+    server
+        .sys_suspend(Duration::from_secs(1))
+        .await
+        .expect("suspend acknowledged");
+
+    // Saturate the bounded call channel (capacity 64) plus a generous margin so
+    // a subsequent send has no buffer slot and would block indefinitely.
+    let mut fillers = Vec::new();
+    for _ in 0..256 {
+        let s = server.clone();
+        fillers.push(tokio::spawn(async move {
+            let _ = s.call(CounterCall::Get, Duration::from_secs(30)).await;
+        }));
+    }
+
+    // Give the filler tasks a chance to occupy the channel buffer.
+    tokio::task::yield_now().await;
+
+    // This call cannot even enqueue within the budget -> Timeout, not a hang.
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.call(CounterCall::Get, Duration::from_millis(50)),
+    )
+    .await
+    .expect("call() must return within its own timeout, not hang");
+
+    assert!(
+        matches!(result, Err(CallError::Timeout)),
+        "expected Timeout from a full/suspended server, got {result:?}"
+    );
+
+    for f in fillers {
+        f.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a self-reenqueuing handle_continue must not starve calls (fix
+// #5). The engine processes at most one continue per loop iteration and the
+// continue arm is the lowest-priority select branch, so calls still progress
+// even under a continue that perpetually re-enqueues itself.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn greedy_continue_does_not_starve_calls() {
+    struct ContinueLooper;
+
+    #[async_trait::async_trait]
+    impl GenServer for ContinueLooper {
+        type State = u64;
+        type Call = ();
+        type Cast = ();
+        type Reply = u64;
+
+        async fn init(&self, ctx: &GenServerContext) -> Result<Self::State, String> {
+            // Kick off a perpetual continue chain.
+            ctx.continue_with(rmpv::Value::Nil);
+            Ok(0)
+        }
+
+        async fn handle_call(
+            &self,
+            _msg: (),
+            _from: ProcessId,
+            state: &mut u64,
+            _ctx: &GenServerContext,
+        ) -> u64 {
+            *state
+        }
+
+        async fn handle_cast(&self, _msg: (), _state: &mut u64, _ctx: &GenServerContext) {}
+
+        async fn handle_continue(
+            &self,
+            _msg: rmpv::Value,
+            state: &mut u64,
+            ctx: &GenServerContext,
+        ) {
+            *state += 1;
+            // Re-enqueue: a greedy drain loop would spin here forever and never
+            // service the pending call.
+            ctx.continue_with(rmpv::Value::Nil);
+        }
+    }
+
+    let rt = Arc::new(Runtime::new(1));
+    let server = spawn_gen_server(rt, ContinueLooper).await;
+
+    // Despite the perpetual continue, the call must be serviced promptly.
+    let reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        server.call((), Duration::from_secs(1)),
+    )
+    .await
+    .expect("call must not be starved by a self-reenqueuing continue")
+    .expect("call succeeds");
+
+    // State has advanced (continues ran) but the call still got through.
+    assert!(reply >= 1, "expected at least one continue to have run");
+}
+
+// ---------------------------------------------------------------------------
+// Regression: a panicking gen_server callback must still fire monitor DOWNs
+// (fix #2). The inner task's JoinError is detected and the death is routed
+// through cleanup_process rather than being swallowed.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn panicking_gen_server_fires_monitor_down() {
+    struct Panicker;
+
+    #[async_trait::async_trait]
+    impl GenServer for Panicker {
+        type State = ();
+        type Call = ();
+        type Cast = ();
+        type Reply = ();
+
+        async fn init(&self, _ctx: &GenServerContext) -> Result<Self::State, String> {
+            Ok(())
+        }
+
+        async fn handle_call(
+            &self,
+            _msg: (),
+            _from: ProcessId,
+            _state: &mut (),
+            _ctx: &GenServerContext,
+        ) {
+            panic!("intentional panic to exercise cleanup on JoinError");
+        }
+
+        async fn handle_cast(&self, _msg: (), _state: &mut (), _ctx: &GenServerContext) {}
+    }
+
+    let rt = Arc::new(Runtime::new(1));
+    let server = spawn_gen_server(Arc::clone(&rt), Panicker).await;
+    let target = server.pid();
+
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (down_tx, down_rx) = tokio::sync::oneshot::channel();
+    rt.spawn(move |mut ctx| async move {
+        let mref = ctx.monitor(target);
+        ready_tx.send(()).unwrap();
+        let msg = ctx.recv().await.unwrap();
+        let down = DownMessage::from_value(msg.payload()).expect("payload is a DOWN message");
+        down_tx.send((mref, down)).unwrap();
+    })
+    .await;
+
+    ready_rx.await.unwrap();
+
+    // Trigger the panic inside the gen_server's task. The call itself will fail.
+    let _ = server.call((), Duration::from_millis(200)).await;
+
+    let (mref, down) = tokio::time::timeout(Duration::from_secs(2), down_rx)
+        .await
+        .expect("DOWN must be delivered even when the gen_server panics")
+        .unwrap();
+    assert_eq!(down.monitor_ref, mref);
+    assert_eq!(down.pid, target);
 }

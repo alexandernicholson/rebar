@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "tracing")]
@@ -11,15 +10,16 @@ use tracing::instrument;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::process::{ExitReason, ProcessId};
-use crate::runtime::Runtime;
+use crate::runtime::{ProcessContext, Runtime};
 use crate::supervisor::spec::{ChildSpec, RestartStrategy, ShutdownStrategy, SupervisorSpec};
-
-static CHILD_PID_COUNTER: AtomicU64 = AtomicU64::new(1_000_000);
 
 /// A factory that creates the child's async task. Must be callable multiple
 /// times (for restarts) and is shared via Arc.
+///
+/// The factory receives the child's [`ProcessContext`]: every supervised
+/// child is a real runtime process with a routable PID and a mailbox.
 pub type ChildFactory =
-    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ExitReason> + Send>> + Send + Sync>;
+    Arc<dyn Fn(ProcessContext) -> Pin<Box<dyn Future<Output = ExitReason> + Send>> + Send + Sync>;
 
 /// Pairs a `ChildSpec` with its `ChildFactory` for supervisor startup.
 pub struct ChildEntry {
@@ -28,6 +28,11 @@ pub struct ChildEntry {
 }
 
 impl ChildEntry {
+    /// Create a child whose task does not read its mailbox.
+    ///
+    /// The child still gets a real PID and its mailbox stays open (sends to
+    /// it succeed), but messages are never consumed. Use
+    /// [`with_context`](Self::with_context) for children that receive.
     pub fn new<F, Fut>(spec: ChildSpec, factory: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
@@ -35,7 +40,26 @@ impl ChildEntry {
     {
         Self {
             spec,
-            factory: Arc::new(move || Box::pin(factory())),
+            factory: Arc::new(move |ctx| {
+                let fut = factory();
+                Box::pin(async move {
+                    let _ctx = ctx; // keep the mailbox open for the child's lifetime
+                    fut.await
+                })
+            }),
+        }
+    }
+
+    /// Create a child whose task receives its [`ProcessContext`], allowing
+    /// it to read its mailbox and send messages like any other process.
+    pub fn with_context<F, Fut>(spec: ChildSpec, factory: F) -> Self
+    where
+        F: Fn(ProcessContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ExitReason> + Send + 'static,
+    {
+        Self {
+            spec,
+            factory: Arc::new(move |ctx| Box::pin(factory(ctx))),
         }
     }
 }
@@ -45,8 +69,13 @@ struct ChildState {
     spec: ChildSpec,
     factory: ChildFactory,
     pid: Option<ProcessId>,
-    /// Sender to signal the child to shut down (dropped = shutdown signal).
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Abort handle for the inner child task, used to force-kill on timeout
+    /// or brutal kill.
+    abort: Option<tokio::task::AbortHandle>,
+    /// Fires once the child's task has fully terminated. Awaited (with the
+    /// shutdown timeout) so the supervisor never runs two incarnations
+    /// concurrently.
+    done_rx: Option<oneshot::Receiver<()>>,
 }
 
 /// Messages the supervisor loop processes.
@@ -134,6 +163,13 @@ impl SupervisorHandle {
 /// Start a supervisor as a process in the given runtime.
 ///
 /// Returns a handle with the supervisor's PID and a channel to interact with it.
+///
+/// # Panics
+///
+/// The spawned supervisor *process* panics (and is reaped via the runtime's
+/// normal death-time cleanup, firing a monitor `DOWN` to any watchers) if it
+/// escalates — i.e. its children exceed the configured restart intensity. This
+/// panic happens inside the supervisor task, not in this function.
 pub async fn start_supervisor(
     runtime: Arc<Runtime>,
     spec: SupervisorSpec,
@@ -146,9 +182,16 @@ pub async fn start_supervisor(
     // Instead, we'll allocate a PID for it conceptually.
     // Actually let's use Runtime::spawn to get a real PID.
     let msg_tx_clone = msg_tx.clone();
+    let runtime_clone = Arc::clone(&runtime);
     let pid = runtime
         .spawn(move |_ctx| async move {
-            supervisor_loop(spec, children, msg_rx, msg_tx_clone).await;
+            let escalated =
+                supervisor_loop(runtime_clone, spec, children, msg_rx, msg_tx_clone).await;
+            // Escalation: the supervisor gives up. Exit abnormally (via panic,
+            // which the runtime's drop guard still turns into death-time
+            // cleanup + a monitor DOWN) so watchers learn the supervisor died
+            // rather than shut down cleanly.
+            assert!(!escalated, "supervisor escalated: restart intensity exceeded");
         })
         .await;
 
@@ -158,11 +201,12 @@ pub async fn start_supervisor(
 /// The main supervisor loop.
 #[cfg_attr(feature = "tracing", instrument(level = "trace", skip(spec, children, msg_rx, msg_tx)))]
 async fn supervisor_loop(
+    runtime: Arc<Runtime>,
     spec: SupervisorSpec,
     children: Vec<ChildEntry>,
     mut msg_rx: mpsc::UnboundedReceiver<SupervisorMsg>,
     msg_tx: mpsc::UnboundedSender<SupervisorMsg>,
-) {
+) -> bool {
     let mut state = SupervisorState {
         strategy: spec.strategy,
         max_restarts: spec.max_restarts,
@@ -177,22 +221,27 @@ async fn supervisor_loop(
             spec: entry.spec,
             factory: entry.factory,
             pid: None,
-            shutdown_tx: None,
+            abort: None,
+            done_rx: None,
         };
         state.children.push(child_state);
     }
 
     // Start all children in order
     for i in 0..state.children.len() {
-        start_child(&mut state.children[i], i, &msg_tx);
+        start_child(&runtime, &mut state.children[i], i, &msg_tx).await;
     }
 
-    // Main event loop
+    // Main event loop. Returns `true` if the supervisor escalated (gave up on
+    // restarts), `false` for a clean shutdown.
     loop {
         match msg_rx.recv().await {
             Some(SupervisorMsg::ChildExited { index, pid, reason }) => {
-                if state.handle_child_exit(index, pid, &reason, &msg_tx).await {
-                    break;
+                if state
+                    .handle_child_exit(&runtime, index, pid, &reason, &msg_tx)
+                    .await
+                {
+                    return true;
                 }
             }
             Some(SupervisorMsg::AddChild { entry, reply }) => {
@@ -201,9 +250,10 @@ async fn supervisor_loop(
                     spec: entry.spec,
                     factory: entry.factory,
                     pid: None,
-                    shutdown_tx: None,
+                    abort: None,
+                    done_rx: None,
                 };
-                start_child(&mut child_state, idx, &msg_tx);
+                start_child(&runtime, &mut child_state, idx, &msg_tx).await;
                 let pid = child_state.pid.unwrap();
                 state.children.push(child_state);
                 let _ = reply.send(Ok(pid));
@@ -216,9 +266,10 @@ async fn supervisor_loop(
                         spec: entry.spec,
                         factory: entry.factory,
                         pid: None,
-                        shutdown_tx: None,
+                        abort: None,
+                        done_rx: None,
                     };
-                    start_child(&mut child_state, idx, &msg_tx);
+                    start_child(&runtime, &mut child_state, idx, &msg_tx).await;
                     let pid = child_state.pid.unwrap();
                     state.children.push(child_state);
                     results.push(Ok(pid));
@@ -227,12 +278,12 @@ async fn supervisor_loop(
             }
             Some(SupervisorMsg::Shutdown) => {
                 shutdown_all_children(&mut state.children).await;
-                break;
+                return false;
             }
             None => {
                 // All senders dropped, shut down
                 shutdown_all_children(&mut state.children).await;
-                break;
+                return false;
             }
         }
     }
@@ -250,6 +301,7 @@ impl SupervisorState {
     /// Handle a child exit event. Returns `true` if the supervisor should stop.
     async fn handle_child_exit(
         &mut self,
+        runtime: &Arc<Runtime>,
         index: usize,
         pid: ProcessId,
         reason: &ExitReason,
@@ -261,7 +313,8 @@ impl SupervisorState {
         }
 
         self.children[index].pid = None;
-        self.children[index].shutdown_tx = None;
+        self.children[index].abort = None;
+        self.children[index].done_rx = None;
 
         if !self.children[index].spec.restart.should_restart(reason) {
             return false;
@@ -276,28 +329,39 @@ impl SupervisorState {
         // Apply restart strategy
         match self.strategy {
             RestartStrategy::OneForOne => {
-                start_child(&mut self.children[index], index, msg_tx);
+                start_child(runtime, &mut self.children[index], index, msg_tx).await;
             }
             RestartStrategy::OneForAll => {
                 let len = self.children.len();
+                // Children that were still running (and the triggering child)
+                // are part of the group and get restarted. Children that had
+                // already exited on their own (pid == None, not the trigger)
+                // are left alone so we don't re-run an exited
+                // Temporary/Transient child and duplicate its side effects.
+                let to_restart: Vec<usize> = (0..len)
+                    .filter(|&i| i == index || self.children[i].pid.is_some())
+                    .collect();
                 for i in (0..len).rev() {
                     if i != index && self.children[i].pid.is_some() {
                         stop_child(&mut self.children[i]).await;
                     }
                 }
-                for i in 0..len {
-                    start_child(&mut self.children[i], i, msg_tx);
+                for i in to_restart {
+                    start_child(runtime, &mut self.children[i], i, msg_tx).await;
                 }
             }
             RestartStrategy::RestForOne => {
                 let len = self.children.len();
+                let to_restart: Vec<usize> = (index..len)
+                    .filter(|&i| i == index || self.children[i].pid.is_some())
+                    .collect();
                 for i in (index + 1..len).rev() {
                     if self.children[i].pid.is_some() {
                         stop_child(&mut self.children[i]).await;
                     }
                 }
-                for i in index..len {
-                    start_child(&mut self.children[i], i, msg_tx);
+                for i in to_restart {
+                    start_child(runtime, &mut self.children[i], i, msg_tx).await;
                 }
             }
         }
@@ -330,67 +394,104 @@ impl SupervisorState {
     }
 }
 
-/// Start (or restart) a child, spawning it as a tokio task.
-#[cfg_attr(feature = "tracing", instrument(level = "trace", skip(child, msg_tx)))]
-fn start_child(
+/// Start (or restart) a child as a real runtime process.
+///
+/// The child gets a routable PID from the runtime's process table. If its
+/// spec requests registration, the spec id is (re-)registered to the new
+/// incarnation so name-based sends keep working across restarts.
+#[cfg_attr(feature = "tracing", instrument(level = "trace", skip(runtime, child, msg_tx)))]
+async fn start_child(
+    runtime: &Arc<Runtime>,
     child: &mut ChildState,
     index: usize,
     msg_tx: &mpsc::UnboundedSender<SupervisorMsg>,
 ) {
     let factory = Arc::clone(&child.factory);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (abort_tx, abort_rx) = oneshot::channel::<tokio::task::AbortHandle>();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
     let msg_tx = msg_tx.clone();
+    let register_name = child.spec.register.then(|| child.spec.id.clone());
+    let table = Arc::clone(runtime.table());
 
-    let local_id = CHILD_PID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = ProcessId::new(0, local_id);
+    let pid = runtime
+        .spawn(move |ctx| async move {
+            let self_pid = ctx.self_pid();
+            if let Some(name) = register_name {
+                // Takeover semantics: a restarted incarnation claims the name
+                // even if the previous incarnation's cleanup hasn't run yet.
+                let _ = table.reregister(name, self_pid);
+            }
+            let child_future = factory(ctx);
 
+            // Run the child body as an INNER task so a panic surfaces as a
+            // JoinError instead of unwinding (and skipping) the ChildExited
+            // send. The supervisor keeps the abort handle to force-kill.
+            let inner = tokio::spawn(child_future);
+            let _ = abort_tx.send(inner.abort_handle());
+
+            // Await the inner task. A panic becomes a JoinError (non-cancel)
+            // → Abnormal, so a Permanent child that panics IS restarted. A
+            // supervisor-initiated abort surfaces as a cancellation → Normal.
+            let reason = match inner.await {
+                Ok(reason) => reason,
+                Err(join_err) if join_err.is_cancelled() => ExitReason::Normal,
+                Err(_) => ExitReason::Abnormal("panic".into()),
+            };
+
+            // Signal the supervisor that this incarnation has fully stopped
+            // BEFORE reporting the exit, so stop_child's await resolves only
+            // after the task is truly gone.
+            let _ = done_tx.send(());
+            let _ = msg_tx.send(SupervisorMsg::ChildExited {
+                index,
+                pid: self_pid,
+                reason,
+            });
+        })
+        .await;
+
+    // Wait for the inner task's abort handle to come back so the supervisor
+    // can force-kill on timeout/brutal-kill.
+    child.abort = abort_rx.await.ok();
     child.pid = Some(pid);
-    child.shutdown_tx = Some(shutdown_tx);
-
-    tokio::spawn(async move {
-        let child_future = factory();
-
-        tokio::select! {
-            reason = child_future => {
-                let _ = msg_tx.send(SupervisorMsg::ChildExited {
-                    index,
-                    pid,
-                    reason,
-                });
-            }
-            _ = shutdown_rx => {
-                // Shutdown requested: the child is terminated
-                let _ = msg_tx.send(SupervisorMsg::ChildExited {
-                    index,
-                    pid,
-                    reason: ExitReason::Normal,
-                });
-            }
-        }
-    });
+    child.done_rx = Some(done_rx);
 }
 
-/// Stop a single child according to its shutdown strategy.
+/// Stop a single child according to its shutdown strategy, awaiting actual
+/// termination before returning so the old incarnation can never overlap a
+/// replacement.
 #[cfg_attr(feature = "tracing", instrument(level = "trace", skip(child)))]
 async fn stop_child(child: &mut ChildState) {
-    if let Some(tx) = child.shutdown_tx.take() {
-        match &child.spec.shutdown {
-            ShutdownStrategy::BrutalKill => {
-                // Drop the sender immediately (signals shutdown)
-                drop(tx);
+    let shutdown = child.spec.shutdown.clone();
+    let abort = child.abort.take();
+    let done_rx = child.done_rx.take();
+
+    match shutdown {
+        ShutdownStrategy::BrutalKill => {
+            // Force-kill immediately, then await confirmation of termination.
+            if let Some(abort) = &abort {
+                abort.abort();
             }
-            ShutdownStrategy::Timeout(_duration) => {
-                // Send shutdown signal
-                let _ = tx.send(());
+            if let Some(done_rx) = done_rx {
+                let _ = done_rx.await;
+            }
+        }
+        ShutdownStrategy::Timeout(duration) => {
+            // Give the child its graceful window to finish on its own; abort
+            // and reap it only if it overruns the timeout.
+            let overran = match done_rx {
+                Some(done_rx) => tokio::time::timeout(duration, done_rx).await.is_err(),
+                None => true,
+            };
+            if let (true, Some(abort)) = (overran, &abort) {
+                abort.abort();
             }
         }
     }
-    // Small yield to let the task finish
-    tokio::task::yield_now().await;
     child.pid = None;
 }
 
-/// Shut down all children in reverse order.
+/// Shut down all children in reverse order, awaiting each one's termination.
 async fn shutdown_all_children(children: &mut [ChildState]) {
     for i in (0..children.len()).rev() {
         if children[i].pid.is_some() {
@@ -772,7 +873,10 @@ mod tests {
         let scc = Arc::clone(&start_count_c);
 
         let entries = vec![
-            ChildEntry::new(ChildSpec::new("a"), move || {
+            ChildEntry::new(
+                ChildSpec::new("a")
+                    .shutdown(ShutdownStrategy::Timeout(Duration::from_millis(20))),
+                move || {
                 let sc = Arc::clone(&sca);
                 async move {
                     sc.fetch_add(1, Ordering::SeqCst);
@@ -794,7 +898,10 @@ mod tests {
                     }
                 }
             }),
-            ChildEntry::new(ChildSpec::new("c"), move || {
+            ChildEntry::new(
+                ChildSpec::new("c")
+                    .shutdown(ShutdownStrategy::Timeout(Duration::from_millis(20))),
+                move || {
                 let sc = Arc::clone(&scc);
                 async move {
                     sc.fetch_add(1, Ordering::SeqCst);
@@ -935,7 +1042,10 @@ mod tests {
                     }
                 }
             }),
-            ChildEntry::new(ChildSpec::new("c"), move || {
+            ChildEntry::new(
+                ChildSpec::new("c")
+                    .shutdown(ShutdownStrategy::Timeout(Duration::from_millis(20))),
+                move || {
                 let sc = Arc::clone(&scc);
                 async move {
                     sc.fetch_add(1, Ordering::SeqCst);
@@ -1252,7 +1362,10 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(30)).await;
                 ExitReason::Abnormal("crash".into())
             }),
-            ChildEntry::new(ChildSpec::new("linked"), move || {
+            ChildEntry::new(
+                ChildSpec::new("linked")
+                    .shutdown(ShutdownStrategy::Timeout(Duration::from_millis(20))),
+                move || {
                 let rc = Arc::clone(&rc);
                 async move {
                     rc.fetch_add(1, Ordering::SeqCst);
@@ -1554,5 +1667,105 @@ mod tests {
 
         handle.shutdown();
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: a Permanent child that PANICS is restarted.
+    //
+    // Before the fix, a panic in the child future unwound the spawn body and
+    // skipped the ChildExited send, so the supervisor never learned the child
+    // died and never restarted it.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn panicking_permanent_child_is_restarted() {
+        let rt = test_runtime();
+        let start_count = Arc::new(AtomicU32::new(0));
+        let sc = Arc::clone(&start_count);
+
+        let entries = vec![ChildEntry::new(
+            ChildSpec::new("panicker").restart(RestartType::Permanent),
+            move || {
+                let sc = Arc::clone(&sc);
+                async move {
+                    let c = sc.fetch_add(1, Ordering::SeqCst);
+                    // Panic (instead of returning an ExitReason) on the first
+                    // two incarnations to exercise panic-driven restart.
+                    assert!(c >= 2, "boom");
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    ExitReason::Normal
+                }
+            },
+        )];
+
+        let spec = SupervisorSpec::new(RestartStrategy::OneForOne)
+            .max_restarts(10)
+            .max_seconds(10);
+        let handle = start_supervisor(rt, spec, entries).await;
+
+        // Wait until the child has been (re)started past its panicking phase.
+        for _ in 0..10_000 {
+            if start_count.load(Ordering::SeqCst) >= 3 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            start_count.load(Ordering::SeqCst) >= 3,
+            "panicking permanent child must be restarted, got {} starts",
+            start_count.load(Ordering::SeqCst)
+        );
+
+        handle.shutdown();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: graceful shutdown gives the child its timeout window and
+    // does NOT return until the child has actually terminated.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn graceful_shutdown_waits_for_child_to_finish() {
+        let rt = test_runtime();
+        let finished = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&finished);
+
+        // Child exits on its own shortly; the supervisor must wait for it.
+        let entries = vec![ChildEntry::new(
+            ChildSpec::new("flusher")
+                .restart(RestartType::Temporary)
+                .shutdown(ShutdownStrategy::Timeout(Duration::from_secs(5))),
+            move || {
+                let f = Arc::clone(&f);
+                async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    f.store(true, Ordering::SeqCst);
+                    ExitReason::Normal
+                }
+            },
+        )];
+
+        let spec = SupervisorSpec::new(RestartStrategy::OneForOne);
+        let handle = start_supervisor(Arc::clone(&rt), spec, entries).await;
+
+        // Let the child start.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Shut the supervisor down and watch its process die. The supervisor
+        // must not finish until the child's task has completed its flush.
+        let sup_pid = handle.pid();
+        handle.shutdown();
+        for _ in 0..1_000_000 {
+            if rt.table().get(&sup_pid).is_none() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        // The child's flush ran (it was given its graceful window).
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "graceful shutdown must wait for the child to finish its work"
+        );
     }
 }

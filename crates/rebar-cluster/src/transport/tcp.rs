@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::protocol::Frame;
+use crate::protocol::{Frame, MAX_FRAME_SIZE};
 use crate::transport::traits::{TransportConnection, TransportError, TransportListener};
 
 /// TCP transport using length-prefixed framing.
@@ -15,18 +15,36 @@ use crate::transport::traits::{TransportConnection, TransportError, TransportLis
 /// │ len: u32 │ payload: [u8]│
 /// └──────────┴──────────────┘
 /// ```
+#[derive(Default)]
 pub struct TcpTransport;
 
 impl TcpTransport {
-    pub fn new() -> Self {
-        TcpTransport
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
     }
 
+    /// Create a TCP listener bound to `addr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError::Io` if the listener cannot be bound to `addr`.
     pub async fn listen(&self, addr: SocketAddr) -> Result<TcpTransportListener, TransportError> {
         let listener = TcpListener::bind(addr).await?;
-        Ok(TcpTransportListener { inner: listener })
+        // Cache the bound address now (while we can still surface a bind error)
+        // so `local_addr` is infallible and cannot panic later.
+        let local_addr = listener.local_addr()?;
+        Ok(TcpTransportListener {
+            inner: listener,
+            local_addr,
+        })
     }
 
+    /// Connect to a remote TCP endpoint at `addr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TransportError::Io` if the connection cannot be established.
     pub async fn connect(&self, addr: SocketAddr) -> Result<TcpConnection, TransportError> {
         let stream = TcpStream::connect(addr).await?;
         Ok(TcpConnection { stream })
@@ -35,6 +53,7 @@ impl TcpTransport {
 
 pub struct TcpTransportListener {
     inner: TcpListener,
+    local_addr: SocketAddr,
 }
 
 #[async_trait]
@@ -42,7 +61,7 @@ impl TransportListener for TcpTransportListener {
     type Connection = TcpConnection;
 
     fn local_addr(&self) -> SocketAddr {
-        self.inner.local_addr().expect("listener has local addr")
+        self.local_addr
     }
 
     async fn accept(&self) -> Result<Self::Connection, TransportError> {
@@ -59,7 +78,8 @@ pub struct TcpConnection {
 impl TransportConnection for TcpConnection {
     async fn send(&mut self, frame: &Frame) -> Result<(), TransportError> {
         let encoded = frame.encode();
-        let len = encoded.len() as u32;
+        let len = u32::try_from(encoded.len())
+            .map_err(|e| TransportError::Io(std::io::Error::other(e)))?;
         self.stream.write_all(&len.to_be_bytes()).await?;
         self.stream.write_all(&encoded).await?;
         self.stream.flush().await?;
@@ -76,6 +96,14 @@ impl TransportConnection for TcpConnection {
             Err(e) => return Err(TransportError::Io(e)),
         }
         let len = u32::from_be_bytes(len_buf) as usize;
+        // Reject an oversized length prefix BEFORE allocating, so a peer cannot
+        // force a multi-gigabyte allocation (remote OOM/DoS).
+        if len > MAX_FRAME_SIZE {
+            return Err(TransportError::FrameTooLarge {
+                declared: len,
+                max: MAX_FRAME_SIZE,
+            });
+        }
         let mut buf = vec![0u8; len];
         self.stream.read_exact(&mut buf).await?;
         let frame = Frame::decode(&buf)?;
@@ -266,7 +294,7 @@ mod tests {
         .unwrap();
         let (r1, r2) = server.await.unwrap();
         let mut ids = vec![r1, r2];
-        ids.sort();
+        ids.sort_unstable();
         assert_eq!(ids, vec![100, 200]);
     }
 
@@ -310,6 +338,38 @@ mod tests {
         let transport = TcpTransport::new();
         let result = transport.connect("127.0.0.1:1".parse().unwrap()).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn recv_rejects_oversized_length_prefix() {
+        // A peer that sends FF FF FF FF as the length prefix must be rejected
+        // BEFORE any ~4 GiB buffer is allocated. We assert recv returns
+        // FrameTooLarge promptly without the test exhausting memory.
+        let transport = TcpTransport::new();
+        let listener = transport
+            .listen("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr();
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            conn.recv().await
+        });
+        let mut attacker = TcpStream::connect(addr).await.unwrap();
+        attacker.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+        attacker.flush().await.unwrap();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("recv hung — oversized length likely triggered a huge allocation")
+            .unwrap();
+        match result {
+            Err(TransportError::FrameTooLarge { declared, max }) => {
+                assert_eq!(declared, u32::MAX as usize);
+                assert_eq!(max, crate::protocol::MAX_FRAME_SIZE);
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
     }
 
     #[tokio::test]
